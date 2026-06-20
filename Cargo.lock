@@ -552,6 +552,12 @@ version = "0.0.0"
 [[package]]
 name = "sh-media"
 version = "0.0.0"
+dependencies = [
+ "bytes",
+ "sh-protocol",
+ "sh-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sh-protocol"
