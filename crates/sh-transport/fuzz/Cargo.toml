@@ -1,0 +1,26 @@
+# cargo-fuzz crate for sh-transport. This is its OWN workspace (note the empty [workspace] table) and
+# is excluded from the main workspace, so `cargo build/clippy/test --workspace` and CI never touch it.
+# Run with a nightly toolchain: `cargo +nightly fuzz run framing_decode` (see README.md).
+[package]
+name = "sh-transport-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sh-transport]
+path = ".."
+
+[[bin]]
+name = "framing_decode"
+path = "fuzz_targets/framing_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

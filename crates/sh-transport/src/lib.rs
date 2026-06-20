@@ -25,6 +25,9 @@ mod error;
 #[cfg(feature = "insecure-lan")]
 mod insecure;
 
+pub mod channel;
+
+pub use channel::{Channel, ChannelSpec, QuicTransport, Reliability, Transport, MAX_FRAME_LEN};
 pub use connection::Connection;
 pub use endpoint::{ClientEndpoint, ServerEndpoint};
 pub use error::TransportError;

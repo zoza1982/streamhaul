@@ -29,6 +29,38 @@ pub enum TransportError {
     #[error("server endpoint closed before a connection arrived")]
     EndpointClosed,
 
+    /// The QUIC stream was closed cleanly by the peer before a complete framed message
+    /// could be read (partial header or payload received).
+    #[error("stream closed by peer mid-message")]
+    StreamClosed,
+
+    /// A framed message header declared a payload length that exceeds the configured
+    /// safety limit.
+    #[error("framed message too large: declared length {len} bytes")]
+    MessageTooLarge {
+        /// The declared payload length in bytes.
+        len: u32,
+    },
+
+    /// An I/O error occurred while writing to a QUIC stream.
+    #[error("stream write error: {0}")]
+    Io(#[from] quinn::WriteError),
+
+    /// The stream was already closed when a priority or other operation was attempted.
+    #[error("stream already closed")]
+    StreamAlreadyClosed,
+
+    /// An I/O error occurred while reading from a QUIC stream.
+    #[error("stream read error: {0}")]
+    StreamRead(#[from] quinn::ReadExactError),
+
+    /// The channel header bytes received during stream negotiation were invalid.
+    #[error("invalid channel header: {reason}")]
+    InvalidChannelHeader {
+        /// A description of what was wrong.
+        reason: &'static str,
+    },
+
     /// Certificate generation failed (insecure-lan feature only).
     #[cfg(feature = "insecure-lan")]
     #[error("certificate generation error: {0}")]
