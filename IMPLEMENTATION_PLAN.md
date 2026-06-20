@@ -88,9 +88,11 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | P1-2 | `sh-protocol`: input event message (LLD §3.1) + control/RPC framing | sh-protocol | P0-3 | network-engineer | proptest + fuzz | ✅ | #14 |
 | P1-3 | `sh-platform-win`: `InputInjector` (SendInput/Raw Input), normalized coord mapping, multi-monitor | sh-platform-win | P1-1,P1-2 | realtime-systems-engineer | injection smoke | ☐ | |
 | P1-4 | Audio: WASAPI loopback capture + Opus encode/decode + AV sync (shared monotonic clock) | sh-media, sh-codec-hw | P0 | realtime-systems-engineer | sync test | ☐ | |
-| P1-5 | Channel prioritization (input > video) + file-channel congestion-isolation scaffolding | sh-transport | P1-1 | network-engineer | starvation test under load | ☐ | |
+| P1-5 | Channel prioritization (input > video) + file-channel congestion-isolation scaffolding | sh-transport | P1-1 | network-engineer | starvation test under load | ✅ | #16 |
 
-**Gate P1:** ☐ click-to-photon measured · ☐ audio AV-synced (±20ms) · ☐ input not starved under video load.
+**Gate P1:** ☐ click-to-photon measured · ☐ audio AV-synced (±20ms) · ☑ input not starved under video load (structural per-stream isolation; loopback test #16).
+
+> **Datagram demux** (route datagrams to the right channel by SHP CHANNEL field — needed once video+audio coexist) and a **bandwidth-shaped congestion-scheduling test** (loopback can't create real congestion) remain follow-ups (see Risk Register).
 
 ---
 
