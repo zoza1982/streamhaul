@@ -141,10 +141,16 @@ Run independent agents in parallel when their work doesn't depend on each other.
 
 ## 8. Documentation Standards
 
-- **Docs ship with the code** in the same PR — never "later".
+- **Docs ship with the code** in the same PR — never "later". A task is not done until its docs are updated.
+- **Update ALL affected docs after every task, in the same PR.** At minimum, on each task:
+  - **`IMPLEMENTATION_PLAN.md` (the tracker) is updated every task** — flip the task status (`☐`→`✅`/`🟡`/`⛔`),
+    fill its **PR** link, and update the affected **phase gate** and progress count. This is mandatory and
+    is the canonical record of project state.
+  - If the change alters design or behavior, update **`LLD.md`** / **`PRD.md`** and add/update the relevant **ADR**.
+  - Keep **`README.md`** links and any **`CHANGELOG.md`** entry current; update **rustdoc** for changed public APIs.
+  - Never defer a doc/tracker update to a follow-up PR.
 - **Architecture decisions** are recorded as ADRs in `docs/adr/` (copy `docs/adr/_template.md`).
 - Each crate has a `README.md` and complete rustdoc. The product spec lives in `PRD.md` and stays authoritative.
-- User-facing changes update `CHANGELOG.md` (Keep a Changelog format) once releases begin.
 - Comments explain **why**, not what. Keep them current; stale comments are bugs.
 
 ---
@@ -172,6 +178,8 @@ Run independent agents in parallel when their work doesn't depend on each other.
 - [ ] **`code-reviewer` run on the diff; all findings addressed.**
 - [ ] Security surface? → `security-engineer` reviewed; `cargo audit` clean.
 - [ ] Public APIs documented; ADR added/updated if a decision was made.
+- [ ] **`IMPLEMENTATION_PLAN.md` updated** (task status + PR link + phase gate) and all other affected docs
+  (PRD/LLD/ADR/README/CHANGELOG/rustdoc) updated **in this PR**.
 - [ ] No `unwrap/expect/panic` in production paths; no new `unsafe` without `// SAFETY:`.
 - [ ] Coverage not reduced.
 

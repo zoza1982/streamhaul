@@ -17,6 +17,7 @@
 - [ ] **`code-reviewer` agent run on the diff — all findings addressed**
 - [ ] Security surface touched? → `security-engineer` reviewed and `cargo audit` clean
 - [ ] Public APIs documented (rustdoc); ADR added/updated if a decision was made
+- [ ] **`IMPLEMENTATION_PLAN.md` updated** (task status + PR link + phase gate); all other affected docs updated in this PR
 - [ ] No `unwrap/expect/panic` in production paths; no new `unsafe` without `// SAFETY:`
 - [ ] Test coverage not reduced
 
