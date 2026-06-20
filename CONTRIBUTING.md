@@ -49,6 +49,10 @@ fix(crypto): reject downgraded SRTP cipher suites
 docs(prd): clarify adaptive-engine hysteresis
 ```
 
+The **scope** is a lowercase component (e.g. `workspace`, `transport`, `protocol`, `crypto`) — **not**
+a task ID. CI enforces a lowercase scope. Reference the task (e.g. `P0-1`) in the PR body and the tracker,
+not in the title scope.
+
 Enable the commit template once per clone:
 
 ```
