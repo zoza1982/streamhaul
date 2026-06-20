@@ -15,6 +15,8 @@ pub const RAW_HEADER_LEN: usize = 10;
 /// Bitstream format version, bumped on any incompatible header change.
 const RAW_VERSION: u8 = 1;
 
+// `format_to_u8` is exhaustive (adding a `PixelFormat` variant breaks compilation here, forcing the
+// developer to this file); keep `format_from_u8` directly below it in sync.
 fn format_to_u8(format: PixelFormat) -> u8 {
     match format {
         PixelFormat::Bgra8 => 0,
@@ -45,6 +47,11 @@ impl RawEncoder {
 }
 
 impl VideoEncoder for RawEncoder {
+    /// # Errors
+    /// Returns [`MediaError::FrameSize`] if `frame.data` is inconsistent with its format/resolution.
+    // TODO(perf): this copies the whole pixel buffer behind the header every frame (~8 MB at 1080p).
+    // A scatter-gather `EncodedPacket` (header `Bytes` chained with the frame's `Bytes`) would make
+    // raw encode zero-copy; deferred until the pipeline justifies the API change.
     fn encode(&mut self, frame: &VideoFrame) -> Result<Option<EncodedPacket>, MediaError> {
         frame.validate_len()?;
         let [w0, w1, w2, w3] = frame.resolution.width.to_be_bytes();
@@ -83,8 +90,8 @@ impl VideoEncoder for RawEncoder {
             hardware: false,
             max_resolution: Resolution::new(u32::MAX, u32::MAX),
             // Raw is format-agnostic: it records the frame's format in the header and passes pixels
-            // through verbatim, so the pipeline never needs to convert.
-            required_input_format: None,
+            // through verbatim, so the pipeline never needs to convert (empty = accepts any).
+            accepted_input_formats: &[],
         }
     }
 }
@@ -103,7 +110,17 @@ impl RawDecoder {
 }
 
 impl VideoDecoder for RawDecoder {
+    /// # Errors
+    /// Returns [`MediaError::Decode`] if `packet.codec` is not [`Codec::Raw`], or the bitstream is
+    /// truncated, carries an unknown version or format byte, declares a zero dimension, or its pixel
+    /// length does not match the declared format and resolution.
     fn decode(&mut self, packet: &EncodedPacket) -> Result<Option<VideoFrame>, MediaError> {
+        if packet.codec != Codec::Raw {
+            return Err(MediaError::Decode(format!(
+                "raw: unexpected codec {:?}",
+                packet.codec
+            )));
+        }
         let header: [u8; RAW_HEADER_LEN] = packet
             .data
             .get(..RAW_HEADER_LEN)
@@ -121,6 +138,9 @@ impl VideoDecoder for RawDecoder {
             u32::from_be_bytes([w0, w1, w2, w3]),
             u32::from_be_bytes([h0, h1, h2, h3]),
         );
+        if resolution.width == 0 || resolution.height == 0 {
+            return Err(MediaError::Decode("raw: zero-dimension frame".to_owned()));
+        }
         // Pixels follow the header; the slice range is in bounds because the header parsed.
         let pixels = packet.data.slice(RAW_HEADER_LEN..);
         let expected = format.frame_len(resolution);
@@ -244,6 +264,24 @@ mod tests {
             dec.decode(&pkt(&[1, 7, 0, 0, 0, 1, 0, 0, 0, 1])),
             Err(MediaError::Decode(_))
         ));
+        // Zero-dimension frame (width = 0) is rejected before the length check.
+        assert!(matches!(
+            dec.decode(&pkt(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 1])),
+            Err(MediaError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_codec() {
+        let mut dec = RawDecoder::new();
+        let not_raw = EncodedPacket {
+            data: Bytes::from_static(&[1, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]),
+            codec: Codec::H264,
+            frame_id: FrameId(0),
+            capture_ts_us: TimestampUs(0),
+            frame_type: FrameType::Idr,
+        };
+        assert!(matches!(dec.decode(&not_raw), Err(MediaError::Decode(_))));
     }
 
     #[test]

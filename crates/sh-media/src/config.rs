@@ -26,11 +26,12 @@ pub struct EncoderCaps {
     pub hardware: bool,
     /// Largest resolution this encoder supports.
     pub max_resolution: Resolution,
-    /// Pixel format this encoder requires as input, or `None` if it accepts any format. The pipeline
-    /// compares `Some(fmt)` against the capturer's [`pixel_format`](crate::ScreenCapturer::pixel_format)
-    /// and inserts color conversion if they differ (e.g. NVENC needs NV12 while a BGRA capturer feeds
-    /// it); `None` (e.g. the raw codec) means no conversion is ever needed.
-    pub required_input_format: Option<PixelFormat>,
+    /// Pixel formats this encoder accepts as input. **An empty slice means "accepts any format"**
+    /// (e.g. the raw codec). The pipeline checks whether the capturer's
+    /// [`pixel_format`](crate::ScreenCapturer::pixel_format) is in this list and, if not, inserts
+    /// color conversion to the first accepted format (e.g. a BGRA capturer feeding an NV12-only NVENC).
+    /// A `&'static [..]` rather than a single format because hardware encoders often accept several.
+    pub accepted_input_formats: &'static [PixelFormat],
 }
 
 /// What a concrete [`VideoDecoder`](crate::VideoDecoder) backend can do.
