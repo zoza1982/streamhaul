@@ -5,8 +5,10 @@
 //!
 //! # Usage
 //! ```text
-//! streamhaul-host [bind-addr]   (default: 127.0.0.1:7878)
+//! streamhaul-host [bind-addr]   (default: 0.0.0.0:7878)
 //! ```
+
+use anyhow::Context as _;
 
 /// Entry point for the streamhaul-host binary.
 ///
@@ -14,20 +16,26 @@
 ///
 /// Returns any I/O or transport error encountered during startup or streaming.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> anyhow::Result<()> {
     let bind_addr: std::net::SocketAddr = std::env::args()
         .nth(1)
         .as_deref()
-        .unwrap_or("127.0.0.1:7878")
-        .parse()?;
+        .unwrap_or("0.0.0.0:7878")
+        .parse()
+        .context("invalid bind address")?;
 
     let ack = sh_transport::InsecureLanLab::i_understand_this_skips_tls_verification();
-    let server_config = sh_transport::self_signed_server_config(ack)?;
-    let server_ep = sh_transport::ServerEndpoint::bind(bind_addr, server_config)?;
-    let local = server_ep.local_addr()?;
+    let server_config = sh_transport::self_signed_server_config(ack)
+        .context("failed to create server TLS config")?;
+    let server_ep = sh_transport::ServerEndpoint::bind(bind_addr, server_config)
+        .context("failed to bind server endpoint")?;
+    let local = server_ep.local_addr().context("failed to get local addr")?;
     println!("streamhaul-host listening on {local}");
 
-    let conn = server_ep.accept().await?;
+    let conn = server_ep
+        .accept()
+        .await
+        .context("failed to accept connection")?;
     println!("client connected from {}", conn.remote_address());
 
     let resolution = sh_media::Resolution::new(320, 180);
@@ -41,8 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fps,
         pace_frames: false,
     };
-    let send_times =
-        sh_core::run_host_pipeline(&conn, &mut capturer, &mut encoder, &params).await?;
+    let send_times = sh_core::run_host_pipeline(&conn, &mut capturer, &mut encoder, &params)
+        .await
+        .context("host pipeline failed")?;
     println!("host sent {} frames", send_times.len());
     Ok(())
 }

@@ -3,8 +3,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use sh_media::{ScreenCapturer, VideoDecoder, VideoEncoder};
-use sh_render::FrameSink;
+use sh_media::{FrameSink, ScreenCapturer, VideoDecoder, VideoEncoder};
 use sh_types::FrameId;
 
 /// Errors that can occur during pipeline execution.
@@ -24,7 +23,7 @@ pub enum PipelineError {
     Packetize(#[from] crate::packetize::PacketizeError),
     /// A render sink error occurred.
     #[error("render: {0}")]
-    Render(#[from] sh_render::RenderError),
+    Render(#[from] sh_media::RenderError),
     /// The connection does not support datagrams.
     #[error("no datagram support on this connection")]
     NoDatagramSupport,
@@ -52,6 +51,11 @@ pub struct HostPipelineParams {
 /// Captures `params.frame_count` frames, encodes them, fragments each encoded
 /// packet into QUIC datagrams, and sends them over `conn`.
 ///
+/// The `max_datagram_size` is re-queried once per frame so that QUIC path-MTU
+/// discovery changes are respected during a long burst transfer. Callers must
+/// pass a connection whose transport config has datagrams enabled
+/// (i.e. `datagram_receive_buffer_size` set to `Some(_)`).
+///
 /// Returns a list of `(FrameId, send_instant)` pairs for each frame sent.
 ///
 /// # Errors
@@ -68,13 +72,14 @@ pub async fn run_host_pipeline(
     encoder: &mut dyn VideoEncoder,
     params: &HostPipelineParams,
 ) -> Result<Vec<(FrameId, Instant)>, PipelineError> {
-    let max_datagram = conn
-        .max_datagram_size()
-        .ok_or(PipelineError::NoDatagramSupport)?;
     let mut seq: u16 = 0;
     let mut results = Vec::with_capacity(params.frame_count);
 
     for _ in 0..params.frame_count {
+        let max_datagram = conn
+            .max_datagram_size()
+            .ok_or(PipelineError::NoDatagramSupport)?;
+
         let frame = capturer
             .next_frame(Duration::ZERO)
             .map_err(PipelineError::Encode)?
@@ -99,6 +104,9 @@ pub async fn run_host_pipeline(
     // Flush encoder
     let tail = encoder.flush().map_err(PipelineError::Encode)?;
     for packet in tail {
+        let max_datagram = conn
+            .max_datagram_size()
+            .ok_or(PipelineError::NoDatagramSupport)?;
         let frame_id = packet.frame_id;
         let datagrams = crate::packetize::fragment(&packet, seq, max_datagram)?;
         let num_frags = u16::try_from(datagrams.len()).unwrap_or(u16::MAX);
@@ -116,14 +124,14 @@ pub async fn run_host_pipeline(
 /// Run the client-side pipeline: receive → reassemble → decode → sink.
 ///
 /// Receives datagrams from `conn` until `frame_count` complete frames have been
-/// decoded and delivered to `sink`, or until `timeout` elapses waiting for a
-/// datagram.
+/// decoded and delivered to `sink`, or until the overall deadline (computed once
+/// from `timeout` at call time) elapses.
 ///
 /// Returns a list of `(FrameId, recv_instant)` pairs for each decoded frame.
 ///
 /// # Errors
 ///
-/// Returns [`PipelineError::Timeout`] if no datagram arrives within `timeout`.
+/// Returns [`PipelineError::Timeout`] if no datagram arrives before the deadline.
 /// Returns [`PipelineError::Transport`] on receive errors.
 /// Returns [`PipelineError::Decode`] on decode errors.
 /// Returns [`PipelineError::Render`] if the sink rejects a frame.
@@ -136,9 +144,11 @@ pub async fn run_client_pipeline(
 ) -> Result<Vec<(FrameId, Instant)>, PipelineError> {
     let mut reassembler = crate::packetize::Reassembler::new();
     let mut results = Vec::with_capacity(frame_count);
+    #[allow(clippy::arithmetic_side_effects)]
+    let deadline = tokio::time::Instant::now() + timeout;
 
     while results.len() < frame_count {
-        let datagram: Bytes = tokio::time::timeout(timeout, conn.read_datagram())
+        let datagram: Bytes = tokio::time::timeout_at(deadline, conn.read_datagram())
             .await
             .map_err(|_| PipelineError::Timeout)?
             .map_err(PipelineError::Transport)?;

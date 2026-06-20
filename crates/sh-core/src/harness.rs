@@ -7,8 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use sh_codec_hw::{RawDecoder, RawEncoder};
-use sh_media::{Resolution, ScreenCapturer, SyntheticCapturer};
-use sh_render::CollectingSink;
+use sh_media::{CollectingSink, Resolution, ScreenCapturer, SyntheticCapturer, VideoFrame};
 
 /// Parameters for the loopback latency harness.
 #[derive(Debug, Clone)]
@@ -67,6 +66,9 @@ pub enum HarnessError {
     /// A tokio task join error occurred.
     #[error("task join error: {0}")]
     Join(String),
+    /// The overall harness deadline elapsed before both pipelines completed.
+    #[error("harness timed out")]
+    Timeout,
 }
 
 /// Run a full end-to-end loopback latency harness.
@@ -76,51 +78,33 @@ pub enum HarnessError {
 /// the client side concurrently, then computes latency statistics and lossless
 /// correctness across all frames.
 ///
+/// The `server_config` and `client_config` must have datagrams enabled (i.e. the
+/// transport config's `datagram_receive_buffer_size` must be `Some(_)`). Use
+/// [`sh_transport::lan_lab_transport_config`] to obtain a suitable config.
+///
 /// # Errors
 ///
 /// Returns [`HarnessError::Transport`] if binding, connecting, or accepting fails.
 /// Returns [`HarnessError::Pipeline`] if either pipeline returns an error.
-/// Returns [`HarnessError::Join`] if a spawned task panics or the idle timeout
-/// duration is invalid.
+/// Returns [`HarnessError::Join`] if a spawned task panics.
+/// Returns [`HarnessError::Timeout`] if the overall deadline elapses.
+#[allow(clippy::arithmetic_side_effects)]
 pub async fn run_loopback_harness(
     server_config: quinn::ServerConfig,
     client_config: quinn::ClientConfig,
     params: HarnessParams,
 ) -> Result<HarnessReport, HarnessError> {
-    let mut transport = quinn::TransportConfig::default();
-    // 120 frames × ~192 fragments × 1162 bytes = ~27 MB of datagrams. Use a 5-minute idle
-    // timeout so the bulk datagram transfer (subject to QUIC congestion-window backpressure)
-    // can complete without triggering idle closure. A 64 MiB receive buffer absorbs the burst.
-    // Keep-alive interval is set to a third of the idle timeout so the connection stays alive
-    // while `send_datagram_wait` holds for congestion-window space.
-    let idle_timeout: quinn::IdleTimeout = Duration::from_secs(300)
-        .try_into()
-        .map_err(|_| HarnessError::Join("invalid idle timeout duration".to_owned()))?;
-    transport.max_idle_timeout(Some(idle_timeout));
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    // Enable QUIC datagrams with a 64 MiB receive buffer.
-    // Without this, `max_datagram_size()` returns `None` and `send_datagram` returns
-    // `DatagramsNotSupported`.
-    transport.datagram_receive_buffer_size(Some(64 * 1024 * 1024));
-    let transport = Arc::new(transport);
-
-    let mut server_cfg = server_config;
-    server_cfg.transport_config(Arc::clone(&transport));
-
-    let mut client_cfg = client_config;
-    client_cfg.transport_config(Arc::clone(&transport));
-
     let server_ep = sh_transport::ServerEndpoint::bind(
         "127.0.0.1:0"
             .parse()
             .map_err(|_| HarnessError::Join("invalid bind address".to_owned()))?,
-        server_cfg,
+        server_config,
     )?;
     let server_addr = server_ep.local_addr()?;
 
     let server_accept = tokio::spawn(async move { server_ep.accept().await });
 
-    let client_ep = sh_transport::ClientEndpoint::bind(client_cfg)?;
+    let client_ep = sh_transport::ClientEndpoint::bind(client_config)?;
     let client_conn = client_ep.connect(server_addr, "localhost").await?;
 
     let server_conn = server_accept
@@ -141,6 +125,16 @@ pub async fn run_loopback_harness(
     // Channel that lets the client task signal completion so the server conn can be
     // dropped cleanly after the client has received all frames.
     let (client_done_tx, client_done_rx) = oneshot::channel::<()>();
+
+    // Overall deadline: 3× the expected frame budget plus 30 s slack, minimum 60 s.
+    let frame_count_u64 = u64::try_from(params.frame_count).unwrap_or(u64::MAX);
+    let fps_u64 = u64::from(params.fps.max(1));
+    let budget_secs = frame_count_u64
+        .saturating_div(fps_u64)
+        .saturating_mul(3)
+        .saturating_add(30)
+        .max(60);
+    let overall_deadline = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
 
     let host_handle = tokio::spawn(async move {
         let mut capturer = SyntheticCapturer::new(resolution, fps);
@@ -178,10 +172,13 @@ pub async fn run_loopback_harness(
         Ok::<_, crate::pipeline::PipelineError>((recv_times, sink))
     });
 
-    // Await both tasks concurrently so the server connection stays alive until the
-    // client finishes receiving. The oneshot handshake above prevents CONNECTION_CLOSE
-    // from racing with the final datagrams.
-    let (host_result, client_result) = tokio::join!(host_handle, client_handle);
+    // Await both tasks concurrently with an overall deadline so a stalled transfer
+    // does not block indefinitely.
+    let (host_result, client_result) = tokio::time::timeout_at(overall_deadline, async {
+        tokio::join!(host_handle, client_handle)
+    })
+    .await
+    .map_err(|_| HarnessError::Timeout)?;
 
     // Drop the harness's Arc handle so the quinn Connection can close cleanly.
     drop(server_conn);
@@ -206,13 +203,18 @@ pub async fn run_loopback_harness(
 
     let decoded_frames = sink.frames();
     let mut source_capturer = SyntheticCapturer::new(resolution, fps);
+
+    // O(1) lookup map: frame_id → decoded frame reference.
+    let decoded_map: HashMap<u64, &VideoFrame> =
+        decoded_frames.iter().map(|f| (f.frame_id.0, f)).collect();
+
     let mut lossless_map: HashMap<u64, bool> = HashMap::new();
     for _ in 0..frame_count {
         if let Ok(Some(source_frame)) = source_capturer.next_frame(Duration::ZERO) {
             let fid = source_frame.frame_id.0;
-            let matches = decoded_frames
-                .iter()
-                .any(|df| df.frame_id.0 == fid && df.data == source_frame.data);
+            let matches = decoded_map
+                .get(&fid)
+                .is_some_and(|df| df.data == source_frame.data);
             lossless_map.insert(fid, matches);
         }
     }
@@ -247,8 +249,23 @@ pub async fn run_loopback_harness(
     let len = latencies_us.len();
     let latency_min_us = latencies_us.first().copied().unwrap_or(0);
     let latency_max_us = latencies_us.last().copied().unwrap_or(0);
-    let latency_median_us = latencies_us.get(len / 2).copied().unwrap_or(0);
-    let p95_idx = len.saturating_mul(95).saturating_div(100);
+
+    let latency_median_us = if len == 0 {
+        0
+    } else if len % 2 == 1 {
+        latencies_us.get(len / 2).copied().unwrap_or(0)
+    } else {
+        let lo = latencies_us.get(len / 2 - 1).copied().unwrap_or(0);
+        let hi = latencies_us.get(len / 2).copied().unwrap_or(0);
+        lo / 2 + hi / 2 + (lo % 2 + hi % 2) / 2
+    };
+
+    let p95_idx = len
+        .saturating_mul(95)
+        .saturating_add(99)
+        .saturating_div(100)
+        .saturating_sub(1)
+        .min(len.saturating_sub(1));
     let latency_p95_us = latencies_us.get(p95_idx).copied().unwrap_or(0);
 
     Ok(HarnessReport {

@@ -5,6 +5,7 @@
 //! loopback / LAN test environment.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -27,6 +28,30 @@ impl InsecureLanLab {
     pub fn i_understand_this_skips_tls_verification() -> Self {
         Self(())
     }
+}
+
+/// Returns a [`quinn::TransportConfig`] tuned for LAN-lab loopback testing.
+///
+/// Settings applied:
+/// - `datagram_receive_buffer_size(Some(64 * 1024 * 1024))` — 64 MiB receive buffer.
+///   Budget: 120 frames × ~192 fragments × ~1162 bytes ≈ 27 MiB; this is 2× headroom.
+/// - `max_idle_timeout(Some(300 s))` — 5 minutes, so a bulk datagram transfer subject
+///   to QUIC congestion-window backpressure can complete without triggering idle closure.
+/// - `keep_alive_interval(Some(10 s))` — 1/30th of the idle timeout, keeps the connection
+///   alive while `send_datagram_wait` holds for congestion-window space.
+///
+/// **LAN LAB ONLY — NEVER USE IN PRODUCTION.**
+pub fn lan_lab_transport_config() -> Arc<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    // 120 frames × ~192 fragments × ~1162 bytes ≈ 27 MiB; 64 MiB is 2× headroom.
+    transport.datagram_receive_buffer_size(Some(64 * 1024 * 1024));
+    // 5-minute idle timeout so bulk datagram transfers complete without idle closure.
+    if let Ok(idle) = quinn::IdleTimeout::try_from(Duration::from_secs(300)) {
+        transport.max_idle_timeout(Some(idle));
+    }
+    // Keep-alive at 1/30th of idle timeout.
+    transport.keep_alive_interval(Some(Duration::from_secs(10)));
+    Arc::new(transport)
 }
 
 /// **LAN LAB ONLY — NEVER USE IN PRODUCTION.**
@@ -64,9 +89,10 @@ pub fn self_signed_server_config(
     let quic_server_config = quinn::crypto::rustls::QuicServerConfig::try_from(server_tls_config)
         .map_err(|e| TransportError::TlsConfig(e.to_string()))?;
 
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(
-        quic_server_config,
-    )))
+    let transport = lan_lab_transport_config();
+    let mut server_cfg = quinn::ServerConfig::with_crypto(Arc::new(quic_server_config));
+    server_cfg.transport_config(transport);
+    Ok(server_cfg)
 }
 
 /// **LAN LAB ONLY — NEVER USE IN PRODUCTION.**
@@ -96,7 +122,10 @@ pub fn insecure_client_config(_ack: InsecureLanLab) -> Result<quinn::ClientConfi
     let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
         .map_err(|e| TransportError::TlsConfig(e.to_string()))?;
 
-    Ok(quinn::ClientConfig::new(Arc::new(quic_client_config)))
+    let transport = lan_lab_transport_config();
+    let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_config));
+    client_cfg.transport_config(transport);
+    Ok(client_cfg)
 }
 
 /// A `ServerCertVerifier` that accepts every certificate without any checks.

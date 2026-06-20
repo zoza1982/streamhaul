@@ -25,6 +25,12 @@ pub enum PacketizeError {
     /// The payload length field overflowed u16.
     #[error("payload too large to fit in u16 length field")]
     PayloadTooLarge,
+    /// The max datagram size is too small to fit even one byte of payload.
+    #[error("max_datagram {max_datagram} is too small to fit even one payload byte")]
+    DatagramTooSmall {
+        /// The maximum datagram size that was provided.
+        max_datagram: usize,
+    },
 }
 
 /// Fragment an [`EncodedPacket`] into QUIC datagrams.
@@ -34,6 +40,8 @@ pub enum PacketizeError {
 ///
 /// # Errors
 ///
+/// Returns [`PacketizeError::DatagramTooSmall`] if `max_datagram` is not larger
+/// than the combined header size (no room for even one payload byte).
 /// Returns [`PacketizeError::TooManyFragments`] if the packet would require more
 /// than 255 fragments given the `max_datagram` size.
 /// Returns [`PacketizeError::Protocol`] if header encoding fails.
@@ -45,7 +53,11 @@ pub fn fragment(
     max_datagram: usize,
 ) -> Result<Vec<Bytes>, PacketizeError> {
     let combined_header = COMMON_HEADER_LEN.saturating_add(VIDEO_HEADER_LEN);
-    let chunk_size = max_datagram.saturating_sub(combined_header).max(1);
+    if max_datagram <= combined_header {
+        return Err(PacketizeError::DatagramTooSmall { max_datagram });
+    }
+    // saturating_sub is safe here: the check above guarantees max_datagram > combined_header.
+    let chunk_size = max_datagram.saturating_sub(combined_header);
 
     let num_frags = if packet.data.is_empty() {
         1
@@ -148,8 +160,11 @@ struct FrameBuffer {
 
 /// Reassembles fragmented video datagrams into complete [`EncodedPacket`]s.
 ///
-/// Buffers up to [`MAX_BUFFERED_FRAMES`] incomplete frames at a time, evicting
-/// the oldest frame when the buffer is full.
+/// Buffers up to [`MAX_BUFFERED_FRAMES`] incomplete frames at a time. When the buffer is full
+/// and a new frame key arrives, the entry with the lowest key is evicted (FIFO by key order,
+/// not true FIFO by arrival time). Note: the 24-bit frame_id wraps at [`MAX_FRAME_ID`], so
+/// frame IDs can collide after 16 777 215 frames — do not use this reassembler for long-lived
+/// sessions without resetting.
 pub struct Reassembler {
     buffers: BTreeMap<u32, FrameBuffer>,
 }
@@ -177,6 +192,8 @@ impl Reassembler {
     /// - The channel is not [`ChannelId::Video`].
     /// - The fragment is a duplicate.
     /// - The frame is not yet complete.
+    /// - The incoming `total_frags` does not match the previously stored value for this frame.
+    /// - The `frag_index` is out of range per the stored `total_frags`.
     pub fn ingest(&mut self, datagram: &Bytes) -> Option<EncodedPacket> {
         let common = CommonHeader::decode(datagram).ok()?;
         if common.channel != ChannelId::Video {
@@ -213,6 +230,15 @@ impl Reassembler {
             capture_ts_us: common.timestamp_us,
         });
 
+        // Validate against the stored total_frags (not the incoming value) to prevent
+        // a corrupt packet from widening the slot vector after the frame was first seen.
+        if video.total_frags != buf.total_frags {
+            return None; // mismatched fragment — discard
+        }
+        if video.frag_index >= buf.total_frags {
+            return None; // out of range per stored value
+        }
+
         let frag_index_usize = usize::from(video.frag_index);
 
         // Check for duplicate
@@ -248,6 +274,109 @@ impl Reassembler {
             })
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    missing_docs,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use proptest::prelude::*;
+    use sh_media::EncodedPacket;
+    use sh_protocol::{Codec, FrameType};
+    use sh_types::{FrameId, TimestampUs};
+
+    fn make_packet(data: Vec<u8>, frame_id: u64) -> EncodedPacket {
+        EncodedPacket {
+            data: Bytes::from(data),
+            codec: Codec::Raw,
+            frame_id: FrameId(frame_id),
+            capture_ts_us: TimestampUs(0),
+            frame_type: FrameType::Idr,
+        }
+    }
+
+    #[test]
+    fn fragment_datagram_too_small_returns_error() {
+        let combined_header = sh_protocol::COMMON_HEADER_LEN + sh_protocol::VIDEO_HEADER_LEN;
+        let packet = make_packet(vec![0u8; 100], 1);
+        let result = fragment(&packet, 0, combined_header);
+        assert!(
+            matches!(result, Err(PacketizeError::DatagramTooSmall { .. })),
+            "expected DatagramTooSmall, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn fragment_exact_header_size_returns_error() {
+        let combined_header = sh_protocol::COMMON_HEADER_LEN + sh_protocol::VIDEO_HEADER_LEN;
+        let packet = make_packet(vec![42u8; 50], 2);
+        // max_datagram == combined_header means 0 bytes of payload, should error
+        let result = fragment(&packet, 0, combined_header);
+        assert!(matches!(
+            result,
+            Err(PacketizeError::DatagramTooSmall { .. })
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn all_datagrams_fit_in_max_datagram(
+            payload_len in 0usize..4096,
+            max_datagram in 30usize..2000,
+        ) {
+            let combined_header = sh_protocol::COMMON_HEADER_LEN + sh_protocol::VIDEO_HEADER_LEN;
+            let data = vec![0u8; payload_len];
+            let packet = make_packet(data, 1);
+            match fragment(&packet, 0, max_datagram) {
+                Ok(datagrams) => {
+                    for dg in &datagrams {
+                        prop_assert!(dg.len() <= max_datagram,
+                            "datagram len {} > max {}", dg.len(), max_datagram);
+                    }
+                }
+                Err(PacketizeError::DatagramTooSmall { .. }) => {
+                    prop_assert!(max_datagram <= combined_header);
+                }
+                Err(_) => {} // TooManyFragments etc. are also acceptable
+            }
+        }
+
+        #[test]
+        fn fragment_reassemble_roundtrip(
+            payload in proptest::collection::vec(any::<u8>(), 0..4096),
+            frame_id in 0u64..0x00FF_FFFF,
+        ) {
+            let combined_header = sh_protocol::COMMON_HEADER_LEN + sh_protocol::VIDEO_HEADER_LEN;
+            let max_datagram = combined_header + 256;
+            let packet = make_packet(payload.clone(), frame_id);
+            let datagrams = match fragment(&packet, 0, max_datagram) {
+                Ok(d) => d,
+                Err(_) => return Ok(()),
+            };
+            let mut reassembler = Reassembler::new();
+            let mut result = None;
+            for dg in &datagrams {
+                result = reassembler.ingest(dg);
+            }
+            if let Some(reassembled) = result {
+                prop_assert_eq!(&reassembled.data[..], &payload[..]);
+            }
+        }
+
+        #[test]
+        fn ingest_random_bytes_never_panics(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let mut r = Reassembler::new();
+            let _ = r.ingest(&Bytes::from(data));
         }
     }
 }

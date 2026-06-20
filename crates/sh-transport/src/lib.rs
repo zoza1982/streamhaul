@@ -30,4 +30,6 @@ pub use endpoint::{ClientEndpoint, ServerEndpoint};
 pub use error::TransportError;
 
 #[cfg(feature = "insecure-lan")]
-pub use insecure::{insecure_client_config, self_signed_server_config, InsecureLanLab};
+pub use insecure::{
+    insecure_client_config, lan_lab_transport_config, self_signed_server_config, InsecureLanLab,
+};

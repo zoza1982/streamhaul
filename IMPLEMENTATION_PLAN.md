@@ -33,7 +33,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
 
-**Progress:** 5 / 41 tasks complete (P0-1…P0-5); P0-6 portable path done, real DXGI capture deferred to hardware.
+**Progress:** 6 / 41 tasks complete (P0-1…P0-5, P0-9); P0-6/7/8/10 portable software paths done + tested locally, with the real DXGI/NVENC/wgpu + LAN-budget work deferred to the on-hardware session. **The full portable Phase-0 vertical slice runs end-to-end and is measured (loopback).**
 
 > **Phase-0 local-vs-hardware note (overnight build):** the dev laptop is **Linux/Intel iGPU, no Windows SDK, no NVIDIA, no cmake/nasm/clang**, so the *real* hardware paths — DXGI capture (P0-6), NVENC encode (P0-7), wgpu-on-display (P0-8) — cannot be built or verified here. The overnight work delivers a **portable, pure-Rust software pipeline** (synthetic capture → raw codec → loopback QUIC → decode → headless sink → latency harness) that runs and is measured **locally and in CI**, achieving Phase 0's *purpose* (validate the vertical-slice latency budget). The hardware backends slot in behind the same traits during the on-hardware/LAN session.
 
@@ -44,7 +44,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | ID | Workstream | Notes | Agent | Status |
 |----|-----------|-------|-------|:------:|
 | X-1 | **CI activation** | ✅ Live: `pr-title`/`lint`/`test` (3 OSes)/`audit` now run real Rust gates; toolchain pinned (1.95.0). **Pending:** coverage gate (`cargo-llvm-cov` ≥80% on `sh-protocol`/`sh-crypto`/`sh-transport`), cross-OS clippy (lands with platform crates, P0-6), and an MSRV-verification job. | devops-engineer | 🟡 |
-| X-2 | **Testing infra** | `LoopbackTransport`, injected `Clock`+seedable RNG, `proptest`, `cargo-fuzz` targets, `loom` for lock-free queues. Build incrementally with each crate. **Started:** proptest in use (sh-types/sh-protocol); first `cargo-fuzz` target `shp_decode` (P0-3). **Pending:** a scheduled nightly fuzz job; `LoopbackTransport` (P0-4); `loom`; coverage gate. | qa-engineer, rust-staff-engineer | 🟡 |
+| X-2 | **Testing infra** | `LoopbackTransport`, injected `Clock`+seedable RNG, `proptest`, `cargo-fuzz` targets, `loom` for lock-free queues. Build incrementally with each crate. **Started:** proptest across sh-types/sh-protocol/sh-codec-hw/sh-core; `cargo-fuzz` targets `shp_decode` (P0-3) and `fuzz_reassembler_ingest` (P0-9). **Pending:** a scheduled nightly fuzz job; `loom`; coverage gate. | qa-engineer, rust-staff-engineer | 🟡 |
 | X-3 | **Security review cadence** | `security-engineer` reviews **every** crypto/auth/transport PR; `cargo audit` clean; document `snow` unaudited status. | security-engineer | ☐ |
 | X-4 | **Release engineering** | `xtask` for packaging/signing; signed releases (Sigstore/cosign), SBOM (CycloneDX), per-OS installers/services. | devops-engineer | ☐ |
 | X-5 | **Open decisions** | Resolve LLD §9 items before they block: Noise pattern names (SHA-256, before P3), platform-attestation envelope, UGC lifetime per compliance tier, `str0m` Safari interop (before P4/5). | software-architect, security-engineer | ☐ |
@@ -70,11 +70,13 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | P0-5 | `sh-media`: `ScreenCapturer`/`VideoEncoder`/`VideoDecoder` traits + frame/surface types | sh-media | P0-2 | realtime-systems-engineer | trait doubles | ✅ | #8 |
 | P0-6 | Capture. **Portable `SyntheticCapturer` done + tested (local/CI), #8.** Real **DXGI Desktop Duplication** (`sh-platform-win`, zero-copy D3D11) is **deferred to the on-hardware session** — the dev laptop is Linux/Intel with no Windows SDK, so it can't be built/verified here. | sh-media / sh-platform-win | P0-5 | realtime-systems-engineer | manual + smoke (on hardware) | 🟡 | #8 |
 | P0-7 | Codec. **Portable lossless `RawEncoder`/`RawDecoder` (+ `Codec::Raw`) done + tested (local/CI), #9.** Real **NVENC H.264** encode + HW decode (zero-copy surface registration) is **deferred to the on-hardware session** (no NVIDIA/Windows SDK/C build tooling on the dev laptop). | sh-codec-hw | P0-5 | realtime-systems-engineer | encode/decode roundtrip | 🟡 | #9 |
-| P0-8 | `sh-render`: `wgpu` NV12→RGB present + frame pacing + latency overlay | sh-render | P0-5 | ui-engineer, realtime-systems-engineer | manual | ☐ | |
-| P0-9 | Wire `streamhaul-host` + `streamhaul-client` end-to-end (capture→encode→QUIC→decode→render) | bins | P0-3,4,7,8 | rust-staff-engineer | e2e smoke | ☐ | |
-| P0-10 | Latency harness; measure & validate **≤~30ms LAN @60fps**; confirm zero-copy; 10-min soak | host/client | P0-9 | performance-tuning-engineer | latency bench; soak | ☐ | |
+| P0-8 | Sink. **Headless `FrameSink` + `CollectingSink`/`NullSink` done + tested (in `sh-media`), #10.** Real **`wgpu` NV12→RGB present + latency overlay** (display) is **deferred to the on-hardware session**. | sh-media / sh-render | P0-5 | ui-engineer, realtime-systems-engineer | manual (on hardware) | 🟡 | #10 |
+| P0-9 | **End-to-end wiring done + tested, #10.** `sh-core` packetize (SHP fragmentation + reorder-tolerant `Reassembler`) + async host/client pipelines; `streamhaul-host`/`streamhaul-client` bins runnable for a real LAN run. Real DXGI/NVENC/wgpu backends plug in behind the same traits. | bins, sh-core | P0-3,4,7,8 | rust-staff-engineer | e2e smoke | ✅ | #10 |
+| P0-10 | **Loopback latency harness done + measured locally, #10** (`run_loopback_harness`: 120 frames @320×180, 100% lossless, median ~7–11 ms data-path over loopback QUIC; deterministic). **Real LAN + hardware glass-to-glass budget + 10-min soak are the user's LAN session.** | host/client | P0-9 | performance-tuning-engineer | latency bench; soak (LAN) | 🟡 | #10 |
 
-**Gate P0:** ☐ live render · ☐ ≤~30ms glass-to-glass LAN · ☐ zero-copy DXGI→NVENC confirmed · ☐ 10-min stable.
+**Gate P0:** ☑ data-path slice runs + lossless (loopback) · ☐ ≤~30ms glass-to-glass **LAN** (user's session) · ☐ zero-copy DXGI→NVENC (hardware) · ☐ 10-min soak (LAN).
+
+> **LAN test handoff (run when awake):** on the host machine `cargo run -p streamhaul-host --features sh-transport/insecure-lan -- 0.0.0.0:7878`; on the client `cargo run -p streamhaul-client --features sh-transport/insecure-lan -- <host-ip>:7878`. Both already apply `lan_lab_transport_config()` (datagrams enabled) via the insecure config helpers. The client prints received-frame/latency stats. (This is the LAN-lab insecure path — `compile_error!` blocks it from release builds.)
 
 ---
 

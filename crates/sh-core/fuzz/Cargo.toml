@@ -1,0 +1,27 @@
+# cargo-fuzz crate for sh-core. This is its OWN workspace (note the empty [workspace] table) and
+# is excluded from the main workspace, so `cargo build/clippy/test --workspace` and CI never touch it.
+# Run with a nightly toolchain: `cargo +nightly fuzz run fuzz_reassembler_ingest` (see README).
+[package]
+name = "sh-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sh-core]
+path = ".."
+features = ["harness"]
+
+[[bin]]
+name = "fuzz_reassembler_ingest"
+path = "fuzz_targets/fuzz_reassembler_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

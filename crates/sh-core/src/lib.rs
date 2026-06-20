@@ -2,12 +2,15 @@
 //!
 //! Re-exports the pipeline, packetization, and harness APIs for Phase-0 latency measurement.
 
-pub mod harness;
 pub mod packetize;
 pub mod pipeline;
 
+#[cfg(feature = "harness")]
+pub mod harness;
+
 pub use sh_types;
 
+#[cfg(feature = "harness")]
 pub use harness::{
     run_loopback_harness, FrameMeasurement, HarnessError, HarnessParams, HarnessReport,
 };

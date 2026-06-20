@@ -40,7 +40,8 @@ impl Connection {
     ///
     /// Unlike [`send_datagram`](Self::send_datagram), this method is `async` and will
     /// yield to the runtime until the datagram can be accepted into the send buffer.
-    /// This provides natural backpressure for high-throughput loopback pipelines.
+    /// Backpressure is against the QUIC send buffer, not the receiver — the peer may still have an
+    /// empty datagram receive buffer when this call returns.
     ///
     /// # Errors
     ///
