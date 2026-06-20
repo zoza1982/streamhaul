@@ -1,0 +1,11 @@
+[package]
+name = "sh-adaptive"
+description = "Congestion control (GCC/SCReAM), content classifier, and rate allocation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "sh-ice"
+description = "ICE/STUN/TURN orchestration and P2P-vs-relay path selection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

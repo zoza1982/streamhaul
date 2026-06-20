@@ -1,0 +1,11 @@
+[package]
+name = "sh-signaling"
+description = "Signaling client: SDP/ICE exchange, pairing transport, and reconnection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
