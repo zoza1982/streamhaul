@@ -13,8 +13,9 @@ sh-media = { path = "../../crates/sh-media" }
 sh-codec-hw = { path = "../../crates/sh-codec-hw" }
 sh-transport = { path = "../../crates/sh-transport", features = ["insecure-lan"] }
 sh-render = { path = "../../crates/sh-render" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 anyhow = "1"
+clap = { version = "4", features = ["derive"] }
 
 [lints]
 workspace = true
