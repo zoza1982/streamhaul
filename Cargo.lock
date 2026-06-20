@@ -670,6 +670,7 @@ name = "sh-codec-hw"
 version = "0.0.0"
 dependencies = [
  "bytes",
+ "proptest",
  "sh-media",
  "sh-protocol",
  "sh-types",

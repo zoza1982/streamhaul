@@ -13,5 +13,8 @@ sh-protocol = { path = "../sh-protocol" }
 sh-types = { path = "../sh-types" }
 bytes.workspace = true
 
+[dev-dependencies]
+proptest.workspace = true
+
 [lints]
 workspace = true
