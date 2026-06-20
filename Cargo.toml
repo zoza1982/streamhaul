@@ -8,6 +8,7 @@ members = [
     "crates/sh-protocol",
     "crates/sh-transport",
     "crates/sh-media",
+    "crates/sh-codec-hw",
     "crates/sh-adaptive",
     "crates/sh-crypto",
     "crates/sh-signaling",

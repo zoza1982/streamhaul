@@ -1,0 +1,17 @@
+[package]
+name = "sh-codec-hw"
+description = "Video codec backends for Streamhaul. Phase-0 ships a portable raw (uncompressed) codec; hardware backends (NVENC/QSV/VideoToolbox/VA-API) land on the on-hardware session."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sh-media = { path = "../sh-media" }
+sh-protocol = { path = "../sh-protocol" }
+sh-types = { path = "../sh-types" }
+bytes.workspace = true
+
+[lints]
+workspace = true
