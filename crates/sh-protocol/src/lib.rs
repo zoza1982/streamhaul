@@ -19,7 +19,7 @@ mod video;
 pub use common::{CommonHeader, Flags};
 pub use control::{decode_control, encode_control, ControlFrame, CONTROL_HEADER_LEN};
 pub use error::ProtocolError;
-pub use input::{modifiers, EventType, InputEvent};
+pub use input::{EventType, InputEvent, Modifiers};
 pub use video::{Codec, FrameType, Priority, VideoHeader};
 
 /// Current SHP protocol version, carried in the top two bits of byte 0 of every packet.

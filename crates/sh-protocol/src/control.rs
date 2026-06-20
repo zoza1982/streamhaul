@@ -11,14 +11,24 @@ use crate::error::ProtocolError;
 pub const CONTROL_HEADER_LEN: usize = 3;
 
 /// A control frame parsed out of a stream buffer (payload borrows the input).
+///
+/// `kind` is deliberately a raw `u8`: this framing layer is application-agnostic. The mapping from
+/// `kind` to a typed message enum lives at the RPC/dispatch layer (P1-1+), not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlFrame<'a> {
     /// Application-defined message kind.
     pub kind: u8,
     /// Opaque message payload.
     pub payload: &'a [u8],
-    /// Total bytes consumed from the buffer for this frame (header + payload); advance the reader by this.
-    pub consumed: usize,
+}
+
+impl ControlFrame<'_> {
+    /// Total bytes this frame occupied in the source buffer (header + payload). Advance the stream
+    /// reader's cursor by this to reach the next frame.
+    #[must_use]
+    pub fn consumed(&self) -> usize {
+        CONTROL_HEADER_LEN.saturating_add(self.payload.len())
+    }
 }
 
 /// Encode a control frame (`KIND | LEN | PAYLOAD`) into a freshly allocated buffer.
@@ -41,7 +51,9 @@ pub fn encode_control(kind: u8, payload: &[u8]) -> Result<Vec<u8>, ProtocolError
 /// and retry). Never panics.
 ///
 /// # Errors
-/// This never returns an error today — the signature reserves `Result` for future framing checks.
+/// Currently infallible; the `Result` is reserved for future framing checks (e.g. CRC validation).
+// `Result` is intentional for forward compatibility, so callers' `?`-handling stays stable when
+// fallible framing checks are added.
 #[allow(clippy::unnecessary_wraps)]
 pub fn decode_control(data: &[u8]) -> Result<Option<ControlFrame<'_>>, ProtocolError> {
     let header: [u8; CONTROL_HEADER_LEN] = match data
@@ -57,15 +69,15 @@ pub fn decode_control(data: &[u8]) -> Result<Option<ControlFrame<'_>>, ProtocolE
     let Some(payload) = data.get(CONTROL_HEADER_LEN..total) else {
         return Ok(None);
     };
-    Ok(Some(ControlFrame {
-        kind,
-        payload,
-        consumed: total,
-    }))
+    Ok(Some(ControlFrame { kind, payload }))
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
@@ -77,7 +89,7 @@ mod tests {
         let frame = decode_control(&buf).unwrap().unwrap();
         assert_eq!(frame.kind, 7);
         assert_eq!(frame.payload, b"hello");
-        assert_eq!(frame.consumed, 8);
+        assert_eq!(frame.consumed(), 8);
     }
 
     #[test]
@@ -85,16 +97,29 @@ mod tests {
         let buf = encode_control(1, b"").unwrap();
         let frame = decode_control(&buf).unwrap().unwrap();
         assert_eq!(frame.payload, b"");
-        assert_eq!(frame.consumed, 3);
+        assert_eq!(frame.consumed(), 3);
     }
 
     #[test]
     fn incremental_needs_more() {
         // Header says 5 payload bytes but only 2 present → None (need more).
         assert_eq!(decode_control(&[9, 0, 5, 1, 2]).unwrap(), None);
+        // A large declared length with a tiny buffer must also be None, never a panic/mis-slice.
+        assert_eq!(decode_control(&[9, 0xFF, 0xFF, 1, 2, 3]).unwrap(), None);
         // Not even a full header.
         assert_eq!(decode_control(&[9, 0]).unwrap(), None);
         assert_eq!(decode_control(&[]).unwrap(), None);
+    }
+
+    #[test]
+    fn trailing_garbage_is_ignored() {
+        // One valid 8-byte frame followed by junk decodes to exactly the first frame.
+        let frame = decode_control(&[7, 0, 5, 1, 2, 3, 4, 5, 0xFF, 0xAA])
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.kind, 7);
+        assert_eq!(frame.payload, &[1, 2, 3, 4, 5]);
+        assert_eq!(frame.consumed(), 8);
     }
 
     #[test]
@@ -103,7 +128,7 @@ mod tests {
         buf.extend(encode_control(2, b"xyz").unwrap());
         let f1 = decode_control(&buf).unwrap().unwrap();
         assert_eq!((f1.kind, f1.payload), (1, b"ab".as_ref()));
-        let f2 = decode_control(&buf[f1.consumed..]).unwrap().unwrap();
+        let f2 = decode_control(&buf[f1.consumed()..]).unwrap().unwrap();
         assert_eq!((f2.kind, f2.payload), (2, b"xyz".as_ref()));
     }
 
@@ -123,7 +148,7 @@ mod tests {
             let frame = decode_control(&buf).unwrap().unwrap();
             prop_assert_eq!(frame.kind, kind);
             prop_assert_eq!(frame.payload, payload.as_slice());
-            prop_assert_eq!(frame.consumed, buf.len());
+            prop_assert_eq!(frame.consumed(), buf.len());
         }
 
         #[test]
