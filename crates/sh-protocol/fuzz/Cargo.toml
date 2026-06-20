@@ -1,0 +1,26 @@
+# cargo-fuzz crate for sh-protocol. This is its OWN workspace (note the empty [workspace] table) and
+# is excluded from the main workspace, so `cargo build/clippy/test --workspace` and CI never touch it.
+# Run with a nightly toolchain: `cargo +nightly fuzz run shp_decode` (see crates/sh-protocol/fuzz/README.md).
+[package]
+name = "sh-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sh-protocol]
+path = ".."
+
+[[bin]]
+name = "shp_decode"
+path = "fuzz_targets/shp_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
