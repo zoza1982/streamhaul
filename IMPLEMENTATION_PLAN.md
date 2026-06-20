@@ -33,7 +33,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
 
-**Progress:** 3 / 41 tasks complete (P0-1, P0-2, P0-3).
+**Progress:** 4 / 41 tasks complete (P0-1, P0-2, P0-3, P0-4).
 
 ---
 
@@ -64,7 +64,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | P0-1 | Cargo workspace scaffold + workspace lints (panic-ban) + activate CI | (all skeleton) | — | rust-staff-engineer | crates compile; clippy `-D warnings` clean; CI goes live | ✅ | #5 |
 | P0-2 | `sh-types`: IDs, units, `FrameId`/`Timestamp`/`ChannelId`, error scaffolding | sh-types | P0-1 | rust-staff-engineer | unit | ✅ | #5 |
 | P0-3 | `sh-protocol`: common header + video payload header (per LLD §3.1), encode/decode | sh-protocol | P0-2 | rust-staff-engineer, network-engineer | **proptest** (never-panic + roundtrip) + **cargo-fuzz** target | ✅ | #6 |
-| P0-4 | `sh-transport`: bare `quinn` backend (LAN, datagrams), no ICE/crypto | sh-transport | P0-2 | network-engineer | loopback integration | ☐ | |
+| P0-4 | `sh-transport`: bare `quinn` backend (LAN, datagrams), no ICE/crypto | sh-transport | P0-2 | network-engineer | loopback integration | ✅ | #7 |
 | P0-5 | `sh-media`: `ScreenCapturer`/`VideoEncoder`/`VideoDecoder` traits + frame/surface types | sh-media | P0-2 | realtime-systems-engineer | trait doubles | ☐ | |
 | P0-6 | `sh-platform-win`: DXGI Desktop Duplication capture (zero-copy D3D11 surface) | sh-platform-win | P0-5 | realtime-systems-engineer | manual + smoke | ☐ | |
 | P0-7 | `sh-codec-hw`: NVENC H.264 encode + HW decode; zero-copy surface registration | sh-codec-hw | P0-5, P0-6 | realtime-systems-engineer | encode/decode roundtrip | ☐ | |
@@ -206,6 +206,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | R5 | `str0m` ↔ Safari WebRTC interop validation | P4/P5 | network-engineer |
 | R6 | NVENC consumer session-limit behavior during double-buffer overlap | P2 | realtime-systems-engineer |
 | R7 | Multi-GPU cross-adapter copy budget on target laptop SKUs | P0/P2 | realtime-systems-engineer |
+| R8 | Remove `sh-transport`'s `insecure-lan` path (self-signed + skip-verify TLS) when real crypto lands — delete the module or move to a dev-only testkit crate. Meanwhile it is fenced by a non-default feature, an `InsecureLanLab` witness, and a `compile_error!` that blocks `--release --features insecure-lan`. | P4 | security-engineer |
 
 ---
 

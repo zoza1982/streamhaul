@@ -31,6 +31,8 @@ rust-version = "1.82"
 [workspace.dependencies]
 thiserror = "2"
 proptest = "1"
+bytes = "1"
+tokio = { version = "1", features = ["net", "rt", "sync"] }
 
 # Workspace-wide lints enforce the CLAUDE.md panic-ban and safety posture.
 # Members opt in with `[lints] workspace = true`. CI runs clippy with `-D warnings`,
