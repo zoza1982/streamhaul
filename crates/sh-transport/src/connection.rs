@@ -91,4 +91,12 @@ impl Connection {
     pub fn rtt(&self) -> std::time::Duration {
         self.inner.rtt()
     }
+
+    /// Consume this [`Connection`] and return the underlying `quinn::Connection`.
+    ///
+    /// Used internally by [`QuicTransport`](crate::channel::QuicTransport) to access stream and
+    /// datagram APIs directly.
+    pub(crate) fn into_quinn(self) -> quinn::Connection {
+        self.inner
+    }
 }

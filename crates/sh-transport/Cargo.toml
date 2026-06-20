@@ -15,6 +15,8 @@ thiserror.workspace = true
 bytes.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio.workspace = true
+async-trait = "0.1"
+sh-types = { path = "../sh-types" }
 
 # Optional: only compiled when `insecure-lan` feature is active.
 # Note: `rustls` is ALREADY in the dependency tree transitively via quinn's `rustls-ring` feature;
