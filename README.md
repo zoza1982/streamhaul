@@ -21,6 +21,8 @@ pipeline. Low-Level Design (LLD) is the next milestone.
 - [`PRD.md`](./PRD.md) — High-level PRD (architecture, transport/protocol, video pipeline, security, scope).
 - [`LLD.md`](./LLD.md) — Low-Level Design: crate layout, trait seams, SHP wire format, crypto, build plan;
   resolves the PRD's 8 open questions.
+- [`IMPLEMENTATION_PLAN.md`](./IMPLEMENTATION_PLAN.md) — **living build tracker**: phase epics broken into
+  PR-sized tasks with status, dependencies, and exit gates. The canonical "where are we?".
 - [`docs/adr/`](./docs/adr/) — Architecture Decision Records (0001–0005).
 
 ## Development
