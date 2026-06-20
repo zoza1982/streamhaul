@@ -123,13 +123,54 @@ impl ChannelSpec {
         }
     }
 
-    /// Convenience constructor: control channel (reliable, low priority).
+    /// Convenience constructor: control channel (reliable, urgency 1).
+    ///
+    /// Maps to LLD §3.2 urgency 1 (RFC 9218). Priority 1 → quinn i32 254 (second-highest after
+    /// input), ensuring RPC/control frames drain before clipboard and file traffic but never ahead
+    /// of input events.
     #[must_use]
     pub fn control() -> Self {
         Self {
             channel: ChannelId::Control,
             reliability: Reliability::Reliable,
-            priority: 128,
+            priority: 1,
+        }
+    }
+
+    /// Convenience constructor: clipboard channel (reliable, urgency 2).
+    ///
+    /// Maps to LLD §3.2 urgency 2 (RFC 9218). Priority 2 → quinn i32 253. Reliable and ordered
+    /// so clipboard content is never truncated, but lower urgency than input and control.
+    #[must_use]
+    pub fn clipboard() -> Self {
+        Self {
+            channel: ChannelId::Clipboard,
+            reliability: Reliability::Reliable,
+            priority: 2,
+        }
+    }
+
+    /// Convenience constructor: file-transfer channel (reliable, urgency 6 = lowest).
+    ///
+    /// Maps to LLD §3.2 urgency 6 (RFC 9218). Priority 6 → quinn i32 249. Each file transfer
+    /// uses its own QUIC stream, giving it independent per-stream flow control so a bulk file
+    /// copy cannot head-of-line-block input, video, or control streams — the congestion-isolation
+    /// guarantee documented in LLD §4.7 is structural: separate streams, not a shared mutex.
+    ///
+    /// # Priority table (LLD §3.2)
+    ///
+    /// | Channel   | urgency | `priority` field | quinn i32 |
+    /// |-----------|---------|-----------------|-----------|
+    /// | input     | 0       | 0               | 255       |
+    /// | control   | 1       | 1               | 254       |
+    /// | clipboard | 2       | 2               | 253       |
+    /// | file      | 6       | 6               | 249       |
+    #[must_use]
+    pub fn file() -> Self {
+        Self {
+            channel: ChannelId::File,
+            reliability: Reliability::Reliable,
+            priority: 6,
         }
     }
 
