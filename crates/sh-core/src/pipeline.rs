@@ -124,17 +124,22 @@ pub async fn run_host_pipeline(
 /// Run the client-side pipeline: receive → reassemble → decode → sink.
 ///
 /// Receives datagrams from `conn` until `frame_count` complete frames have been
-/// decoded and delivered to `sink`, or until the overall deadline (computed once
-/// from `timeout` at call time) elapses.
+/// decoded and delivered to `sink`, or until the deadline (computed once from
+/// `timeout` at call time) elapses.
+///
+/// QUIC datagrams are **unreliable**: losing any one fragment of a frame means that
+/// frame never reassembles. So reaching the deadline with fewer than `frame_count`
+/// frames is a normal outcome, not an error — this returns whatever **did** complete
+/// as `Ok(partial)`. The caller compares the returned count against `frame_count` to
+/// measure loss. (Loss recovery — FEC/NACK — is P2.)
 ///
 /// Returns a list of `(FrameId, recv_instant)` pairs for each decoded frame.
 ///
 /// # Errors
 ///
-/// Returns [`PipelineError::Timeout`] if no datagram arrives before the deadline.
-/// Returns [`PipelineError::Transport`] on receive errors.
-/// Returns [`PipelineError::Decode`] on decode errors.
-/// Returns [`PipelineError::Render`] if the sink rejects a frame.
+/// Returns [`PipelineError::Transport`] on receive errors (connection lost),
+/// [`PipelineError::Decode`] on decode errors, or [`PipelineError::Render`] if the
+/// sink rejects a frame.
 pub async fn run_client_pipeline(
     conn: &sh_transport::Connection,
     decoder: &mut dyn VideoDecoder,
@@ -148,10 +153,11 @@ pub async fn run_client_pipeline(
     let deadline = tokio::time::Instant::now() + timeout;
 
     while results.len() < frame_count {
-        let datagram: Bytes = tokio::time::timeout_at(deadline, conn.read_datagram())
-            .await
-            .map_err(|_| PipelineError::Timeout)?
-            .map_err(PipelineError::Transport)?;
+        let datagram: Bytes = match tokio::time::timeout_at(deadline, conn.read_datagram()).await {
+            // Deadline reached: return whatever completed (datagram loss is expected, not fatal).
+            Err(_elapsed) => break,
+            Ok(recv) => recv.map_err(PipelineError::Transport)?,
+        };
 
         if let Some(packet) = reassembler.ingest(&datagram) {
             if let Some(frame) = decoder.decode(&packet).map_err(PipelineError::Decode)? {
