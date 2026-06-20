@@ -71,6 +71,11 @@ CI runs `pr-title`, `lint`, `test` (Linux/Windows/macOS), and `audit`. Merges re
 green CI, branch up to date with `main`, resolved conversations, and **linear history**
 (squash or rebase merge).
 
+Server-side enforcement of these rules lives in `.github/rulesets/main-branch-protection.json` and
+is applied with `./scripts/setup-branch-protection.sh`. GitHub requires the repo to be **public** or
+the owner to be on **GitHub Pro/Team** to enable rulesets on a private repo; until then CI and the
+`CLAUDE.md` review gate still run on every PR.
+
 ## Security
 
 Do not open public issues for vulnerabilities — see [`SECURITY.md`](./SECURITY.md).
