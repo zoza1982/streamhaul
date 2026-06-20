@@ -49,10 +49,11 @@ async fn main() -> anyhow::Result<()> {
         client_ep.connect(args.server, "localhost"),
     )
     .await
-    .with_context(|| {
-        format!(
+    .map_err(|_| {
+        anyhow::anyhow!(
             "connect to {} timed out after {}s",
-            args.server, args.connect_timeout
+            args.server,
+            args.connect_timeout
         )
     })?
     .context("failed to connect to server")?;
@@ -162,7 +163,9 @@ fn verify_lossless(frames: &[sh_media::VideoFrame], expected_count: usize) -> us
     let Some(first) = frames.first() else {
         return 0;
     };
-    // Regenerate the source sequence (fps is irrelevant to the pixel pattern).
+    // Regenerate the source sequence. The synthetic pixel pattern depends only on (frame_id,
+    // resolution) — fps only affects the capture-timestamp field, not the bytes — so any fps works.
+    // This assumes the host's capturer starts at frame_id 0 (true for `SyntheticCapturer::new`).
     let mut gen = sh_media::SyntheticCapturer::new(first.resolution, 30);
     let mut expected: std::collections::HashMap<u64, Bytes> =
         std::collections::HashMap::with_capacity(expected_count);

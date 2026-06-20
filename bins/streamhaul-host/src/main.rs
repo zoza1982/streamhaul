@@ -83,12 +83,17 @@ async fn main() -> anyhow::Result<()> {
     // (the bins have no client-done back-channel; the loopback harness uses one instead).
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // Payload bytes ≈ frames × width × height × 4 (BGRA); excludes per-datagram header overhead.
+    // Payload bytes ≈ frames × width × height × 4 (BGRA). Excludes the raw codec's 10-byte per-frame
+    // header and per-datagram SHP/QUIC header overhead; rewrite when real (compressed) codecs land.
     let frame_bytes = u64::from(args.width)
         .saturating_mul(u64::from(args.height))
         .saturating_mul(4);
     let total_bytes = frame_bytes.saturating_mul(u64::try_from(send_times.len()).unwrap_or(0));
     let secs = elapsed.as_secs_f64();
+    // This is the *send rate*, not link capacity: in paced mode it reflects the fps-paced cadence; in
+    // --no-pace (blast) mode it approaches the link's peak. The client's receive-window throughput is
+    // the better measure of delivered rate.
+    let mode = if args.no_pace { "blast" } else { "paced" };
     #[allow(clippy::cast_precision_loss)]
     let mbps = if secs > 0.0 {
         (total_bytes as f64) * 8.0 / secs / 1.0e6
@@ -106,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     println!("  send duration: {secs:.2} s");
-    println!("  throughput:    {mbps:.1} Mbps (payload)");
+    println!("  send rate:     {mbps:.1} Mbps ({mode}, payload)");
     println!(
         "  quic rtt:      {:.1} ms",
         conn.rtt().as_secs_f64() * 1000.0

@@ -42,7 +42,11 @@ pub struct HostPipelineParams {
     pub frame_count: usize,
     /// Frames per second for the capturer.
     pub fps: u32,
-    /// Whether to pace frames according to the configured FPS.
+    /// Whether to pace frame sends to `fps`.
+    ///
+    /// Uses `MissedTickBehavior::Delay`: on a slow link the pacer falls behind and never bursts to
+    /// catch up, so the effective send rate is bounded by `min(fps, link_capacity)`. `false` sends as
+    /// fast as the link allows (subject to `send_datagram_wait` backpressure).
     pub pace_frames: bool,
 }
 
