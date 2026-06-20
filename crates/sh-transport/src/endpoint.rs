@@ -1,10 +1,14 @@
 //! QUIC server and client endpoint wrappers for `sh-transport`.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::{connection::Connection, error::TransportError};
 
+/// Ephemeral IPv4 bind address (`0.0.0.0:0`) — the OS picks the port.
+const EPHEMERAL_V4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+
 /// A QUIC server endpoint that listens for incoming connections.
+#[derive(Debug)]
 pub struct ServerEndpoint {
     inner: quinn::Endpoint,
 }
@@ -54,23 +58,23 @@ impl ServerEndpoint {
 }
 
 /// A QUIC client endpoint for connecting to servers.
+#[derive(Debug)]
 pub struct ClientEndpoint {
     inner: quinn::Endpoint,
 }
 
 impl ClientEndpoint {
-    /// Bind an ephemeral local UDP socket and create a QUIC client endpoint
-    /// using the given `config` as the default client configuration.
+    /// Bind an ephemeral local UDP socket and create a QUIC client endpoint.
+    ///
+    /// `config` is installed as the default client configuration for all subsequent
+    /// [`connect`](Self::connect) calls.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError::Bind`] if the underlying UDP socket cannot be
     /// bound to an ephemeral port.
     pub fn bind(config: quinn::ClientConfig) -> Result<Self, TransportError> {
-        let addr: SocketAddr = "0.0.0.0:0".parse().map_err(|e: std::net::AddrParseError| {
-            TransportError::Bind(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-        })?;
-        let mut inner = quinn::Endpoint::client(addr).map_err(TransportError::Bind)?;
+        let mut inner = quinn::Endpoint::client(EPHEMERAL_V4).map_err(TransportError::Bind)?;
         inner.set_default_client_config(config);
         Ok(Self { inner })
     }

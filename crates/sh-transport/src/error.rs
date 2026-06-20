@@ -32,9 +32,14 @@ pub enum TransportError {
     /// Certificate generation failed (insecure-lan feature only).
     #[cfg(feature = "insecure-lan")]
     #[error("certificate generation error: {0}")]
-    CertGeneration(String),
+    CertGeneration(#[from] rcgen::Error),
 
-    /// TLS configuration error (insecure-lan feature only).
+    /// TLS/QUIC configuration assembly failed (insecure-lan feature only).
+    ///
+    /// Aggregates several heterogeneous config-time error sources (the rustls config builder,
+    /// private-key parsing, and quinn's `QuicServerConfig`/`QuicClientConfig` conversion) that can
+    /// only occur at lab startup. Structured variants will replace this when the production crypto
+    /// path lands (P3/P4).
     #[cfg(feature = "insecure-lan")]
     #[error("TLS config error: {0}")]
     TlsConfig(String),

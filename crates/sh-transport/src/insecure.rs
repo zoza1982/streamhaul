@@ -12,22 +12,43 @@ use rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
 use crate::error::TransportError;
 
+/// Witness that the caller has acknowledged the LAN-lab-only, no-TLS-verification posture.
+///
+/// [`insecure_client_config`] and [`self_signed_server_config`] require one so every use of the
+/// insecure path is explicit and greppable at the call site (you cannot reach it by autocomplete
+/// alone). It carries no data and exists purely as a speed bump.
+#[derive(Debug, Clone, Copy)]
+pub struct InsecureLanLab(());
+
+impl InsecureLanLab {
+    /// Acknowledge that the resulting config **skips TLS certificate verification** and is for a
+    /// controlled LAN lab only — never production.
+    #[must_use]
+    pub fn i_understand_this_skips_tls_verification() -> Self {
+        Self(())
+    }
+}
+
 /// **LAN LAB ONLY — NEVER USE IN PRODUCTION.**
 ///
 /// Generates a self-signed TLS certificate for `localhost` and returns a
 /// `quinn::ServerConfig` backed by it. The certificate is generated fresh on
 /// every call and is not persisted.
 ///
+// TODO(P4): delete this module (or move to a dev-only `sh-transport-testkit` crate) once the real
+// crypto path — Noise/identity (P3) and DTLS fingerprint pinning (P4) — lands.
+///
 /// # Errors
 ///
 /// Returns [`TransportError::CertGeneration`] if rcgen fails to generate the
 /// certificate, or [`TransportError::TlsConfig`] if rustls fails to build the
 /// server config from it.
-pub fn self_signed_server_config() -> Result<quinn::ServerConfig, TransportError> {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .map_err(|e| TransportError::CertGeneration(e.to_string()))?;
+pub fn self_signed_server_config(
+    _ack: InsecureLanLab,
+) -> Result<quinn::ServerConfig, TransportError> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])?;
 
-    let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    let cert_der = cert.cert.der().clone();
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
         .map_err(|e| TransportError::TlsConfig(e.to_string()))?;
 
@@ -61,7 +82,7 @@ pub fn self_signed_server_config() -> Result<quinn::ServerConfig, TransportError
 /// Returns [`TransportError::TlsConfig`] if the underlying TLS or QUIC
 /// configuration cannot be assembled (in practice this should not happen with
 /// the ring provider).
-pub fn insecure_client_config() -> Result<quinn::ClientConfig, TransportError> {
+pub fn insecure_client_config(_ack: InsecureLanLab) -> Result<quinn::ClientConfig, TransportError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(SkipVerification(Arc::clone(&provider)));
 

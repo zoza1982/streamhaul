@@ -16,7 +16,11 @@ bytes.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tokio.workspace = true
 
-# Optional: only compiled when `insecure-lan` feature is active
+# Optional: only compiled when `insecure-lan` feature is active.
+# Note: `rustls` is ALREADY in the dependency tree transitively via quinn's `rustls-ring` feature;
+# this optional entry only adds the *direct* dependency needed to name rustls types in `insecure.rs`.
+# The actual fence around the skip-verification verifier is the `#[cfg(feature = "insecure-lan")]` on
+# the module + the release compile_error guard in `lib.rs`, not this optional dep.
 rcgen = { version = "0.13", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
 

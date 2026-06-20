@@ -7,12 +7,17 @@ use bytes::Bytes;
 use crate::error::TransportError;
 
 /// A wrapper around a `quinn::Connection` that exposes datagram send/receive.
+#[derive(Debug)]
 pub struct Connection {
     inner: quinn::Connection,
 }
 
 impl Connection {
     /// Creates a new [`Connection`] from a raw `quinn::Connection`.
+    ///
+    /// Intentionally `pub(crate)`: callers obtain connections exclusively through
+    /// [`ServerEndpoint::accept`](crate::ServerEndpoint::accept) or
+    /// [`ClientEndpoint::connect`](crate::ClientEndpoint::connect).
     pub(crate) fn new(inner: quinn::Connection) -> Self {
         Self { inner }
     }
@@ -21,13 +26,14 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::SendDatagram`] if the datagram could not be sent,
-    /// or [`TransportError::DatagramsNotSupported`] if the remote peer does not
-    /// support datagrams.
+    /// Returns [`TransportError::DatagramsNotSupported`] if the remote peer disabled datagram
+    /// support, or [`TransportError::SendDatagram`] for any other send failure (e.g. the datagram
+    /// exceeds [`max_datagram_size`](Self::max_datagram_size), or the connection is closing).
     pub fn send_datagram(&self, data: Bytes) -> Result<(), TransportError> {
-        self.inner
-            .send_datagram(data)
-            .map_err(TransportError::SendDatagram)
+        self.inner.send_datagram(data).map_err(|e| match e {
+            quinn::SendDatagramError::UnsupportedByPeer => TransportError::DatagramsNotSupported,
+            other => TransportError::SendDatagram(other),
+        })
     }
 
     /// Receive the next datagram from the remote peer.
