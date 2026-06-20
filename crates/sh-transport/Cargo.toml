@@ -1,11 +1,27 @@
 [package]
 name = "sh-transport"
-description = "Transport/Channel abstraction over QUIC (quinn) and WebRTC (str0m)."
+description = "QUIC datagram transport for Streamhaul (Phase-0 LAN lab)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[features]
+insecure-lan = ["dep:rcgen", "dep:rustls"]
+
+[dependencies]
+thiserror.workspace = true
+bytes.workspace = true
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio.workspace = true
+
+# Optional: only compiled when `insecure-lan` feature is active
+rcgen = { version = "0.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true
