@@ -85,7 +85,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | ID | Task | Crates | Depends | Agent | Tests | Status | PR |
 |----|------|--------|---------|-------|-------|:------:|----|
 | P1-1 | Promote `Transport`/`Channel` trait + `ChannelSpec`; multi-channel (video unreliable + input reliable, **input urgency 0**) | sh-transport | P0 | network-engineer, rust-staff-engineer | loopback multi-channel | ☐ | |
-| P1-2 | `sh-protocol`: input event message (LLD §3.1) + control/RPC framing | sh-protocol | P0-3 | network-engineer | proptest + fuzz | ☐ | |
+| P1-2 | `sh-protocol`: input event message (LLD §3.1) + control/RPC framing | sh-protocol | P0-3 | network-engineer | proptest + fuzz | ✅ | #14 |
 | P1-3 | `sh-platform-win`: `InputInjector` (SendInput/Raw Input), normalized coord mapping, multi-monitor | sh-platform-win | P1-1,P1-2 | realtime-systems-engineer | injection smoke | ☐ | |
 | P1-4 | Audio: WASAPI loopback capture + Opus encode/decode + AV sync (shared monotonic clock) | sh-media, sh-codec-hw | P0 | realtime-systems-engineer | sync test | ☐ | |
 | P1-5 | Channel prioritization (input > video) + file-channel congestion-isolation scaffolding | sh-transport | P1-1 | network-engineer | starvation test under load | ☐ | |
