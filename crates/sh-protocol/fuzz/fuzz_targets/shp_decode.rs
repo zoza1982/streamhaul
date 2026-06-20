@@ -4,7 +4,9 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Both decoders take untrusted network bytes; neither may panic, hang, or read out of bounds.
+    // All decoders take untrusted network bytes; none may panic, hang, or read out of bounds.
     let _ = sh_protocol::CommonHeader::decode(data);
     let _ = sh_protocol::VideoHeader::decode(data);
+    let _ = sh_protocol::InputEvent::decode(data);
+    let _ = sh_protocol::decode_control(data);
 });

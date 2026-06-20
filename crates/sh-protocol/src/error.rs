@@ -31,6 +31,12 @@ pub enum ProtocolError {
     /// A reserved field was non-zero (must be zero; rejected to keep the format unambiguous).
     #[error("reserved bits must be zero")]
     ReservedBitsSet,
+    /// The event-type byte does not map to a known [`crate::EventType`].
+    #[error("invalid input event type: {0}")]
+    InvalidEventType(u8),
+    /// A control-frame payload exceeds the 16-bit length field.
+    #[error("control payload {0} exceeds 16-bit maximum")]
+    ControlPayloadTooLarge(usize),
     /// `frame_id` exceeds [`crate::MAX_FRAME_ID`] (does not fit the 24-bit wire field).
     #[error("frame_id {0} exceeds 24-bit maximum")]
     FrameIdTooLarge(u64),

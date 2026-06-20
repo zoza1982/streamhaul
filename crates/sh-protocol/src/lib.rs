@@ -5,17 +5,21 @@
 //! order). Decoding treats every input as hostile — it never panics and never indexes out of bounds;
 //! malformed input returns [`ProtocolError`]. See `LLD.md` §3.1 for the field layouts.
 //!
-//! This first cut (task P0-3) covers the [`CommonHeader`] and the [`VideoHeader`]. Audio, input, and
-//! feedback message types land with their phases. Each header type lives in its own module; the public
-//! surface is re-exported here.
+//! Covers the [`CommonHeader`], [`VideoHeader`], the [`InputEvent`] (P1-2), and control-channel
+//! framing ([`encode_control`]/[`decode_control`], P1-2). Audio and feedback message types land with
+//! their phases. Each message type lives in its own module; the public surface is re-exported here.
 
 mod bits;
 mod common;
+mod control;
 mod error;
+mod input;
 mod video;
 
 pub use common::{CommonHeader, Flags};
+pub use control::{decode_control, encode_control, ControlFrame, CONTROL_HEADER_LEN};
 pub use error::ProtocolError;
+pub use input::{modifiers, EventType, InputEvent};
 pub use video::{Codec, FrameType, Priority, VideoHeader};
 
 /// Current SHP protocol version, carried in the top two bits of byte 0 of every packet.
@@ -26,6 +30,9 @@ pub const COMMON_HEADER_LEN: usize = 9;
 
 /// Wire length of the video payload header (follows the common header for video packets), in bytes.
 pub const VIDEO_HEADER_LEN: usize = 12;
+
+/// Wire length of an SHP input event, in bytes (14 fields + 2 reserved).
+pub const INPUT_EVENT_LEN: usize = 16;
 
 /// The largest value a 24-bit on-wire `FRAME_ID` can hold.
 pub const MAX_FRAME_ID: u32 = 0x00FF_FFFF;
