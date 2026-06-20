@@ -7,5 +7,11 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+sh-media = { path = "../sh-media" }
+sh-types = { path = "../sh-types" }
+bytes.workspace = true
+thiserror.workspace = true
+
 [lints]
 workspace = true

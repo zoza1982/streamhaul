@@ -548,7 +548,16 @@ dependencies = [
 name = "sh-core"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "quinn",
+ "sh-codec-hw",
+ "sh-media",
+ "sh-protocol",
+ "sh-render",
+ "sh-transport",
  "sh-types",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -581,6 +590,12 @@ dependencies = [
 [[package]]
 name = "sh-render"
 version = "0.0.0"
+dependencies = [
+ "bytes",
+ "sh-media",
+ "sh-types",
+ "thiserror",
+]
 
 [[package]]
 name = "sh-signaling"
@@ -631,14 +646,24 @@ dependencies = [
 name = "streamhaul-client"
 version = "0.0.0"
 dependencies = [
+ "sh-codec-hw",
  "sh-core",
+ "sh-media",
+ "sh-render",
+ "sh-transport",
+ "tokio",
 ]
 
 [[package]]
 name = "streamhaul-host"
 version = "0.0.0"
 dependencies = [
+ "sh-codec-hw",
  "sh-core",
+ "sh-media",
+ "sh-render",
+ "sh-transport",
+ "tokio",
 ]
 
 [[package]]

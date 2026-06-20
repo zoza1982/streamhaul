@@ -1,6 +1,6 @@
 [package]
 name = "sh-core"
-description = "Umbrella facade composing the Streamhaul engine (Session/HostEngine/ClientEngine). Scaffold."
+description = "Umbrella facade composing the Streamhaul engine; Phase-0 pipeline and latency harness."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,20 @@ rust-version.workspace = true
 
 [dependencies]
 sh-types = { path = "../sh-types" }
+sh-media = { path = "../sh-media" }
+sh-codec-hw = { path = "../sh-codec-hw" }
+sh-transport = { path = "../sh-transport" }
+sh-protocol = { path = "../sh-protocol" }
+sh-render = { path = "../sh-render" }
+bytes.workspace = true
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+thiserror.workspace = true
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+
+[dev-dependencies]
+sh-transport = { path = "../sh-transport", features = ["insecure-lan"] }
+sh-media = { path = "../sh-media" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

@@ -1,9 +1,15 @@
-//! `sh-core` — the umbrella facade that composes protocol, transport, media, adaptive, and crypto into
-//! the `Session` / `HostEngine` / `ClientEngine` state machines (see `LLD.md` §1).
+//! `sh-core` — umbrella facade composing the Streamhaul engine.
 //!
-//! Scaffold stub: the engine is wired up starting in Phase 0 task **P0-9**. For now it only re-exports
-//! the shared primitive types so downstream crates have a single import surface.
+//! Re-exports the pipeline, packetization, and harness APIs for Phase-0 latency measurement.
 
-/// Shared primitive types, re-exported so downstream code can reach them as `sh_core::sh_types::*`
-/// without taking a separate direct dependency.
+pub mod harness;
+pub mod packetize;
+pub mod pipeline;
+
 pub use sh_types;
+
+pub use harness::{
+    run_loopback_harness, FrameMeasurement, HarnessError, HarnessParams, HarnessReport,
+};
+pub use packetize::{fragment, PacketizeError, Reassembler};
+pub use pipeline::{run_client_pipeline, run_host_pipeline, HostPipelineParams, PipelineError};
