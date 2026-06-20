@@ -33,7 +33,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
 
-**Progress:** 2 / 41 tasks complete (P0-1, P0-2).
+**Progress:** 3 / 41 tasks complete (P0-1, P0-2, P0-3).
 
 ---
 
@@ -42,7 +42,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | ID | Workstream | Notes | Agent | Status |
 |----|-----------|-------|-------|:------:|
 | X-1 | **CI activation** | ✅ Live: `pr-title`/`lint`/`test` (3 OSes)/`audit` now run real Rust gates; toolchain pinned (1.95.0). **Pending:** coverage gate (`cargo-llvm-cov` ≥80% on `sh-protocol`/`sh-crypto`/`sh-transport`), cross-OS clippy (lands with platform crates, P0-6), and an MSRV-verification job. | devops-engineer | 🟡 |
-| X-2 | **Testing infra** | `LoopbackTransport`, injected `Clock`+seedable RNG, `proptest`, `cargo-fuzz` targets, `loom` for lock-free queues. Build incrementally with each crate. | qa-engineer, rust-staff-engineer | ☐ |
+| X-2 | **Testing infra** | `LoopbackTransport`, injected `Clock`+seedable RNG, `proptest`, `cargo-fuzz` targets, `loom` for lock-free queues. Build incrementally with each crate. **Started:** proptest in use (sh-types/sh-protocol); first `cargo-fuzz` target `shp_decode` (P0-3). **Pending:** a scheduled nightly fuzz job; `LoopbackTransport` (P0-4); `loom`; coverage gate. | qa-engineer, rust-staff-engineer | 🟡 |
 | X-3 | **Security review cadence** | `security-engineer` reviews **every** crypto/auth/transport PR; `cargo audit` clean; document `snow` unaudited status. | security-engineer | ☐ |
 | X-4 | **Release engineering** | `xtask` for packaging/signing; signed releases (Sigstore/cosign), SBOM (CycloneDX), per-OS installers/services. | devops-engineer | ☐ |
 | X-5 | **Open decisions** | Resolve LLD §9 items before they block: Noise pattern names (SHA-256, before P3), platform-attestation envelope, UGC lifetime per compliance tier, `str0m` Safari interop (before P4/5). | software-architect, security-engineer | ☐ |
@@ -63,7 +63,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 |----|------|--------|---------|-------|-------|:------:|----|
 | P0-1 | Cargo workspace scaffold + workspace lints (panic-ban) + activate CI | (all skeleton) | — | rust-staff-engineer | crates compile; clippy `-D warnings` clean; CI goes live | ✅ | #5 |
 | P0-2 | `sh-types`: IDs, units, `FrameId`/`Timestamp`/`ChannelId`, error scaffolding | sh-types | P0-1 | rust-staff-engineer | unit | ✅ | #5 |
-| P0-3 | `sh-protocol`: common header + video payload header (per LLD §3.1), encode/decode | sh-protocol | P0-2 | rust-staff-engineer, network-engineer | **proptest** (never-panic + roundtrip) + **cargo-fuzz** target | ☐ | |
+| P0-3 | `sh-protocol`: common header + video payload header (per LLD §3.1), encode/decode | sh-protocol | P0-2 | rust-staff-engineer, network-engineer | **proptest** (never-panic + roundtrip) + **cargo-fuzz** target | ✅ | #6 |
 | P0-4 | `sh-transport`: bare `quinn` backend (LAN, datagrams), no ICE/crypto | sh-transport | P0-2 | network-engineer | loopback integration | ☐ | |
 | P0-5 | `sh-media`: `ScreenCapturer`/`VideoEncoder`/`VideoDecoder` traits + frame/surface types | sh-media | P0-2 | realtime-systems-engineer | trait doubles | ☐ | |
 | P0-6 | `sh-platform-win`: DXGI Desktop Duplication capture (zero-copy D3D11 surface) | sh-platform-win | P0-5 | realtime-systems-engineer | manual + smoke | ☐ | |
