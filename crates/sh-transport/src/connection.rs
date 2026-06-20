@@ -82,4 +82,13 @@ impl Connection {
     pub fn remote_address(&self) -> SocketAddr {
         self.inner.remote_address()
     }
+
+    /// The current QUIC-estimated round-trip time to the peer.
+    ///
+    /// This is a real path-RTT measurement maintained by the QUIC stack, so it is meaningful across
+    /// machines without any clock synchronization (unlike one-way latency).
+    #[must_use]
+    pub fn rtt(&self) -> std::time::Duration {
+        self.inner.rtt()
+    }
 }

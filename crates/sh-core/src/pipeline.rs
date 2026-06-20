@@ -75,7 +75,24 @@ pub async fn run_host_pipeline(
     let mut seq: u16 = 0;
     let mut results = Vec::with_capacity(params.frame_count);
 
+    // Optional real-time pacing. `MissedTickBehavior::Delay` paces frame starts to `fps` when the
+    // link can keep up, but never *adds* delay when sending is the bottleneck (it just falls in step
+    // behind the previous frame's completion), so a slow link naturally rate-limits without stalling.
+    let mut pacer = (params.pace_frames && params.fps > 0).then(|| {
+        let per_us = 1_000_000u64
+            .checked_div(u64::from(params.fps))
+            .unwrap_or(1)
+            .max(1);
+        let mut iv = tokio::time::interval(Duration::from_micros(per_us));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        iv
+    });
+
     for _ in 0..params.frame_count {
+        if let Some(iv) = pacer.as_mut() {
+            iv.tick().await;
+        }
+
         let max_datagram = conn
             .max_datagram_size()
             .ok_or(PipelineError::NoDatagramSupport)?;
