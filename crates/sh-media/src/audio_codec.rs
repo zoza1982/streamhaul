@@ -1,10 +1,41 @@
 //! Audio encoder and decoder traits.
 
-use sh_protocol::Codec;
-
+use crate::audio_codec_type::AudioCodec;
 use crate::audio_frame::AudioFrame;
 use crate::audio_packet::AudioEncodedPacket;
 use crate::error::MediaError;
+
+/// Capabilities of a concrete [`AudioEncoder`] backend, probed at startup.
+///
+/// This struct is the pipeline seam for sample-rate and channel-count
+/// negotiation. Inspect `sample_rate_hz` and `channels` before wiring
+/// an encoder to a capturer to determine whether an intermediate resampler
+/// or channel-layout converter is needed.
+///
+/// # Note — no `request_keyframe`
+/// Audio encoders intentionally do **not** expose a `request_keyframe`
+/// method. Opus (and PCM) have no keyframe concept; error resilience is
+/// handled at the packet level by FEC / PLC, not by forcing an intra-refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioEncoderCaps {
+    /// Codec this encoder produces.
+    pub codec: AudioCodec,
+    /// Output sample rate in Hz (e.g. 48 000).
+    pub sample_rate_hz: u32,
+    /// Number of interleaved output channels (e.g. 1 for mono, 2 for stereo).
+    pub channels: u8,
+}
+
+/// Capabilities of a concrete [`AudioDecoder`] backend.
+///
+/// # Note — no `request_keyframe`
+/// Audio decoders intentionally do **not** expose a `request_keyframe`
+/// method. See [`AudioEncoderCaps`] for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioDecoderCaps {
+    /// Codec this decoder consumes.
+    pub codec: AudioCodec,
+}
 
 /// Encodes raw [`AudioFrame`]s into [`AudioEncodedPacket`]s.
 ///
@@ -24,15 +55,19 @@ pub trait AudioEncoder: Send {
     /// declared format.
     fn encode(&mut self, frame: &AudioFrame) -> Result<Option<AudioEncodedPacket>, MediaError>;
 
-    /// Drain any internally buffered packet. Call once before dropping the encoder
-    /// so pipelined encoders do not drop their last pending output.
+    /// Drain any internally buffered packets. Call once before dropping the encoder
+    /// so pipelined encoders (e.g. a future Opus backend) do not drop tail packets.
+    ///
+    /// The default implementation returns an empty `Vec` (non-buffering encoder).
     ///
     /// # Errors
     /// Returns [`MediaError::Encode`] if the encoder fails while flushing.
-    fn flush(&mut self) -> Result<Option<AudioEncodedPacket>, MediaError>;
+    fn flush(&mut self) -> Result<Vec<AudioEncodedPacket>, MediaError> {
+        Ok(Vec::new())
+    }
 
-    /// The codec this encoder produces.
-    fn codec(&self) -> Codec;
+    /// This encoder's capabilities.
+    fn caps(&self) -> AudioEncoderCaps;
 }
 
 /// Decodes [`AudioEncodedPacket`]s back into raw [`AudioFrame`]s.
@@ -49,13 +84,17 @@ pub trait AudioDecoder: Send {
     /// fails. Implementations must never panic on malformed input.
     fn decode(&mut self, packet: &AudioEncodedPacket) -> Result<Option<AudioFrame>, MediaError>;
 
-    /// Drain any internally buffered frame. Call once before dropping the decoder
+    /// Drain any internally buffered frames. Call once before dropping the decoder
     /// so a buffering decoder does not drop its last pending output.
+    ///
+    /// The default implementation returns an empty `Vec` (non-buffering decoder).
     ///
     /// # Errors
     /// Returns [`MediaError::Decode`] if the decoder fails while flushing.
-    fn flush(&mut self) -> Result<Option<AudioFrame>, MediaError>;
+    fn flush(&mut self) -> Result<Vec<AudioFrame>, MediaError> {
+        Ok(Vec::new())
+    }
 
-    /// The codec this decoder consumes.
-    fn codec(&self) -> Codec;
+    /// This decoder's capabilities.
+    fn caps(&self) -> AudioDecoderCaps;
 }

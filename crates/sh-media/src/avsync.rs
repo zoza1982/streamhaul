@@ -14,6 +14,12 @@
 //!
 //! The controller is **clock-injected** via [`MonotonicClock`] so that tests
 //! are fully deterministic with no real `Instant::now()` calls.
+//!
+//! # Phase placement
+//! [`AvSync`] lives in `sh-media` for Phase-0 because it depends only on
+//! `sh_types::TimestampUs`. It is a **render-side** controller (it schedules
+//! playout instants, not capture instants) and may migrate to `sh-render` or
+//! `sh-core` in a later phase when those crates are established.
 
 use sh_types::TimestampUs;
 
@@ -29,7 +35,8 @@ pub trait MonotonicClock: Send {
 
 /// A/V sync controller.
 ///
-/// Establishes a common playout epoch from the first presented frame.
+/// Establishes a common playout epoch from the first presented frame (either
+/// audio or video — whichever arrives first sets the epoch).
 ///
 /// ```text
 /// playout_instant(capture_ts) = local_epoch + (capture_ts - capture_epoch)
@@ -39,6 +46,12 @@ pub trait MonotonicClock: Send {
 /// preserves relative timing exactly. Skew is measured as the signed difference
 /// between the most recently presented video and audio capture timestamps:
 /// positive skew means video is ahead of audio.
+///
+/// # Frame ordering
+/// Callers should present frames in per-stream capture order (monotonically
+/// increasing `capture_ts` within each stream). A stale (smaller) `capture_ts`
+/// will not update the epoch but will momentarily skew the measurement until
+/// the next in-order frame arrives. The controller does not reorder frames.
 pub struct AvSync<C: MonotonicClock> {
     clock: C,
     /// Capture timestamp of the very first frame (either stream).
@@ -65,7 +78,13 @@ impl<C: MonotonicClock> AvSync<C> {
 
     /// Present a video frame capture timestamp to the sync controller.
     ///
-    /// Returns the recommended playout time in microseconds (local clock).
+    /// The **first call** of either `present_video` or [`present_audio`](Self::present_audio)
+    /// establishes the playout epoch. Subsequent calls map the given `capture_ts_us`
+    /// relative to that epoch onto the local clock.
+    ///
+    /// Returns the scheduled playout instant in microseconds on the local clock.
+    /// If `capture_ts_us` is smaller than the capture epoch (a stale/out-of-order
+    /// frame), the playout instant is clamped to the epoch (immediate playout).
     pub fn present_video(&mut self, capture_ts_us: TimestampUs) -> TimestampUs {
         self.last_video_capture_ts = Some(capture_ts_us);
         self.playout_time(capture_ts_us)
@@ -73,7 +92,13 @@ impl<C: MonotonicClock> AvSync<C> {
 
     /// Present an audio packet capture timestamp to the sync controller.
     ///
-    /// Returns the recommended playout time in microseconds (local clock).
+    /// The **first call** of either `present_audio` or [`present_video`](Self::present_video)
+    /// establishes the playout epoch. Subsequent calls map the given `capture_ts_us`
+    /// relative to that epoch onto the local clock.
+    ///
+    /// Returns the scheduled playout instant in microseconds on the local clock.
+    /// If `capture_ts_us` is smaller than the capture epoch (a stale/out-of-order
+    /// frame), the playout instant is clamped to the epoch (immediate playout).
     pub fn present_audio(&mut self, capture_ts_us: TimestampUs) -> TimestampUs {
         self.last_audio_capture_ts = Some(capture_ts_us);
         self.playout_time(capture_ts_us)
@@ -106,13 +131,20 @@ impl<C: MonotonicClock> AvSync<C> {
         }
     }
 
-    /// Returns a correction hint for audio playout.
+    /// Returns a **measurement hint** for audio playout rate adaptation.
     ///
-    /// - Positive hint: advance audio playout (audio is behind video).
-    /// - Negative hint: hold audio playout (audio is ahead of video).
+    /// The value is `skew / 2`, clamped to ±500 ms. It represents **half the
+    /// current measured skew** and is intended as an input to a rate-adaptive
+    /// control law (e.g. an adaptive resampler or a PLL-based clock tracker).
     ///
-    /// The hint is a proportional nudge: `hint = skew / 2`, clamped to
-    /// ±500 ms to prevent runaway corrections.
+    /// **Interpretation:**
+    /// - Positive hint: video is ahead of audio → advance audio playout (speed up).
+    /// - Negative hint: audio is ahead of video → hold audio playout (slow down).
+    ///
+    /// **Important:** applying this hint naively as a one-shot offset will
+    /// oscillate. The caller is responsible for implementing the actual control
+    /// law (e.g. a leaky integrator or PI controller) to close the feedback loop
+    /// smoothly. This method only measures; it does not correct.
     ///
     /// Returns `None` if either stream has not presented a frame yet.
     pub fn audio_correction_hint_us(&self) -> Option<i64> {
@@ -330,6 +362,25 @@ mod tests {
     }
 
     #[test]
+    fn in_sync_at_exact_tolerance_boundary() {
+        // Verify `<=` semantics: skew exactly equal to tolerance is in-sync.
+        let clock = ManualClock::new(0);
+        let mut sync = AvSync::new(clock);
+        sync.present_video(TimestampUs(5_000));
+        sync.present_audio(TimestampUs(0));
+        // skew = 5000, tolerance = 5000 → |5000| <= 5000 → true
+        assert!(
+            sync.in_sync(5_000),
+            "skew exactly at tolerance must be in_sync (<=, not <)"
+        );
+        // one less than skew → false
+        assert!(
+            !sync.in_sync(4_999),
+            "skew 5000 at tolerance 4999 must not be in_sync"
+        );
+    }
+
+    #[test]
     fn correction_hint_advances_audio_when_video_ahead() {
         let clock = ManualClock::new(0);
         let mut sync = AvSync::new(clock);
@@ -361,5 +412,80 @@ mod tests {
         let t1 = sync.present_video(TimestampUs(1_500));
         // playout = local_epoch(1000) + (1500 - 500) = 1000 + 1000 = 2000
         assert_eq!(t1.0, 2_000);
+    }
+
+    #[test]
+    fn epoch_established_by_audio_first() {
+        // Audio presents first; video follows. Epoch must be set from audio.
+        let clock = ManualClock::new(2_000);
+        let mut sync = AvSync::new(clock);
+        let t_audio = sync.present_audio(TimestampUs(100));
+        assert_eq!(t_audio.0, 2_000, "audio-first: epoch set at local=2000");
+        // Video arrives later in local time; capture_ts=200 (100 µs after audio epoch).
+        sync.clock.advance(500);
+        let t_video = sync.present_video(TimestampUs(200));
+        // playout = local_epoch(2000) + (200 - 100) = 2100
+        assert_eq!(
+            t_video.0, 2_100,
+            "video playout = local_epoch + capture_offset"
+        );
+    }
+
+    #[test]
+    fn epoch_established_by_video_first() {
+        // Video presents first; audio follows. Epoch must be set from video.
+        let clock = ManualClock::new(3_000);
+        let mut sync = AvSync::new(clock);
+        let t_video = sync.present_video(TimestampUs(50));
+        assert_eq!(t_video.0, 3_000, "video-first: epoch set at local=3000");
+        sync.clock.advance(200);
+        let t_audio = sync.present_audio(TimestampUs(150));
+        // playout = local_epoch(3000) + (150 - 50) = 3100
+        assert_eq!(t_audio.0, 3_100);
+    }
+
+    #[test]
+    fn negative_offset_playout_clamps_to_epoch() {
+        // A frame with capture_ts < capture_epoch is stale; it should be scheduled
+        // for immediate playout (= local_epoch), not a time in the past.
+        let clock = ManualClock::new(1_000);
+        let mut sync = AvSync::new(clock);
+        // Epoch: capture=1000, local=1000.
+        sync.present_video(TimestampUs(1_000));
+        sync.clock.advance(100);
+        // Stale frame: capture_ts=500 < epoch=1000.
+        let t = sync.present_audio(TimestampUs(500));
+        assert_eq!(
+            t.0, 1_000,
+            "stale capture_ts < epoch must clamp to local_epoch"
+        );
+    }
+
+    #[test]
+    fn skew_saturates_at_extremes_no_panic() {
+        // u64::MAX video ts vs 0 audio ts — skew must saturate, never panic.
+        let clock = ManualClock::new(0);
+        let mut sync = AvSync::new(clock);
+        sync.present_video(TimestampUs(u64::MAX));
+        sync.present_audio(TimestampUs(0));
+        // i64::try_from(u64::MAX) fails → unwrap_or(i64::MAX); 0 → 0.
+        // skew = i64::MAX.saturating_sub(0) = i64::MAX
+        let skew = sync.skew_us().unwrap();
+        assert_eq!(skew, i64::MAX, "extreme skew must saturate to i64::MAX");
+
+        // Reverse: audio = u64::MAX, video = 0.
+        // a_i64 = i64::try_from(u64::MAX) fails → i64::MAX; v_i64 = 0.
+        // skew = 0.saturating_sub(i64::MAX) = i64::MIN + 1 (saturating_sub of MAX from 0).
+        let clock2 = ManualClock::new(0);
+        let mut sync2 = AvSync::new(clock2);
+        sync2.present_video(TimestampUs(0));
+        sync2.present_audio(TimestampUs(u64::MAX));
+        let skew2 = sync2.skew_us().unwrap();
+        // 0i64.saturating_sub(i64::MAX) = i64::MIN + 1, not i64::MIN.
+        assert_eq!(
+            skew2,
+            i64::MIN.saturating_add(1),
+            "extreme negative skew: 0 - i64::MAX saturates to i64::MIN + 1"
+        );
     }
 }

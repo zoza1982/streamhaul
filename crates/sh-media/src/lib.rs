@@ -15,6 +15,7 @@
 //! times from their shared capture clock (`LLD.md` §6.6).
 
 mod audio_codec;
+mod audio_codec_type;
 mod audio_frame;
 mod audio_packet;
 pub mod avsync;
@@ -28,7 +29,8 @@ mod synthetic_audio;
 
 use std::time::Duration;
 
-pub use audio_codec::{AudioDecoder, AudioEncoder};
+pub use audio_codec::{AudioDecoder, AudioDecoderCaps, AudioEncoder, AudioEncoderCaps};
+pub use audio_codec_type::AudioCodec;
 pub use audio_frame::AudioFrame;
 pub use audio_packet::AudioEncodedPacket;
 pub use avsync::{AvSync, MonotonicClock};

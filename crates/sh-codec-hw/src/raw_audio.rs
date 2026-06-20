@@ -18,11 +18,13 @@
 //! Total header length: [`RAW_AUDIO_HEADER_LEN`] = 8 bytes.
 //!
 //! TODO(deferred): Real Opus encode/decode — blocked on libopus/audiopus requiring cmake.
-//! Add Codec::Opus variant and RawOpusEncoder/Decoder when cmake is available.
+//! Add AudioCodec::Opus variant and RawOpusEncoder/Decoder when cmake is available.
 
 use bytes::Bytes;
-use sh_media::{AudioDecoder, AudioEncodedPacket, AudioEncoder, AudioFrame, MediaError};
-use sh_protocol::Codec;
+use sh_media::{
+    AudioCodec, AudioDecoder, AudioDecoderCaps, AudioEncodedPacket, AudioEncoder, AudioEncoderCaps,
+    AudioFrame, MediaError,
+};
 
 /// Length of the raw audio bitstream header in bytes.
 pub const RAW_AUDIO_HEADER_LEN: usize = 8;
@@ -38,14 +40,23 @@ const RAW_AUDIO_VERSION: u8 = 1;
 ///
 /// Every encoded packet can be decoded independently (there is no inter-frame
 /// state), so each output is effectively a keyframe.
-#[derive(Debug, Default, Clone)]
-pub struct RawAudioEncoder;
+#[derive(Debug, Clone)]
+pub struct RawAudioEncoder {
+    sample_rate: u32,
+    channels: u8,
+}
 
 impl RawAudioEncoder {
-    /// Create a new raw audio encoder.
+    /// Create a new raw audio encoder with the given format parameters.
+    ///
+    /// These parameters are reported via [`AudioEncoder::caps`] and must match
+    /// the [`AudioFrame`]s that will be submitted to [`encode`](Self::encode).
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(sample_rate: u32, channels: u8) -> Self {
+        Self {
+            sample_rate,
+            channels,
+        }
     }
 }
 
@@ -53,9 +64,19 @@ impl AudioEncoder for RawAudioEncoder {
     /// Encode one audio frame into a raw audio packet.
     ///
     /// # Errors
-    /// Returns [`MediaError::FrameSize`] if the frame's buffer is inconsistent
-    /// with its declared format (zero channels, zero sample rate, odd byte count).
+    /// Returns [`MediaError::Encode`] if the frame's `sample_rate`/`channels` do not match the
+    /// format this encoder was constructed with (and advertises via [`caps`](Self::caps)) — a
+    /// mismatch means a downstream component negotiating off `caps()` would operate on the wrong
+    /// format. Returns [`MediaError::FrameSize`] or [`MediaError::Unsupported`] if the frame's
+    /// buffer is inconsistent with its declared format (zero channels, zero sample rate, odd byte
+    /// count, or sample count not divisible by channel count for multi-channel frames).
     fn encode(&mut self, frame: &AudioFrame) -> Result<Option<AudioEncodedPacket>, MediaError> {
+        if frame.sample_rate != self.sample_rate || frame.channels != self.channels {
+            return Err(MediaError::Encode(format!(
+                "raw_audio: frame format {}Hz/{}ch does not match encoder caps {}Hz/{}ch",
+                frame.sample_rate, frame.channels, self.sample_rate, self.channels
+            )));
+        }
         frame.validate_len()?;
         let [r0, r1, r2, r3] = frame.sample_rate.to_be_bytes();
         let mut buf = Vec::with_capacity(RAW_AUDIO_HEADER_LEN.saturating_add(frame.samples.len()));
@@ -74,22 +95,24 @@ impl AudioEncoder for RawAudioEncoder {
             data: Bytes::from(buf),
             capture_ts_us: frame.capture_ts_us,
             seq: frame.seq,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         }))
     }
 
-    /// Flush any internally buffered packets.
-    ///
-    /// The raw encoder never buffers; this always returns `Ok(None)`.
+    /// This implementation never buffers; always returns an empty `Vec`.
     ///
     /// # Errors
     /// This implementation never returns an error.
-    fn flush(&mut self) -> Result<Option<AudioEncodedPacket>, MediaError> {
-        Ok(None)
+    fn flush(&mut self) -> Result<Vec<AudioEncodedPacket>, MediaError> {
+        Ok(Vec::new())
     }
 
-    fn codec(&self) -> Codec {
-        Codec::Raw
+    fn caps(&self) -> AudioEncoderCaps {
+        AudioEncoderCaps {
+            codec: AudioCodec::RawPcm,
+            sample_rate_hz: self.sample_rate,
+            channels: self.channels,
+        }
     }
 }
 
@@ -114,15 +137,16 @@ impl AudioDecoder for RawAudioDecoder {
     ///
     /// # Errors
     /// Returns [`MediaError::Decode`] if:
-    /// - `packet.codec` is not [`Codec::Raw`]
+    /// - `packet.codec` is not [`AudioCodec::RawPcm`]
     /// - The header is truncated (fewer than [`RAW_AUDIO_HEADER_LEN`] bytes)
     /// - The magic byte is not `0xA0`
     /// - The version byte is not `1`
     /// - `sample_rate` is zero
     /// - `channels` is zero
     /// - The payload length is odd (not a whole number of i16 samples)
+    /// - The total sample count is not divisible by the channel count (multi-channel frames)
     fn decode(&mut self, packet: &AudioEncodedPacket) -> Result<Option<AudioFrame>, MediaError> {
-        if packet.codec != Codec::Raw {
+        if packet.codec != AudioCodec::RawPcm {
             return Err(MediaError::Decode(format!(
                 "raw_audio: unexpected codec {:?}",
                 packet.codec
@@ -163,6 +187,21 @@ impl AudioDecoder for RawAudioDecoder {
                 "raw_audio: odd payload length — not a whole number of i16 samples".to_owned(),
             ));
         }
+        // For multi-channel frames: total sample count must be divisible by channels.
+        let total_samples = samples_bytes.len() / 2;
+        let ch_usize = usize::from(channels);
+        if ch_usize > 1 {
+            // checked_rem avoids the clippy::arithmetic_side_effects lint on `%`. ch_usize is
+            // non-zero (channels > 0 checked above) so this is always Some; the unwrap_or(1)
+            // fallback is fail-safe — if the guard above were ever removed, a zero divisor would
+            // yield a non-zero remainder and reject the frame rather than silently accepting it.
+            let rem = total_samples.checked_rem(ch_usize).unwrap_or(1);
+            if rem != 0 {
+                return Err(MediaError::Decode(format!(
+                    "raw_audio: sample count {total_samples} not divisible by channels {channels}"
+                )));
+            }
+        }
 
         Ok(Some(AudioFrame {
             samples: samples_bytes,
@@ -173,18 +212,18 @@ impl AudioDecoder for RawAudioDecoder {
         }))
     }
 
-    /// Flush any internally buffered frame.
-    ///
-    /// The raw decoder never buffers; this always returns `Ok(None)`.
+    /// This implementation never buffers; always returns an empty `Vec`.
     ///
     /// # Errors
     /// This implementation never returns an error.
-    fn flush(&mut self) -> Result<Option<AudioFrame>, MediaError> {
-        Ok(None)
+    fn flush(&mut self) -> Result<Vec<AudioFrame>, MediaError> {
+        Ok(Vec::new())
     }
 
-    fn codec(&self) -> Codec {
-        Codec::Raw
+    fn caps(&self) -> AudioDecoderCaps {
+        AudioDecoderCaps {
+            codec: AudioCodec::RawPcm,
+        }
     }
 }
 
@@ -213,13 +252,17 @@ mod tests {
         }
     }
 
+    fn make_encoder() -> RawAudioEncoder {
+        RawAudioEncoder::new(48_000, 1)
+    }
+
     #[test]
     fn roundtrip_mono() {
         let frame = make_frame(48_000, 1, 960);
-        let mut enc = RawAudioEncoder::new();
+        let mut enc = RawAudioEncoder::new(48_000, 1);
         let mut dec = RawAudioDecoder::new();
         let pkt = enc.encode(&frame).unwrap().unwrap();
-        assert_eq!(pkt.codec, Codec::Raw);
+        assert_eq!(pkt.codec, AudioCodec::RawPcm);
         assert_eq!(pkt.seq, frame.seq);
         assert_eq!(pkt.capture_ts_us, frame.capture_ts_us);
         let decoded = dec.decode(&pkt).unwrap().unwrap();
@@ -233,7 +276,7 @@ mod tests {
     #[test]
     fn roundtrip_stereo() {
         let frame = make_frame(44_100, 2, 1764);
-        let mut enc = RawAudioEncoder::new();
+        let mut enc = RawAudioEncoder::new(44_100, 2);
         let mut dec = RawAudioDecoder::new();
         let pkt = enc.encode(&frame).unwrap().unwrap();
         let decoded = dec.decode(&pkt).unwrap().unwrap();
@@ -241,29 +284,66 @@ mod tests {
     }
 
     #[test]
-    fn flush_returns_none() {
-        let mut enc = RawAudioEncoder::new();
+    fn flush_returns_empty_vec() {
+        let mut enc = make_encoder();
         let mut dec = RawAudioDecoder::new();
-        assert_eq!(enc.flush().unwrap(), None);
-        assert_eq!(dec.flush().unwrap(), None);
+        assert_eq!(enc.flush().unwrap(), Vec::<AudioEncodedPacket>::new());
+        assert_eq!(dec.flush().unwrap(), Vec::<AudioFrame>::new());
     }
 
     #[test]
-    fn codec_is_raw() {
-        assert_eq!(RawAudioEncoder::new().codec(), Codec::Raw);
-        assert_eq!(RawAudioDecoder::new().codec(), Codec::Raw);
+    fn codec_is_raw_pcm() {
+        assert_eq!(make_encoder().caps().codec, AudioCodec::RawPcm);
+        assert_eq!(RawAudioDecoder::new().caps().codec, AudioCodec::RawPcm);
     }
 
     #[test]
+    fn caps_reports_correct_format() {
+        let enc = RawAudioEncoder::new(44_100, 2);
+        let caps = enc.caps();
+        assert_eq!(caps.codec, AudioCodec::RawPcm);
+        assert_eq!(caps.sample_rate_hz, 44_100);
+        assert_eq!(caps.channels, 2);
+    }
+
+    #[test]
+    fn decode_accepts_well_formed_raw_pcm_packet() {
+        // Honest happy-path coverage. The decoder's wrong-codec rejection guard
+        // (`packet.codec != AudioCodec::RawPcm`) is structurally untestable while
+        // `AudioCodec` has only the `RawPcm` variant — see the tracked
+        // `decode_rejects_wrong_codec` below.
+        let mut dec = RawAudioDecoder::new();
+        let frame = make_frame(48_000, 1, 4);
+        let mut enc = RawAudioEncoder::new(48_000, 1);
+        let pkt = enc.encode(&frame).unwrap().unwrap();
+        assert!(dec.decode(&pkt).is_ok());
+    }
+
+    #[test]
+    #[ignore = "AudioCodec has only RawPcm today; re-enable when Opus lands (tracked: IMPLEMENTATION_PLAN.md R12)"]
     fn decode_rejects_wrong_codec() {
-        let mut dec = RawAudioDecoder::new();
-        let pkt = AudioEncodedPacket {
-            data: Bytes::from_static(&[0xA0, 1, 0, 0, 187, 128, 1, 0, 0, 0]),
-            capture_ts_us: TimestampUs(0),
-            seq: 0,
-            codec: Codec::H264,
-        };
-        assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
+        // When AudioCodec gains a second variant (e.g. Opus), construct a packet
+        // carrying it and assert the RawAudioDecoder rejects it:
+        //   let pkt = AudioEncodedPacket { codec: AudioCodec::Opus, .. };
+        //   assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
+    }
+
+    #[test]
+    fn encode_rejects_frame_format_mismatch() {
+        // Encoder advertises 48kHz/1ch via caps(); a frame with a different
+        // format must be rejected so a caps()-negotiating pipeline cannot
+        // silently operate on the wrong format.
+        let mut enc = RawAudioEncoder::new(48_000, 1);
+        let wrong_rate = make_frame(44_100, 1, 4);
+        assert!(matches!(
+            enc.encode(&wrong_rate),
+            Err(MediaError::Encode(_))
+        ));
+        let wrong_channels = make_frame(48_000, 2, 4);
+        assert!(matches!(
+            enc.encode(&wrong_channels),
+            Err(MediaError::Encode(_))
+        ));
     }
 
     #[test]
@@ -273,7 +353,7 @@ mod tests {
             data: Bytes::from_static(&[0xA0, 1, 0]),
             capture_ts_us: TimestampUs(0),
             seq: 0,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         };
         assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
     }
@@ -286,7 +366,7 @@ mod tests {
             data: Bytes::from(vec![0xBB, 1, 0, 0, 187, 128, 1, 0]),
             capture_ts_us: TimestampUs(0),
             seq: 0,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         };
         assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
     }
@@ -298,7 +378,7 @@ mod tests {
             data: Bytes::from(vec![0xA0, 99, 0, 0, 187, 128, 1, 0]),
             capture_ts_us: TimestampUs(0),
             seq: 0,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         };
         assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
     }
@@ -311,7 +391,7 @@ mod tests {
             data: Bytes::from(vec![0xA0, 1, 0, 0, 0, 0, 1, 0]),
             capture_ts_us: TimestampUs(0),
             seq: 0,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         };
         assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
     }
@@ -324,7 +404,7 @@ mod tests {
             data: Bytes::from(vec![0xA0, 1, 0, 0, 187, 128, 0, 0]),
             capture_ts_us: TimestampUs(0),
             seq: 0,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         };
         assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
     }
@@ -339,9 +419,28 @@ mod tests {
             data: Bytes::from(data),
             capture_ts_us: TimestampUs(0),
             seq: 0,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         };
         assert!(matches!(dec.decode(&pkt), Err(MediaError::Decode(_))));
+    }
+
+    #[test]
+    fn decode_rejects_stereo_frame_with_odd_sample_count() {
+        // channels=2, payload=6 bytes = 3 i16 samples → 3 % 2 != 0 → Err
+        // Header: magic=0xA0, ver=1, rate=48000=0x0000BB80, channels=2
+        let mut dec = RawAudioDecoder::new();
+        let mut data = vec![0xA0u8, 1, 0x00, 0x00, 0xBB, 0x80, 2, 0];
+        data.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]); // 6 bytes = 3 samples
+        let pkt = AudioEncodedPacket {
+            data: Bytes::from(data),
+            capture_ts_us: TimestampUs(0),
+            seq: 0,
+            codec: AudioCodec::RawPcm,
+        };
+        assert!(
+            matches!(dec.decode(&pkt), Err(MediaError::Decode(_))),
+            "stereo frame with 3 samples (not divisible by 2) must be rejected"
+        );
     }
 
     #[test]
@@ -353,7 +452,7 @@ mod tests {
             data: Bytes::from(vec![0xA0, 1, 0x00, 0x00, 0xBB, 0x80, 1, 0]),
             capture_ts_us: TimestampUs(0),
             seq: 0,
-            codec: Codec::Raw,
+            codec: AudioCodec::RawPcm,
         };
         let decoded = dec.decode(&pkt).unwrap().unwrap();
         assert_eq!(decoded.samples.len(), 0);
@@ -385,7 +484,7 @@ mod tests {
                     seq: 42,
                 };
 
-                let mut enc = RawAudioEncoder::new();
+                let mut enc = RawAudioEncoder::new(sample_rate, channels);
                 let mut dec = RawAudioDecoder::new();
                 let pkt = enc.encode(&frame).unwrap().unwrap();
                 let decoded = dec.decode(&pkt).unwrap().unwrap();

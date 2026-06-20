@@ -12,7 +12,7 @@
 //! traits and land during the on-hardware session.
 //!
 //! # Deferred
-//! - Opus audio encode/decode: blocked on `libopus`/`audiopus` requiring cmake. Add `Codec::Opus`
+//! - Opus audio encode/decode: blocked on `libopus`/`audiopus` requiring cmake. Add `AudioCodec::Opus`
 //!   variant and `RawOpusEncoder`/`RawOpusDecoder` when cmake is available.
 
 mod raw;

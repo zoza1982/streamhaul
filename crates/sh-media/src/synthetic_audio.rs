@@ -76,9 +76,10 @@ impl SyntheticAudioSource {
 
     /// Produce the next audio frame.
     ///
-    /// The capture timestamp is `seq * frame_duration_us`. Samples are a
-    /// deterministic ramp: each i16 value is `(seq * channels_count + sample_index) as i16`.
-    /// The ramp wraps naturally via i16 arithmetic, which is fine for test data.
+    /// The capture timestamp is `seq * frame_duration_us`. Samples are a deterministic ramp:
+    /// each i16 value is `(seq.wrapping_mul(1000).wrapping_add(sample_index)) as i16`, where
+    /// `sample_index` counts every interleaved sample in the frame (not per-channel). The ramp
+    /// wraps naturally via i16 arithmetic, which is fine for test data.
     ///
     /// The sequence number is incremented after each call.
     pub fn next_frame(&mut self) -> AudioFrame {

@@ -17,6 +17,11 @@ use crate::error::MediaError;
 pub struct AudioFrame {
     /// Interleaved i16 LE PCM samples for all channels.
     ///
+    /// The field is named `samples` (not `data`) to distinguish it from
+    /// [`VideoFrame::data`], which is an opaque pixel buffer. The naming
+    /// reflects the semantic: audio is addressable as typed i16 samples,
+    /// not as an arbitrary byte blob.
+    ///
     /// Length must be even (`len % 2 == 0`), since each sample is 2 bytes.
     /// For multi-channel audio `samples.len() / 2` must be divisible by `channels`.
     pub samples: Bytes,
@@ -37,27 +42,45 @@ impl AudioFrame {
     /// - `channels > 0`
     /// - `sample_rate > 0`
     /// - `samples.len() % 2 == 0` (each i16 is 2 bytes)
+    /// - For multi-channel audio: `(samples.len() / 2) % channels == 0`
+    ///   (the total sample count must be divisible by the channel count)
     ///
     /// # Errors
-    /// Returns [`MediaError::FrameSize`] if any invariant is violated.
+    /// Returns [`MediaError::Unsupported`] if `channels == 0` or `sample_rate == 0`.
+    /// Returns [`MediaError::FrameSize`] if the byte length is odd or the sample
+    /// count is not divisible by the channel count.
     pub fn validate_len(&self) -> Result<(), MediaError> {
         if self.channels == 0 {
-            return Err(MediaError::FrameSize {
-                expected: 0,
-                got: self.samples.len(),
-            });
+            return Err(MediaError::Unsupported(
+                "audio frame has zero channels".to_owned(),
+            ));
         }
         if self.sample_rate == 0 {
-            return Err(MediaError::FrameSize {
-                expected: 0,
-                got: self.samples.len(),
-            });
+            return Err(MediaError::Unsupported(
+                "audio frame has zero sample rate".to_owned(),
+            ));
         }
         if self.samples.len() % 2 != 0 {
             return Err(MediaError::FrameSize {
                 expected: self.samples.len().saturating_sub(1),
                 got: self.samples.len(),
             });
+        }
+        // For multi-channel frames: each channel must have a whole number of samples.
+        let total_samples = self.samples.len() / 2;
+        let ch = usize::from(self.channels);
+        if ch > 1 {
+            // checked_rem avoids the clippy::arithmetic_side_effects lint on `%` (variable divisor).
+            // ch is non-zero (channels > 0 checked above) so this is always Some; the unwrap_or(1)
+            // fallback is fail-safe — a zero divisor would yield a non-zero remainder and reject the
+            // frame rather than silently accepting it, should the guard above ever be removed.
+            let rem = total_samples.checked_rem(ch).unwrap_or(1);
+            if rem != 0 {
+                return Err(MediaError::FrameSize {
+                    expected: total_samples.saturating_sub(rem).saturating_mul(2),
+                    got: self.samples.len(),
+                });
+            }
         }
         Ok(())
     }
@@ -96,8 +119,8 @@ mod tests {
     fn validate_rejects_zero_channels() {
         let f = make_frame(4, 0, 48_000);
         assert!(
-            matches!(f.validate_len(), Err(MediaError::FrameSize { .. })),
-            "zero channels must be rejected"
+            matches!(f.validate_len(), Err(MediaError::Unsupported(_))),
+            "zero channels must be rejected with Unsupported"
         );
     }
 
@@ -105,8 +128,8 @@ mod tests {
     fn validate_rejects_zero_sample_rate() {
         let f = make_frame(4, 1, 0);
         assert!(
-            matches!(f.validate_len(), Err(MediaError::FrameSize { .. })),
-            "zero sample_rate must be rejected"
+            matches!(f.validate_len(), Err(MediaError::Unsupported(_))),
+            "zero sample_rate must be rejected with Unsupported"
         );
     }
 
@@ -117,6 +140,23 @@ mod tests {
             matches!(f.validate_len(), Err(MediaError::FrameSize { .. })),
             "odd byte count must be rejected"
         );
+    }
+
+    #[test]
+    fn validate_rejects_stereo_frame_with_odd_sample_count() {
+        // 6 bytes = 3 i16 samples, channels=2 → 3 % 2 != 0 → invalid
+        let f = make_frame(6, 2, 48_000);
+        assert!(
+            matches!(f.validate_len(), Err(MediaError::FrameSize { .. })),
+            "stereo frame with 3 samples (not divisible by 2 channels) must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_valid_stereo_frame() {
+        // 8 bytes = 4 i16 samples, channels=2 → 4 % 2 == 0 → valid
+        let f = make_frame(8, 2, 48_000);
+        assert!(f.validate_len().is_ok());
     }
 
     #[test]

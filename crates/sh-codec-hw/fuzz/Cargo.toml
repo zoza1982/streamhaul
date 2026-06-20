@@ -1,0 +1,48 @@
+# cargo-fuzz crate for sh-codec-hw. This is its OWN workspace (note the empty [workspace] table)
+# and is excluded from the main workspace, so `cargo build/clippy/test --workspace` and CI never
+# touch it. Run with a nightly toolchain:
+#   cargo +nightly fuzz run raw_audio_decode
+#   cargo +nightly fuzz run raw_decode
+# See README.md for details.
+[package]
+name = "sh-codec-hw-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sh-codec-hw]
+path = ".."
+
+[dependencies.sh-media]
+path = "../../sh-media"
+
+[dependencies.sh-types]
+path = "../../sh-types"
+
+[dependencies.sh-protocol]
+path = "../../sh-protocol"
+
+[dependencies.bytes]
+version = "1"
+
+[[bin]]
+name = "raw_audio_decode"
+path = "fuzz_targets/raw_audio_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raw_decode"
+path = "fuzz_targets/raw_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
