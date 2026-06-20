@@ -1,14 +1,35 @@
 [package]
 name = "sh-core"
-description = "Umbrella facade composing the Streamhaul engine (Session/HostEngine/ClientEngine). Scaffold."
+description = "Umbrella facade composing the Streamhaul engine; Phase-0 pipeline and latency harness."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+harness = ["dep:quinn", "dep:sh-codec-hw"]
+
 [dependencies]
 sh-types = { path = "../sh-types" }
+sh-media = { path = "../sh-media" }
+sh-transport = { path = "../sh-transport" }
+sh-protocol = { path = "../sh-protocol" }
+bytes.workspace = true
+tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+thiserror.workspace = true
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
+sh-codec-hw = { path = "../sh-codec-hw", optional = true }
+
+[dev-dependencies]
+sh-transport = { path = "../sh-transport", features = ["insecure-lan"] }
+sh-media = { path = "../sh-media" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+proptest.workspace = true
+
+[[test]]
+name = "loopback_harness"
+required-features = ["harness"]
 
 [lints]
 workspace = true

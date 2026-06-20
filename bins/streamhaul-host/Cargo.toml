@@ -9,6 +9,12 @@ rust-version.workspace = true
 
 [dependencies]
 sh-core = { path = "../../crates/sh-core" }
+sh-media = { path = "../../crates/sh-media" }
+sh-codec-hw = { path = "../../crates/sh-codec-hw" }
+sh-transport = { path = "../../crates/sh-transport", features = ["insecure-lan"] }
+sh-render = { path = "../../crates/sh-render" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+anyhow = "1"
 
 [lints]
 workspace = true

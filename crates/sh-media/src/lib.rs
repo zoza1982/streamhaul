@@ -13,6 +13,7 @@ mod config;
 mod error;
 mod frame;
 mod packet;
+pub mod sink;
 mod synthetic;
 
 use std::time::Duration;
@@ -21,6 +22,7 @@ pub use config::{DecoderCaps, EncoderCaps, EncoderConfig};
 pub use error::MediaError;
 pub use frame::{PixelFormat, Resolution, VideoFrame};
 pub use packet::EncodedPacket;
+pub use sink::{CollectingSink, FrameSink, NullSink, RenderError};
 pub use synthetic::SyntheticCapturer;
 
 /// A source of raw video frames (a screen/window/display, or a synthetic generator).

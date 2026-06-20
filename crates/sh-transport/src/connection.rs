@@ -36,6 +36,29 @@ impl Connection {
         })
     }
 
+    /// Send a datagram to the remote peer, waiting if the send buffer is full.
+    ///
+    /// Unlike [`send_datagram`](Self::send_datagram), this method is `async` and will
+    /// yield to the runtime until the datagram can be accepted into the send buffer.
+    /// Backpressure is against the QUIC send buffer, not the receiver — the peer may still have an
+    /// empty datagram receive buffer when this call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::DatagramsNotSupported`] if the remote peer disabled datagram
+    /// support, or [`TransportError::SendDatagram`] for any other send failure.
+    pub async fn send_datagram_wait(&self, data: Bytes) -> Result<(), TransportError> {
+        self.inner
+            .send_datagram_wait(data)
+            .await
+            .map_err(|e| match e {
+                quinn::SendDatagramError::UnsupportedByPeer => {
+                    TransportError::DatagramsNotSupported
+                }
+                other => TransportError::SendDatagram(other),
+            })
+    }
+
     /// Receive the next datagram from the remote peer.
     ///
     /// # Errors

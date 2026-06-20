@@ -3,6 +3,12 @@
 version = 3
 
 [[package]]
+name = "anyhow"
+version = "1.0.102"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -548,7 +554,16 @@ dependencies = [
 name = "sh-core"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "proptest",
+ "quinn",
+ "sh-codec-hw",
+ "sh-media",
+ "sh-protocol",
+ "sh-transport",
  "sh-types",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -581,6 +596,9 @@ dependencies = [
 [[package]]
 name = "sh-render"
 version = "0.0.0"
+dependencies = [
+ "sh-media",
+]
 
 [[package]]
 name = "sh-signaling"
@@ -631,14 +649,26 @@ dependencies = [
 name = "streamhaul-client"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "sh-codec-hw",
  "sh-core",
+ "sh-media",
+ "sh-render",
+ "sh-transport",
+ "tokio",
 ]
 
 [[package]]
 name = "streamhaul-host"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "sh-codec-hw",
  "sh-core",
+ "sh-media",
+ "sh-render",
+ "sh-transport",
+ "tokio",
 ]
 
 [[package]]
