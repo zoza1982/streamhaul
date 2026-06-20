@@ -388,6 +388,10 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────────
 
     /// Verify the quinn_priority mapping: priority 0 → 255 (highest), 255 → 0 (lowest).
+    ///
+    // TODO(P1-5): this only checks the i32 mapping; the actual scheduling effect (high-priority
+    // streams draining before low-priority ones under contention) is exercised by the P1-5
+    // starvation test, once datagram/stream demux and a contended-link harness exist.
     #[test]
     fn priority_mapping_inverts_correctly() {
         let high = ChannelSpec::input(); // priority 0 → quinn 255

@@ -111,27 +111,17 @@ impl CommonHeader {
     }
 }
 
+/// Encode the 4-bit CHANNEL field. Delegates to the single source of truth in `sh-types`
+/// (`u8::from(ChannelId)`) so the SHP header and the transport stream-open header can never
+/// disagree on the discriminant mapping.
 fn channel_to_bits(channel: ChannelId) -> u8 {
-    match channel {
-        ChannelId::Video => 0,
-        ChannelId::Audio => 1,
-        ChannelId::Input => 2,
-        ChannelId::Clipboard => 3,
-        ChannelId::File => 4,
-        ChannelId::Control => 5,
-    }
+    u8::from(channel)
 }
 
+/// Parse the 4-bit CHANNEL field, delegating to [`ChannelId::try_from`] (the single source of truth)
+/// and mapping unknown values to [`ProtocolError::InvalidChannel`].
 fn channel_from_bits(bits: u8) -> Result<ChannelId, ProtocolError> {
-    match bits {
-        0 => Ok(ChannelId::Video),
-        1 => Ok(ChannelId::Audio),
-        2 => Ok(ChannelId::Input),
-        3 => Ok(ChannelId::Clipboard),
-        4 => Ok(ChannelId::File),
-        5 => Ok(ChannelId::Control),
-        other => Err(ProtocolError::InvalidChannel(other)),
-    }
+    ChannelId::try_from(bits).map_err(|_| ProtocolError::InvalidChannel(bits))
 }
 
 #[cfg(test)]
