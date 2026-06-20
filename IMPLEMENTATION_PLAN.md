@@ -23,7 +23,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 
 | Phase | Theme | Gate (exit) | Status |
 |-------|-------|-------------|:------:|
-| **P0** | Hello Pixels (latency lab) | Live Win→native render, ≤~30ms glass-to-glass LAN @60fps, zero-copy DXGI→NVENC, 10-min stable | ☐ |
+| **P0** | Hello Pixels (latency lab) | Live Win→native render, ≤~30ms glass-to-glass LAN @60fps, zero-copy DXGI→NVENC, 10-min stable | 🟡 |
 | **P1** | Input + multi-channel + audio | Click-to-photon measured; audio AV-synced; input never starved by video | ☐ |
 | **P2** | Adaptivity (Game/Work) | Smooth adapt under loss/bandwidth caps; mode switch no flapping; loss recovery works | ☐ |
 | **P3** | Security & pairing | First-pair TOFU pins key; unpinned MITM rejected; all channels E2E; rotation tested | ☐ |
@@ -33,7 +33,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
 
-**Progress:** 0 / 41 tasks complete.
+**Progress:** 2 / 41 tasks complete (P0-1, P0-2).
 
 ---
 
@@ -41,7 +41,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 
 | ID | Workstream | Notes | Agent | Status |
 |----|-----------|-------|-------|:------:|
-| X-1 | **CI activation** | `lint`/`test`/`audit` jobs go live automatically once `Cargo.toml` exists (done in P0-1). Add coverage gate (`cargo-llvm-cov` ≥80% on `sh-protocol`/`sh-crypto`/`sh-transport`). | devops-engineer | ☐ |
+| X-1 | **CI activation** | ✅ Live: `pr-title`/`lint`/`test` (3 OSes)/`audit` now run real Rust gates; toolchain pinned (1.95.0). **Pending:** coverage gate (`cargo-llvm-cov` ≥80% on `sh-protocol`/`sh-crypto`/`sh-transport`), cross-OS clippy (lands with platform crates, P0-6), and an MSRV-verification job. | devops-engineer | 🟡 |
 | X-2 | **Testing infra** | `LoopbackTransport`, injected `Clock`+seedable RNG, `proptest`, `cargo-fuzz` targets, `loom` for lock-free queues. Build incrementally with each crate. | qa-engineer, rust-staff-engineer | ☐ |
 | X-3 | **Security review cadence** | `security-engineer` reviews **every** crypto/auth/transport PR; `cargo audit` clean; document `snow` unaudited status. | security-engineer | ☐ |
 | X-4 | **Release engineering** | `xtask` for packaging/signing; signed releases (Sigstore/cosign), SBOM (CycloneDX), per-OS installers/services. | devops-engineer | ☐ |
@@ -53,11 +53,16 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 
 > Goal: prove the latency budget on the thinnest vertical slice. Windows host → native client, LAN, H.264,
 > **bare `quinn` QUIC (no ICE/crypto)**, no adaptivity. Validates codec/render pipeline in isolation.
+>
+> **Scaffolding note (P0-1):** the workspace ships 10 portable `sh-*` libs + 2 bins. The platform/codec
+> crates `sh-codec-hw` (P0-7) and `sh-platform-win` (P0-6), and the bindings `sh-ffi`/`sh-wasm` (P5/P8),
+> are created **with their tasks** — they need real platform code to compile cross-OS, so adding empty
+> stubs now would break `cargo test` on the Linux/macOS CI runners.
 
 | ID | Task | Crates | Depends | Agent | Tests | Status | PR |
 |----|------|--------|---------|-------|-------|:------:|----|
-| P0-1 | Cargo workspace scaffold + workspace lints (panic-ban) + activate CI | (all skeleton) | — | rust-staff-engineer | crates compile; clippy `-D warnings` clean; CI goes live | ☐ | |
-| P0-2 | `sh-types`: IDs, units, `FrameId`/`Timestamp`/`ChannelId`, error scaffolding | sh-types | P0-1 | rust-staff-engineer | unit | ☐ | |
+| P0-1 | Cargo workspace scaffold + workspace lints (panic-ban) + activate CI | (all skeleton) | — | rust-staff-engineer | crates compile; clippy `-D warnings` clean; CI goes live | ✅ | #5 |
+| P0-2 | `sh-types`: IDs, units, `FrameId`/`Timestamp`/`ChannelId`, error scaffolding | sh-types | P0-1 | rust-staff-engineer | unit | ✅ | #5 |
 | P0-3 | `sh-protocol`: common header + video payload header (per LLD §3.1), encode/decode | sh-protocol | P0-2 | rust-staff-engineer, network-engineer | **proptest** (never-panic + roundtrip) + **cargo-fuzz** target | ☐ | |
 | P0-4 | `sh-transport`: bare `quinn` backend (LAN, datagrams), no ICE/crypto | sh-transport | P0-2 | network-engineer | loopback integration | ☐ | |
 | P0-5 | `sh-media`: `ScreenCapturer`/`VideoEncoder`/`VideoDecoder` traits + frame/surface types | sh-media | P0-2 | realtime-systems-engineer | trait doubles | ☐ | |

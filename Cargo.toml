@@ -33,7 +33,7 @@ thiserror = "2"
 # so every `warn` below is effectively a hard error in CI.
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-missing_docs = "warn"
+missing_docs = "deny"
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
@@ -47,3 +47,9 @@ indexing_slicing = "warn"
 arithmetic_side_effects = "warn"
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
+
+# Release profile tuned for a latency-sensitive product (used from P0-10 onward).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

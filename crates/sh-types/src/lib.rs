@@ -9,11 +9,16 @@ use thiserror::Error;
 /// A monotonic, per-session encoded-frame identifier.
 ///
 /// On the wire (SHP video header) the field is 24 bits and wraps at 2^24; in memory it is widened to
-/// [`u64`] so accumulation logic never has to reason about wrap-around.
+/// [`u64`] so accumulation logic never has to reason about wrap-around. The inner field is public on
+/// purpose — these are deliberately thin typed-integer wrappers, not invariant-bearing types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FrameId(pub u64);
 
 /// A monotonic timestamp in microseconds since the session epoch (not wall-clock time).
+///
+/// On the wire (SHP common header) the TIMESTAMP field is 32 bits and wraps at 2^32 µs (~71 min); in
+/// memory it is widened to [`u64`] so session-level accounting never has to handle wrap-around. The
+/// inner field is public on purpose (a thin typed wrapper).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TimestampUs(pub u64);
 
@@ -37,6 +42,10 @@ pub enum ChannelId {
 
 /// Errors shared across Streamhaul crates. Crate-specific errors wrap or convert into this where they
 /// cross a public boundary.
+///
+/// The `String` payloads are **scaffolding placeholders**: concrete crates (`sh-protocol`,
+/// `sh-transport`, …) define richer, matchable error types and will replace these with structured
+/// variants as those crates land. Downstream callers should not match on the message text.
 #[derive(Debug, Error)]
 pub enum Error {
     /// A wire-format or protocol violation (malformed header, unexpected message, version mismatch).
@@ -51,7 +60,6 @@ pub enum Error {
 pub type Result<T> = core::result::Result<T, Error>;
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 

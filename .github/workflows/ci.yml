@@ -94,11 +94,14 @@ jobs:
         id: rust
         run: |
           if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Install cargo-audit (prebuilt)
+        if: steps.rust.outputs.present == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - name: cargo audit
         if: steps.rust.outputs.present == 'true'
-        run: |
-          cargo install cargo-audit --locked
-          cargo audit --deny warnings
+        run: cargo audit --deny warnings
       - name: No Rust code yet
         if: steps.rust.outputs.present == 'false'
         run: echo "No Cargo.toml yet — audit gate is a no-op until Rust code lands."
