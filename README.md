@@ -15,10 +15,24 @@ enterprise control plane.
 
 ## Status
 
-Early definition. This repo currently holds the high-level product requirements.
+Early definition. This repo currently holds the high-level product requirements and the engineering
+pipeline. Low-Level Design (LLD) is the next milestone.
 
 - [`PRD.md`](./PRD.md) — High-level PRD (architecture, transport/protocol, video pipeline, security, scope).
-  Low-Level Design (LLD) is the next milestone.
+- [`docs/adr/`](./docs/adr/) — Architecture Decision Records.
+
+## Development
+
+This project enforces a strict quality bar (it ships a remote-control product). Before contributing,
+read the rules — they apply to humans and AI alike.
+
+- [`CLAUDE.md`](./CLAUDE.md) — **authoritative engineering rulebook**: the quality gate (test →
+  `bug-bot` → `code-reviewer` → fix → only then push), testing/security/docs standards, agent map.
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md) — branching, Conventional Commits, PR workflow.
+- [`SECURITY.md`](./SECURITY.md) — private vulnerability disclosure.
+
+**Pipeline:** `main` is protected — every change lands via a feature branch + PR with green CI
+(`pr-title`, `lint`, `test` on Linux/Windows/macOS, `audit`) and a passing Definition of Done.
 
 ## Key technical decisions (at a glance)
 

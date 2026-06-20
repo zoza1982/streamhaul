@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Enforce Conventional Commits on the PR title (powers squash-merge commit msg)
+  # ----------------------------------------------------------------------------
+  pr-title:
+    name: pr-title
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title (Conventional Commits)
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR title: $TITLE"
+          if ! echo "$TITLE" | grep -Eq '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._-]+\))?!?: .+'; then
+            echo "::error::PR title must follow Conventional Commits, e.g. 'feat(transport): add QUIC datagram path'"
+            exit 1
+          fi
+
+  # ----------------------------------------------------------------------------
+  # Lint: rustfmt + clippy (deny warnings). No-ops cleanly until Rust code lands.
+  # ----------------------------------------------------------------------------
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Rust project
+        id: rust
+        run: |
+          if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Add rustfmt + clippy
+        if: steps.rust.outputs.present == 'true'
+        run: rustup component add rustfmt clippy
+      - name: cargo fmt --check
+        if: steps.rust.outputs.present == 'true'
+        run: cargo fmt --all -- --check
+      - name: cargo clippy -D warnings
+        if: steps.rust.outputs.present == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: No Rust code yet
+        if: steps.rust.outputs.present == 'false'
+        run: echo "No Cargo.toml yet — lint gate is a no-op until Rust code lands."
+
+  # ----------------------------------------------------------------------------
+  # Test: full suite across Linux, Windows, macOS.
+  # ----------------------------------------------------------------------------
+  test:
+    name: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Rust project
+        id: rust
+        shell: bash
+        run: |
+          if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Build & test
+        if: steps.rust.outputs.present == 'true'
+        run: cargo test --workspace --all-features --verbose
+      - name: No Rust code yet
+        if: steps.rust.outputs.present == 'false'
+        shell: bash
+        run: echo "No Cargo.toml yet — test gate is a no-op until Rust code lands."
+
+  # ----------------------------------------------------------------------------
+  # Security audit of dependencies.
+  # ----------------------------------------------------------------------------
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Rust project
+        id: rust
+        run: |
+          if [ -f Cargo.toml ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - name: cargo audit
+        if: steps.rust.outputs.present == 'true'
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
+      - name: No Rust code yet
+        if: steps.rust.outputs.present == 'false'
+        run: echo "No Cargo.toml yet — audit gate is a no-op until Rust code lands."
