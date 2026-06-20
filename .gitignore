@@ -1,6 +1,10 @@
 # Claude Code session/local data
 .claude/
 
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
 # OS / editor cruft
 .DS_Store
 *.swp

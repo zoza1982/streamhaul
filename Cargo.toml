@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sh-types",
+    "crates/sh-protocol",
+    "crates/sh-transport",
+    "crates/sh-media",
+    "crates/sh-adaptive",
+    "crates/sh-crypto",
+    "crates/sh-signaling",
+    "crates/sh-ice",
+    "crates/sh-render",
+    "crates/sh-core",
+    "bins/streamhaul-host",
+    "bins/streamhaul-client",
+]
+
+# Shared metadata inherited by every crate via `field.workspace = true`.
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zoza1982/streamhaul"
+authors = ["Streamhaul contributors"]
+rust-version = "1.82"
+
+# Shared dependency versions. Members opt in with `dep.workspace = true`.
+[workspace.dependencies]
+thiserror = "2"
+
+# Workspace-wide lints enforce the CLAUDE.md panic-ban and safety posture.
+# Members opt in with `[lints] workspace = true`. CI runs clippy with `-D warnings`,
+# so every `warn` below is effectively a hard error in CI.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+
+# Release profile tuned for a latency-sensitive product (used from P0-10 onward).
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

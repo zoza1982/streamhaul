@@ -1,0 +1,6 @@
+# Pinned toolchain for reproducible builds and a stable lint set across the team and CI.
+# Bump deliberately (not floating "stable") so a new release's lints can't fail CI with no
+# source change. `llvm-tools` is included for cargo-llvm-cov coverage (X-1).
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy", "llvm-tools"]

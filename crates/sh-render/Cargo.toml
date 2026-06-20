@@ -1,0 +1,11 @@
+[package]
+name = "sh-render"
+description = "Client present pipeline: wgpu swapchain, YUV-to-RGB, jitter buffer, frame pacing."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

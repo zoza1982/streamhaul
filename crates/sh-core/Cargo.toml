@@ -1,0 +1,14 @@
+[package]
+name = "sh-core"
+description = "Umbrella facade composing the Streamhaul engine (Session/HostEngine/ClientEngine). Scaffold."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sh-types = { path = "../sh-types" }
+
+[lints]
+workspace = true
