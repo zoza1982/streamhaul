@@ -33,7 +33,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
 
-**Progress:** 6 / 41 tasks complete (P0-1…P0-5, P0-9); P0-6/7/8/10 portable software paths done + tested locally, with the real DXGI/NVENC/wgpu + LAN-budget work deferred to the on-hardware session. **The full portable Phase-0 vertical slice runs end-to-end and is measured (loopback).**
+**Progress:** Phase 0 complete (P0-1…P0-10; P0-6/7/8/10 via portable software paths, real DXGI/NVENC/wgpu + LAN-budget deferred to the on-hardware session). **Phase 1: P1-1, P1-2, P1-4, P1-5 done** (P1-4 portable audio + `AvSync`; real WASAPI/Opus deferred — R13); **P1-3 (input injection) remaining.** The full portable Phase-0 vertical slice runs end-to-end and is measured (loopback); Phase-1 input/control framing, multi-channel transport, prioritization, and audio AV-sync are landed and gated.
 
 > **Phase-0 local-vs-hardware note (overnight build):** the dev laptop is **Linux/Intel iGPU, no Windows SDK, no NVIDIA, no cmake/nasm/clang**, so the *real* hardware paths — DXGI capture (P0-6), NVENC encode (P0-7), wgpu-on-display (P0-8) — cannot be built or verified here. The overnight work delivers a **portable, pure-Rust software pipeline** (synthetic capture → raw codec → loopback QUIC → decode → headless sink → latency harness) that runs and is measured **locally and in CI**, achieving Phase 0's *purpose* (validate the vertical-slice latency budget). The hardware backends slot in behind the same traits during the on-hardware/LAN session.
 
@@ -87,12 +87,14 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | P1-1 | Promote `Transport`/`Channel` trait + `ChannelSpec`; multi-channel (video unreliable + input reliable, **input urgency 0**) | sh-transport | P0 | network-engineer, rust-staff-engineer | loopback multi-channel | ✅ | #15 |
 | P1-2 | `sh-protocol`: input event message (LLD §3.1) + control/RPC framing | sh-protocol | P0-3 | network-engineer | proptest + fuzz | ✅ | #14 |
 | P1-3 | `sh-platform-win`: `InputInjector` (SendInput/Raw Input), normalized coord mapping, multi-monitor | sh-platform-win | P1-1,P1-2 | realtime-systems-engineer | injection smoke | ☐ | |
-| P1-4 | Audio: WASAPI loopback capture + Opus encode/decode + AV sync (shared monotonic clock) | sh-media, sh-codec-hw | P0 | realtime-systems-engineer | sync test | ☐ | |
+| P1-4 | Audio: capture + encode/decode + AV sync (shared monotonic clock). **Portable slice done**: `AudioFrame`/`AudioEncoder`/`AudioDecoder` traits + `AudioCodec` + raw-PCM codec + `SyntheticAudioSource` + `AvSync` controller (±20ms, max skew 18.4ms). **Deferred** (no audio hardware on dev box): real WASAPI loopback capture + Opus — see note. | sh-media, sh-codec-hw | P0 | realtime-systems-engineer | sync test + raw-audio fuzz | ✅ | #17 |
 | P1-5 | Channel prioritization (input > video) + file-channel congestion-isolation scaffolding | sh-transport | P1-1 | network-engineer | starvation test under load | ✅ | #16 |
 
-**Gate P1:** ☐ click-to-photon measured · ☐ audio AV-synced (±20ms) · ☑ input not starved under video load (structural per-stream isolation; loopback test #16).
+**Gate P1:** ☐ click-to-photon measured · ☑ audio AV-synced (±20ms) (`AvSync` controller; max skew 18.4ms < 20ms target, deterministic over 3 runs; test in `sh-media`) · ☑ input not starved under video load (structural per-stream isolation; loopback test #16).
 
 > **Datagram demux** (route datagrams to the right channel by SHP CHANNEL field — needed once video+audio coexist) and a **bandwidth-shaped congestion-scheduling test** (loopback can't create real congestion) remain follow-ups (see Risk Register).
+>
+> **P1-4 audio hardware deferred** (R13): the portable software path (synthetic source → raw-PCM codec → `AvSync`) lands now so the pipeline is measurable on any machine incl. CI; real **WASAPI loopback capture** + **Opus** encode/decode arrive with platform crates (no audio capture hardware / Opus toolchain on the dev box). The trait seams (`AudioEncoder`/`AudioDecoder` + `AudioCodec`) are designed so Opus drops in without touching callers.
 
 ---
 
@@ -216,6 +218,8 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | R9 | Lab bins (`streamhaul-host`/`streamhaul-client`) report **QUIC RTT**, not true one-way glass-to-photon latency — cross-machine one-way latency needs synchronized clocks (NTP/PTP). Add real one-way latency measurement once clock sync is available. | P0-10 / LAN | performance-tuning-engineer |
 | R10 | The bins have no **client-done back-channel**: the host waits a fixed 1.5s drain `sleep` before dropping the connection (a hack). Replace with a proper completion handshake (like the loopback harness's oneshot) so the tail isn't lost and exit is deterministic. | P1 | rust-staff-engineer |
 | R11 | Add a `--json` report mode to the lab bins so WiFi/LAN test runs are machine-parseable (automation, regression tracking). | P0-10 | rust-staff-engineer |
+| R12 | `AudioCodec` has only `RawPcm` today, so `RawAudioDecoder`'s wrong-codec rejection guard is structurally untestable (`decode_rejects_wrong_codec` is `#[ignore]`d). Re-enable the test when a second variant (Opus) lands. | P2 (Opus) | realtime-systems-engineer |
+| R13 | P1-4 ships the **portable audio path only** (synthetic source + raw-PCM codec + `AvSync`). Real **WASAPI loopback capture** + **Opus** encode/decode are deferred until platform crates land (no audio hardware / Opus toolchain on dev box). Trait seams (`AudioEncoder`/`AudioDecoder`/`AudioCodec`) are designed for drop-in Opus. | P2 | realtime-systems-engineer |
 
 ---
 

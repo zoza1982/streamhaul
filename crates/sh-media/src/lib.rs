@@ -1,29 +1,48 @@
 //! Codec-agnostic media traits and types for Streamhaul.
 //!
 //! This crate defines the seams the capture/encode/decode pipeline is built from — [`ScreenCapturer`],
-//! [`VideoEncoder`], [`VideoDecoder`] — plus the shared [`VideoFrame`] / [`EncodedPacket`] types
-//! (see `LLD.md` §2, §5). Concrete hardware backends (DXGI capture, NVENC/QSV/VideoToolbox encode)
-//! live in `sh-codec-hw` / `sh-platform-*` and implement these traits.
+//! [`VideoEncoder`], [`VideoDecoder`], [`AudioEncoder`], [`AudioDecoder`] — plus the shared
+//! [`VideoFrame`] / [`EncodedPacket`] / [`AudioFrame`] / [`AudioEncodedPacket`] types
+//! (see `LLD.md` §2, §5, §6). Concrete hardware backends (DXGI capture, NVENC/QSV/VideoToolbox encode,
+//! WASAPI/ALSA capture) live in `sh-codec-hw` / `sh-platform-*` and implement these traits.
 //!
 //! The traits are **synchronous**: capture and encode run on dedicated real-time threads, not on the
-//! async runtime (`LLD.md` §1). A portable [`SyntheticCapturer`] is provided so the Phase-0 pipeline
-//! can run and be measured on any machine (including headless CI) without capture hardware.
+//! async runtime (`LLD.md` §1). Portable synthetic sources ([`SyntheticCapturer`],
+//! [`SyntheticAudioSource`]) are provided so the Phase-0 pipeline can run and be measured on any
+//! machine (including headless CI) without capture hardware.
+//!
+//! The [`avsync`] module provides the [`AvSync`] controller for aligning audio and video playout
+//! times from their shared capture clock (`LLD.md` §6.6).
 
+mod audio_codec;
+mod audio_codec_type;
+mod audio_frame;
+mod audio_packet;
+pub mod avsync;
 mod config;
 mod error;
 mod frame;
 mod packet;
 pub mod sink;
 mod synthetic;
+mod synthetic_audio;
 
 use std::time::Duration;
 
+pub use audio_codec::{AudioDecoder, AudioDecoderCaps, AudioEncoder, AudioEncoderCaps};
+pub use audio_codec_type::AudioCodec;
+pub use audio_frame::AudioFrame;
+pub use audio_packet::AudioEncodedPacket;
+pub use avsync::{AvSync, MonotonicClock};
 pub use config::{DecoderCaps, EncoderCaps, EncoderConfig};
 pub use error::MediaError;
 pub use frame::{PixelFormat, Resolution, VideoFrame};
 pub use packet::EncodedPacket;
 pub use sink::{CollectingSink, FrameSink, NullSink, RenderError};
 pub use synthetic::SyntheticCapturer;
+pub use synthetic_audio::{
+    SyntheticAudioSource, DEFAULT_CHANNELS, DEFAULT_FRAME_DURATION_US, DEFAULT_SAMPLE_RATE,
+};
 
 /// A source of raw video frames (a screen/window/display, or a synthetic generator).
 ///
