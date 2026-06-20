@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# cargo-fuzz crates are their own workspaces and need a nightly toolchain; keep them out of the
+# main workspace so `cargo build/clippy/test --workspace` and CI never touch them.
+exclude = ["crates/sh-protocol/fuzz"]
 members = [
     "crates/sh-types",
     "crates/sh-protocol",
@@ -27,6 +30,7 @@ rust-version = "1.82"
 # Shared dependency versions. Members opt in with `dep.workspace = true`.
 [workspace.dependencies]
 thiserror = "2"
+proptest = "1"
 
 # Workspace-wide lints enforce the CLAUDE.md panic-ban and safety posture.
 # Members opt in with `[lints] workspace = true`. CI runs clippy with `-D warnings`,

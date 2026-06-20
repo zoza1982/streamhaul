@@ -461,7 +461,8 @@ Hand-written test doubles (not `mockall`) for hot-path traits; an **in-memory `L
 pipeline integration tests without network; **injected `Clock` + seedable RNG** (no `Instant::now()`/`OsRng`
 in testable code); **`proptest`** on the SHP parser (arbitrary bytes never panic; roundtrip); **`cargo-fuzz`**
 targets for packet + Noise-handshake decoding (untrusted input); **`loom`** for the lock-free pool/queues;
-**`cargo-llvm-cov`** with CI gates ≥80% on `sh-protocol`, `sh-crypto`, `sh-transport` (security-critical).
+**`cargo-llvm-cov`** with CI gates ≥85% on `sh-protocol`, `sh-crypto`, `sh-transport` (security-critical;
+matches the CLAUDE.md §5 coverage bar).
 
 ---
 
