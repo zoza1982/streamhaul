@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/zoza1982/streamhaul/security/advisories/new
+    about: Report vulnerabilities privately — never in public issues. See SECURITY.md.

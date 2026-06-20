@@ -1,0 +1,26 @@
+# <type>(<scope>): <summary>   (<= 72 chars, imperative mood)
+#
+# Body: explain WHAT and WHY (not how). Wrap at 72 chars.
+#
+# Footer: reference issues (Closes #123) and co-authors.
+#
+# Allowed types:
+#   feat     A new feature
+#   fix      A bug fix
+#   perf     A performance improvement
+#   refactor Code change that neither fixes a bug nor adds a feature
+#   docs     Documentation only
+#   test     Adding or correcting tests
+#   build    Build system or dependencies
+#   ci       CI configuration
+#   chore    Tooling / maintenance
+#   revert   Reverts a previous commit
+#
+# Example:
+#   feat(transport): add QUIC datagram path for native peers
+#
+#   Native peers negotiate RFC 9221 datagrams for video while keeping
+#   reliable streams for input/files, avoiding head-of-line blocking.
+#
+#   Closes #42
+#   Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

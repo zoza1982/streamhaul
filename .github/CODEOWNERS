@@ -1,0 +1,12 @@
+# Code ownership for review routing.
+# Default owner for everything in the repo.
+*                       @zoza1982
+
+# Security-, crypto-, and transport-sensitive areas (paths added as the codebase grows).
+# These MUST also receive a security-engineer agent review per CLAUDE.md.
+/.github/               @zoza1982
+/CLAUDE.md              @zoza1982
+/SECURITY.md            @zoza1982
+# /crates/crypto/       @zoza1982
+# /crates/transport/    @zoza1982
+# /crates/protocol/     @zoza1982
