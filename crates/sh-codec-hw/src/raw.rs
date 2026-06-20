@@ -82,8 +82,9 @@ impl VideoEncoder for RawEncoder {
             codec: Codec::Raw,
             hardware: false,
             max_resolution: Resolution::new(u32::MAX, u32::MAX),
-            // Raw is format-agnostic (it records the format in the header); BGRA is the Phase-0 source.
-            required_input_format: PixelFormat::Bgra8,
+            // Raw is format-agnostic: it records the frame's format in the header and passes pixels
+            // through verbatim, so the pipeline never needs to convert.
+            required_input_format: None,
         }
     }
 }
@@ -147,12 +148,39 @@ impl VideoDecoder for RawDecoder {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::*;
     use sh_media::{ScreenCapturer, SyntheticCapturer};
     use sh_types::{FrameId, TimestampUs};
     use std::time::Duration;
+
+    #[test]
+    fn roundtrips_all_formats_at_odd_dims() {
+        // Odd dimensions exercise 4:2:0 chroma rounding in frame_len; the codec must be lossless and
+        // must carry frame_id / capture_ts from the source frame through the packet.
+        for format in [PixelFormat::Bgra8, PixelFormat::I420, PixelFormat::Nv12] {
+            let resolution = Resolution::new(3, 5);
+            let len = format.frame_len(resolution);
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let frame = VideoFrame {
+                data: Bytes::from(data),
+                format,
+                resolution,
+                frame_id: FrameId(42),
+                capture_ts_us: TimestampUs(7),
+            };
+            let packet = RawEncoder::new().encode(&frame).unwrap().unwrap();
+            let decoded = RawDecoder::new().decode(&packet).unwrap().unwrap();
+            assert_eq!(decoded, frame, "lossless roundtrip for {format:?}");
+            assert_eq!(decoded.frame_id, FrameId(42));
+            assert_eq!(decoded.capture_ts_us, TimestampUs(7));
+        }
+    }
 
     #[test]
     fn roundtrips_a_synthetic_frame() {
