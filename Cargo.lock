@@ -535,6 +535,16 @@ name = "sh-adaptive"
 version = "0.0.0"
 
 [[package]]
+name = "sh-codec-hw"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "sh-media",
+ "sh-protocol",
+ "sh-types",
+]
+
+[[package]]
 name = "sh-core"
 version = "0.0.0"
 dependencies = [

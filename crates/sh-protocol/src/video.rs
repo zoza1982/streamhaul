@@ -15,6 +15,8 @@ pub enum Codec {
     H265,
     /// AV1.
     Av1,
+    /// Uncompressed/raw frames — used by the Phase-0 LAN-lab software pipeline (`sh-codec-hw`).
+    Raw,
 }
 
 /// Frame coding type (`FRAME_TYPE`, 2 bits).
@@ -170,6 +172,7 @@ fn codec_to_bits(codec: Codec) -> u8 {
         Codec::H264 => 0,
         Codec::H265 => 1,
         Codec::Av1 => 2,
+        Codec::Raw => 3,
     }
 }
 
@@ -178,6 +181,7 @@ fn codec_from_bits(bits: u8) -> Result<Codec, ProtocolError> {
         0 => Ok(Codec::H264),
         1 => Ok(Codec::H265),
         2 => Ok(Codec::Av1),
+        3 => Ok(Codec::Raw),
         other => Err(ProtocolError::InvalidCodec(other)),
     }
 }
@@ -338,7 +342,7 @@ mod tests {
             frame_id in 0u32..=MAX_FRAME_ID,
             frag_index in any::<u8>(),
             total_frags in any::<u8>(),
-            codec_bits in 0u8..=2,
+            codec_bits in 0u8..=3,
             frame_type_bits in 0u8..=2,
             priority_bits in 0u8..=2,
             monitor_id in 0u8..=MAX_MONITOR_ID,
