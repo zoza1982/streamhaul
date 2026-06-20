@@ -126,15 +126,19 @@ pub async fn run_loopback_harness(
     // dropped cleanly after the client has received all frames.
     let (client_done_tx, client_done_rx) = oneshot::channel::<()>();
 
-    // Overall deadline: 3× the expected frame budget plus 30 s slack, minimum 60 s.
+    // Deadlines. The client returns its partial results at `client_timeout` (datagram loss is
+    // expected and not fatal); the overall deadline is strictly longer so the client's own deadline
+    // fires first and the harness completes with whatever arrived instead of erroring. Both derive
+    // from the run size: ~2× the nominal capture duration plus slack.
     let frame_count_u64 = u64::try_from(params.frame_count).unwrap_or(u64::MAX);
     let fps_u64 = u64::from(params.fps.max(1));
-    let budget_secs = frame_count_u64
+    let run_secs = frame_count_u64
         .saturating_div(fps_u64)
-        .saturating_mul(3)
-        .saturating_add(30)
-        .max(60);
-    let overall_deadline = tokio::time::Instant::now() + Duration::from_secs(budget_secs);
+        .saturating_mul(2)
+        .saturating_add(20);
+    let client_timeout = Duration::from_secs(run_secs);
+    let overall_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(run_secs.saturating_add(15));
 
     let host_handle = tokio::spawn(async move {
         let mut capturer = SyntheticCapturer::new(resolution, fps);
@@ -164,7 +168,7 @@ pub async fn run_loopback_harness(
             &mut decoder,
             &mut sink,
             frame_count,
-            Duration::from_secs(300),
+            client_timeout,
         )
         .await?;
         // Signal the host that we've received all frames.
