@@ -27,11 +27,12 @@ pub struct SyntheticCapturer {
 
 impl SyntheticCapturer {
     /// Create a capturer producing `resolution` BGRA frames whose timestamps advance as if captured
-    /// at `fps` frames per second. `fps` is clamped to at least 1.
+    /// at `fps` frames per second. `fps` is clamped to `1..=1_000_000` (so the per-frame interval is
+    /// at least 1 µs and never collapses to zero).
     #[must_use]
     pub fn new(resolution: Resolution, fps: u32) -> Self {
-        let fps = fps.max(1);
-        let frame_interval_us = 1_000_000u64.checked_div(u64::from(fps)).unwrap_or(0);
+        let fps = fps.clamp(1, 1_000_000);
+        let frame_interval_us = 1_000_000u64.checked_div(u64::from(fps)).unwrap_or(1).max(1);
         Self {
             resolution,
             frame_interval_us,
@@ -64,7 +65,16 @@ impl SyntheticCapturer {
 }
 
 impl ScreenCapturer for SyntheticCapturer {
-    fn next_frame(&mut self, _timeout: Duration) -> Result<Option<VideoFrame>, MediaError> {
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<VideoFrame>, MediaError> {
+        // A synthetic frame is always "ready". Sleep up to one frame interval (capped by `timeout`)
+        // so a consumer coding against the blocking `ScreenCapturer` contract paces to `fps` instead
+        // of busy-spinning a core. Tests pass `Duration::ZERO` to stay instant and deterministic.
+        let timeout_us = u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX);
+        let nap_us = self.frame_interval_us.min(timeout_us);
+        if nap_us > 0 {
+            std::thread::sleep(Duration::from_micros(nap_us));
+        }
+
         let frame_id = self.next_frame_id;
         self.next_frame_id = self.next_frame_id.wrapping_add(1);
         let capture_ts_us = frame_id.wrapping_mul(self.frame_interval_us);
@@ -131,5 +141,22 @@ mod tests {
                 b.next_frame(Duration::ZERO).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn usable_as_trait_object() {
+        // Locks in object-safety: the pipeline (P0-9) holds `Box<dyn ScreenCapturer>`.
+        let mut cap: Box<dyn ScreenCapturer> = Box::new(SyntheticCapturer::new(res(), 60));
+        let frame = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(frame.resolution, res());
+    }
+
+    #[test]
+    fn high_fps_keeps_nonzero_interval() {
+        // fps above 1e6 must not collapse the interval to zero.
+        let mut cap = SyntheticCapturer::new(res(), 5_000_000);
+        let f0 = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        let f1 = cap.next_frame(Duration::ZERO).unwrap().unwrap();
+        assert!(f1.capture_ts_us.0 > f0.capture_ts_us.0);
     }
 }

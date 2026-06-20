@@ -2,7 +2,7 @@
 
 use sh_protocol::Codec;
 
-use crate::frame::Resolution;
+use crate::frame::{PixelFormat, Resolution};
 
 /// Configuration for constructing a [`VideoEncoder`](crate::VideoEncoder).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +26,10 @@ pub struct EncoderCaps {
     pub hardware: bool,
     /// Largest resolution this encoder supports.
     pub max_resolution: Resolution,
+    /// Pixel format this encoder requires as input. The pipeline compares this against the capturer's
+    /// [`pixel_format`](crate::ScreenCapturer::pixel_format) and inserts color conversion if they differ
+    /// (e.g. NVENC needs NV12 while a BGRA capturer feeds it).
+    pub required_input_format: PixelFormat,
 }
 
 /// What a concrete [`VideoDecoder`](crate::VideoDecoder) backend can do.

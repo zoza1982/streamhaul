@@ -33,7 +33,9 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
 
-**Progress:** 4 / 41 tasks complete (P0-1, P0-2, P0-3, P0-4).
+**Progress:** 5 / 41 tasks complete (P0-1…P0-5); P0-6 portable path done, real DXGI capture deferred to hardware.
+
+> **Phase-0 local-vs-hardware note (overnight build):** the dev laptop is **Linux/Intel iGPU, no Windows SDK, no NVIDIA, no cmake/nasm/clang**, so the *real* hardware paths — DXGI capture (P0-6), NVENC encode (P0-7), wgpu-on-display (P0-8) — cannot be built or verified here. The overnight work delivers a **portable, pure-Rust software pipeline** (synthetic capture → raw codec → loopback QUIC → decode → headless sink → latency harness) that runs and is measured **locally and in CI**, achieving Phase 0's *purpose* (validate the vertical-slice latency budget). The hardware backends slot in behind the same traits during the on-hardware/LAN session.
 
 ---
 
@@ -65,8 +67,8 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | P0-2 | `sh-types`: IDs, units, `FrameId`/`Timestamp`/`ChannelId`, error scaffolding | sh-types | P0-1 | rust-staff-engineer | unit | ✅ | #5 |
 | P0-3 | `sh-protocol`: common header + video payload header (per LLD §3.1), encode/decode | sh-protocol | P0-2 | rust-staff-engineer, network-engineer | **proptest** (never-panic + roundtrip) + **cargo-fuzz** target | ✅ | #6 |
 | P0-4 | `sh-transport`: bare `quinn` backend (LAN, datagrams), no ICE/crypto | sh-transport | P0-2 | network-engineer | loopback integration | ✅ | #7 |
-| P0-5 | `sh-media`: `ScreenCapturer`/`VideoEncoder`/`VideoDecoder` traits + frame/surface types | sh-media | P0-2 | realtime-systems-engineer | trait doubles | ☐ | |
-| P0-6 | `sh-platform-win`: DXGI Desktop Duplication capture (zero-copy D3D11 surface) | sh-platform-win | P0-5 | realtime-systems-engineer | manual + smoke | ☐ | |
+| P0-5 | `sh-media`: `ScreenCapturer`/`VideoEncoder`/`VideoDecoder` traits + frame/surface types | sh-media | P0-2 | realtime-systems-engineer | trait doubles | ✅ | #8 |
+| P0-6 | Capture. **Portable `SyntheticCapturer` done + tested (local/CI), #8.** Real **DXGI Desktop Duplication** (`sh-platform-win`, zero-copy D3D11) is **deferred to the on-hardware session** — the dev laptop is Linux/Intel with no Windows SDK, so it can't be built/verified here. | sh-media / sh-platform-win | P0-5 | realtime-systems-engineer | manual + smoke (on hardware) | 🟡 | #8 |
 | P0-7 | `sh-codec-hw`: NVENC H.264 encode + HW decode; zero-copy surface registration | sh-codec-hw | P0-5, P0-6 | realtime-systems-engineer | encode/decode roundtrip | ☐ | |
 | P0-8 | `sh-render`: `wgpu` NV12→RGB present + frame pacing + latency overlay | sh-render | P0-5 | ui-engineer, realtime-systems-engineer | manual | ☐ | |
 | P0-9 | Wire `streamhaul-host` + `streamhaul-client` end-to-end (capture→encode→QUIC→decode→render) | bins | P0-3,4,7,8 | rust-staff-engineer | e2e smoke | ☐ | |

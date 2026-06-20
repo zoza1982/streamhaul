@@ -17,24 +17,31 @@ pub enum PixelFormat {
 }
 
 impl PixelFormat {
-    /// Average bits per pixel for this format.
-    #[must_use]
-    pub fn bits_per_pixel(self) -> u32 {
-        match self {
-            PixelFormat::Bgra8 => 32,
-            PixelFormat::I420 | PixelFormat::Nv12 => 12,
-        }
-    }
-
     /// Number of bytes a tightly-packed frame of `resolution` occupies in this format.
     ///
-    /// Saturates rather than overflowing on absurd resolutions.
+    /// For the 4:2:0 planar formats the chroma planes round each dimension **up** to even
+    /// (`Y + 2·⌈w/2⌉·⌈h/2⌉`), so the count is exact even at odd resolutions. Saturates rather than
+    /// overflowing on absurd resolutions.
     #[must_use]
     pub fn frame_len(self, resolution: Resolution) -> usize {
-        let bits = u64::from(resolution.width)
-            .saturating_mul(u64::from(resolution.height))
-            .saturating_mul(u64::from(self.bits_per_pixel()));
-        let bytes = bits.checked_div(8).unwrap_or(0);
+        let w = u64::from(resolution.width);
+        let h = u64::from(resolution.height);
+        let bytes = match self {
+            PixelFormat::Bgra8 => w.saturating_mul(h).saturating_mul(4),
+            PixelFormat::I420 => {
+                let luma = w.saturating_mul(h);
+                let chroma = w.div_ceil(2).saturating_mul(h.div_ceil(2));
+                luma.saturating_add(chroma).saturating_add(chroma) // Y + Cb + Cr
+            }
+            PixelFormat::Nv12 => {
+                let luma = w.saturating_mul(h);
+                let chroma = w
+                    .div_ceil(2)
+                    .saturating_mul(h.div_ceil(2))
+                    .saturating_mul(2); // interleaved UV
+                luma.saturating_add(chroma)
+            }
+        };
         usize::try_from(bytes).unwrap_or(usize::MAX)
     }
 }
@@ -90,5 +97,57 @@ impl VideoFrame {
                 got: self.data.len(),
             })
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bgra8_frame_len() {
+        assert_eq!(
+            PixelFormat::Bgra8.frame_len(Resolution::new(640, 480)),
+            640 * 480 * 4
+        );
+        assert_eq!(PixelFormat::Bgra8.frame_len(Resolution::new(0, 0)), 0);
+    }
+
+    #[test]
+    fn planar_frame_len_even_and_odd() {
+        // Even: 640×480 → Y=307200, +2 chroma planes of 320×240=76800 each → 460800 (I420 == NV12).
+        assert_eq!(
+            PixelFormat::I420.frame_len(Resolution::new(640, 480)),
+            460_800
+        );
+        assert_eq!(
+            PixelFormat::Nv12.frame_len(Resolution::new(640, 480)),
+            460_800
+        );
+        // Odd: 3×3 → Y=9, chroma planes ceil(3/2)=2 → 2×2=4 each → I420 9+4+4=17, NV12 9+8=17.
+        assert_eq!(PixelFormat::I420.frame_len(Resolution::new(3, 3)), 17);
+        assert_eq!(PixelFormat::Nv12.frame_len(Resolution::new(3, 3)), 17);
+        // 1×1 → Y=1, chroma 1×1=1 → I420 1+1+1=3, NV12 1+2=3.
+        assert_eq!(PixelFormat::I420.frame_len(Resolution::new(1, 1)), 3);
+        assert_eq!(PixelFormat::Nv12.frame_len(Resolution::new(1, 1)), 3);
+    }
+
+    #[test]
+    fn validate_len_catches_mismatch() {
+        let frame = VideoFrame {
+            data: Bytes::from_static(&[0u8; 10]),
+            format: PixelFormat::Bgra8,
+            resolution: Resolution::new(2, 2), // needs 2*2*4 = 16 bytes
+            frame_id: FrameId(0),
+            capture_ts_us: TimestampUs(0),
+        };
+        assert_eq!(
+            frame.validate_len(),
+            Err(MediaError::FrameSize {
+                expected: 16,
+                got: 10
+            })
+        );
     }
 }

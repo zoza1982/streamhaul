@@ -45,12 +45,25 @@ pub trait ScreenCapturer: Send {
 
 /// Encodes raw [`VideoFrame`]s into [`EncodedPacket`]s.
 pub trait VideoEncoder: Send {
-    /// Encode one frame.
+    /// Submit one frame for encoding.
+    ///
+    /// Returns `Ok(None)` if the encoder buffered the frame internally — hardware encoders (NVENC,
+    /// VideoToolbox, VAAPI) pipeline several frames, so a packet may emerge on a later call or from
+    /// [`flush`](Self::flush). A purely software encoder typically returns `Ok(Some(_))` every call.
     ///
     /// # Errors
     /// Returns [`MediaError::Encode`] on encoder failure, or [`MediaError::FrameSize`] if the frame's
     /// buffer length is inconsistent with its format and resolution.
-    fn encode(&mut self, frame: &VideoFrame) -> Result<EncodedPacket, MediaError>;
+    fn encode(&mut self, frame: &VideoFrame) -> Result<Option<EncodedPacket>, MediaError>;
+
+    /// Drain any internally buffered packets. Call once before dropping the encoder so a pipelined
+    /// encoder's tail frames are not lost. The default returns nothing (non-buffering encoder).
+    ///
+    /// # Errors
+    /// Returns [`MediaError::Encode`] if the encoder fails while draining.
+    fn flush(&mut self) -> Result<Vec<EncodedPacket>, MediaError> {
+        Ok(Vec::new())
+    }
 
     /// Request that the next encoded frame be a keyframe (e.g. after packet loss or a new viewer).
     fn request_keyframe(&mut self);
