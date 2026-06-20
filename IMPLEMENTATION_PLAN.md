@@ -211,6 +211,9 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | R6 | NVENC consumer session-limit behavior during double-buffer overlap | P2 | realtime-systems-engineer |
 | R7 | Multi-GPU cross-adapter copy budget on target laptop SKUs | P0/P2 | realtime-systems-engineer |
 | R8 | Remove `sh-transport`'s `insecure-lan` path (self-signed + skip-verify TLS) when real crypto lands — delete the module or move to a dev-only testkit crate. Meanwhile it is fenced by a non-default feature, an `InsecureLanLab` witness, and a `compile_error!` that blocks `--release --features insecure-lan`. | P4 | security-engineer |
+| R9 | Lab bins (`streamhaul-host`/`streamhaul-client`) report **QUIC RTT**, not true one-way glass-to-photon latency — cross-machine one-way latency needs synchronized clocks (NTP/PTP). Add real one-way latency measurement once clock sync is available. | P0-10 / LAN | performance-tuning-engineer |
+| R10 | The bins have no **client-done back-channel**: the host waits a fixed 1.5s drain `sleep` before dropping the connection (a hack). Replace with a proper completion handshake (like the loopback harness's oneshot) so the tail isn't lost and exit is deterministic. | P1 | rust-staff-engineer |
+| R11 | Add a `--json` report mode to the lab bins so WiFi/LAN test runs are machine-parseable (automation, regression tracking). | P0-10 | rust-staff-engineer |
 
 ---
 
