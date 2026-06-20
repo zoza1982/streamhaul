@@ -160,7 +160,7 @@ impl ChannelSpec {
     /// # Priority table (LLD §3.2)
     ///
     /// | Channel   | urgency | `priority` field | quinn i32 |
-    /// |-----------|---------|-----------------|-----------|
+    /// |-----------|---------|------------------|-----------|
     /// | input     | 0       | 0               | 255       |
     /// | control   | 1       | 1               | 254       |
     /// | clipboard | 2       | 2               | 253       |

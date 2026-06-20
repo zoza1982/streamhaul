@@ -387,16 +387,25 @@ mod tests {
     // Priority mapping sanity
     // ────────────────────────────────────────────────────────────────────────
 
-    /// Verify the quinn_priority mapping: priority 0 → 255 (highest), 255 → 0 (lowest).
+    /// Verify the quinn_priority mapping for the full inversion formula and all
+    /// LLD §3.2 constructor values.
     ///
-    // TODO(P1-5): this only checks the i32 mapping; the actual scheduling effect (high-priority
-    // streams draining before low-priority ones under contention) is exercised by the P1-5
-    // starvation test, once datagram/stream demux and a contended-link harness exist.
+    /// The convenience-constructor exhaustive check lives in `channel_priority.rs`
+    /// (`channel_spec_constructors_match_lld_priorities`). This test covers the
+    /// boundary cases of the inversion formula and the `ChannelSpec::clipboard()`
+    /// constructor (priority 2 → quinn i32 253).
+    ///
+    // TODO(P1-5): this only checks the i32 mapping; the actual scheduling effect
+    // (high-priority streams draining before low-priority ones under contention)
+    // requires bandwidth shaping (e.g. netem/tc or a rate-limited mock transport)
+    // and is deferred to a later task.
     #[test]
     fn priority_mapping_inverts_correctly() {
-        let high = ChannelSpec::input(); // priority 0 → quinn 255
+        // Boundary: priority 0 → quinn 255 (highest).
+        let high = ChannelSpec::input();
         assert_eq!(high.quinn_priority(), 255);
 
+        // Boundary: priority 255 → quinn 0 (lowest) via saturating subtraction.
         let low = ChannelSpec {
             channel: sh_types::ChannelId::File,
             reliability: Reliability::Reliable,
@@ -404,11 +413,8 @@ mod tests {
         };
         assert_eq!(low.quinn_priority(), 0);
 
-        let mid = ChannelSpec {
-            channel: sh_types::ChannelId::Clipboard,
-            reliability: Reliability::Reliable,
-            priority: 128,
-        };
-        assert_eq!(mid.quinn_priority(), 127);
+        // Constructor: clipboard() uses priority 2 → quinn 253 (LLD §3.2 urgency 2).
+        let clipboard = ChannelSpec::clipboard();
+        assert_eq!(clipboard.quinn_priority(), 253);
     }
 }
