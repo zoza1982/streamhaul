@@ -33,7 +33,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
 
-**Progress:** Phase 0 complete (P0-1…P0-10; P0-6/7/8/10 via portable software paths, real DXGI/NVENC/wgpu + LAN-budget deferred to the on-hardware session). **Phase 1: P1-1, P1-2, P1-4, P1-5 done** (P1-4 portable audio + `AvSync`; real WASAPI/Opus deferred — R13); **P1-3 (input injection) remaining.** The full portable Phase-0 vertical slice runs end-to-end and is measured (loopback); Phase-1 input/control framing, multi-channel transport, prioritization, and audio AV-sync are landed and gated.
+**Progress:** Phase 0 complete (P0-1…P0-10; P0-6/7/8/10 via portable software paths, real DXGI/NVENC/wgpu + LAN-budget deferred to the on-hardware session). **Phase 1: P1-1, P1-2, P1-3, P1-4, P1-5 done** (P1-3 portable `InputInjector` trait + `CoordMapper` + mocks in `sh-input`, real platform injection deferred — R14; P1-4 portable audio + `AvSync`; real WASAPI/Opus deferred — R13). The full portable Phase-0 vertical slice runs end-to-end and is measured (loopback); Phase-1 input/control framing, multi-channel transport, input injection seam, prioritization, and audio AV-sync are all landed and gated.
 
 > **Phase-0 local-vs-hardware note (overnight build):** the dev laptop is **Linux/Intel iGPU, no Windows SDK, no NVIDIA, no cmake/nasm/clang**, so the *real* hardware paths — DXGI capture (P0-6), NVENC encode (P0-7), wgpu-on-display (P0-8) — cannot be built or verified here. The overnight work delivers a **portable, pure-Rust software pipeline** (synthetic capture → raw codec → loopback QUIC → decode → headless sink → latency harness) that runs and is measured **locally and in CI**, achieving Phase 0's *purpose* (validate the vertical-slice latency budget). The hardware backends slot in behind the same traits during the on-hardware/LAN session.
 
@@ -86,7 +86,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 |----|------|--------|---------|-------|-------|:------:|----|
 | P1-1 | Promote `Transport`/`Channel` trait + `ChannelSpec`; multi-channel (video unreliable + input reliable, **input urgency 0**) | sh-transport | P0 | network-engineer, rust-staff-engineer | loopback multi-channel | ✅ | #15 |
 | P1-2 | `sh-protocol`: input event message (LLD §3.1) + control/RPC framing | sh-protocol | P0-3 | network-engineer | proptest + fuzz | ✅ | #14 |
-| P1-3 | `sh-platform-win`: `InputInjector` (SendInput/Raw Input), normalized coord mapping, multi-monitor | sh-platform-win | P1-1,P1-2 | realtime-systems-engineer | injection smoke | ☐ | |
+| P1-3 | `sh-input`: portable `InputInjector` trait + `CoordMapper` (normalized→pixel, multi-monitor, i32 origins) + `NoopInjector` + `RecordingInjector` mocks. Real platform injection (Windows `SendInput`/Raw Input, Linux `uinput`, macOS `CGEvent`) deferred to `sh-platform-*` — see R14. | sh-input (trait/mocks); sh-platform-win/linux/mac (impls, deferred) | P1-1,P1-2 | realtime-systems-engineer | 27 unit + 1 doc-test; proptest mapped-coords-in-bounds | 🟡 | |
 | P1-4 | Audio: capture + encode/decode + AV sync (shared monotonic clock). **Portable slice done**: `AudioFrame`/`AudioEncoder`/`AudioDecoder` traits + `AudioCodec` + raw-PCM codec + `SyntheticAudioSource` + `AvSync` controller (±20ms, max skew 18.4ms). **Deferred** (no audio hardware on dev box): real WASAPI loopback capture + Opus — see note. | sh-media, sh-codec-hw | P0 | realtime-systems-engineer | sync test + raw-audio fuzz | ✅ | #17 |
 | P1-5 | Channel prioritization (input > video) + file-channel congestion-isolation scaffolding | sh-transport | P1-1 | network-engineer | starvation test under load | ✅ | #16 |
 
@@ -95,6 +95,8 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 > **Datagram demux** (route datagrams to the right channel by SHP CHANNEL field — needed once video+audio coexist) and a **bandwidth-shaped congestion-scheduling test** (loopback can't create real congestion) remain follow-ups (see Risk Register).
 >
 > **P1-4 audio hardware deferred** (R13): the portable software path (synthetic source → raw-PCM codec → `AvSync`) lands now so the pipeline is measurable on any machine incl. CI; real **WASAPI loopback capture** + **Opus** encode/decode arrive with platform crates (no audio capture hardware / Opus toolchain on the dev box). The trait seams (`AudioEncoder`/`AudioDecoder` + `AudioCodec`) are designed so Opus drops in without touching callers.
+>
+> **P1-3 platform injection deferred** (R14): `sh-input` delivers the portable `InputInjector` trait, `CoordMapper`, `NoopInjector`, and `RecordingInjector`. Real injection (`SendInput`/Raw Input on Windows, `uinput` on Linux, `CGEvent` on macOS) is deferred to `sh-platform-*` crates — no injection hardware available on the dev box. The trait seam is designed so platform crates drop in without touching callers.
 
 ---
 
@@ -220,6 +222,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | R11 | Add a `--json` report mode to the lab bins so WiFi/LAN test runs are machine-parseable (automation, regression tracking). | P0-10 | rust-staff-engineer |
 | R12 | `AudioCodec` has only `RawPcm` today, so `RawAudioDecoder`'s wrong-codec rejection guard is structurally untestable (`decode_rejects_wrong_codec` is `#[ignore]`d). Re-enable the test when a second variant (Opus) lands. | P2 (Opus) | realtime-systems-engineer |
 | R13 | P1-4 ships the **portable audio path only** (synthetic source + raw-PCM codec + `AvSync`). Real **WASAPI loopback capture** + **Opus** encode/decode are deferred until platform crates land (no audio hardware / Opus toolchain on dev box). Trait seams (`AudioEncoder`/`AudioDecoder`/`AudioCodec`) are designed for drop-in Opus. | P2 | realtime-systems-engineer |
+| R14 | P1-3 ships the **portable input-injection slice only** (`sh-input`: `InputInjector` trait + `CoordMapper` + `NoopInjector` + `RecordingInjector`). Real platform injection — **Windows `SendInput`/Raw Input**, **Linux `uinput`**, **macOS `CGEvent`** — is deferred to `sh-platform-*` crates (no injection hardware / OS SDKs on the dev box). The `InputInjector` trait is object-safe and designed so platform crates drop in without touching callers. | P2 | realtime-systems-engineer |
 
 ---
 
