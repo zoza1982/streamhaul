@@ -250,27 +250,8 @@ pub async fn run_loopback_harness(
     let lossless_match_count = measurements.iter().filter(|m| m.lossless_match).count();
 
     latencies_us.sort_unstable();
-    let len = latencies_us.len();
-    let latency_min_us = latencies_us.first().copied().unwrap_or(0);
-    let latency_max_us = latencies_us.last().copied().unwrap_or(0);
-
-    let latency_median_us = if len == 0 {
-        0
-    } else if len % 2 == 1 {
-        latencies_us.get(len / 2).copied().unwrap_or(0)
-    } else {
-        let lo = latencies_us.get(len / 2 - 1).copied().unwrap_or(0);
-        let hi = latencies_us.get(len / 2).copied().unwrap_or(0);
-        lo / 2 + hi / 2 + (lo % 2 + hi % 2) / 2
-    };
-
-    let p95_idx = len
-        .saturating_mul(95)
-        .saturating_add(99)
-        .saturating_div(100)
-        .saturating_sub(1)
-        .min(len.saturating_sub(1));
-    let latency_p95_us = latencies_us.get(p95_idx).copied().unwrap_or(0);
+    let (latency_min_us, latency_median_us, latency_p95_us, latency_max_us) =
+        crate::stats::percentiles(&latencies_us);
 
     Ok(HarnessReport {
         frames_sent,

@@ -15,6 +15,9 @@ pub mod harness;
 #[cfg(feature = "harness")]
 pub mod input_harness;
 
+#[cfg(feature = "harness")]
+pub(crate) mod stats;
+
 pub use sh_types;
 
 #[cfg(feature = "harness")]

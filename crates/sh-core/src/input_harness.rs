@@ -6,6 +6,10 @@
 //! [`RecordingInjector`], and echoes the raw 16-byte event back to the client. The client
 //! matches each echo to its send timestamp, computing per-event RTT.
 //!
+//! Each event's RTT is measured as a serialized round-trip: the client sends event i, then
+//! blocks waiting for its echo before sending event i+1. This yields the true per-event
+//! transport RTT (the correct click-to-photon proxy for the network+transport contribution).
+//!
 //! True glass-to-photon additionally requires real input injection (deferred — R14) and real
 //! capture/encode (deferred — P0-6/7/8). This harness bounds the *network + transport
 //! contribution* and validates the input path end-to-end, leaving the OS injection overhead
@@ -20,6 +24,14 @@
 //! the index. Because the Input channel is reliable and ordered, reordering is not expected,
 //! but the harness asserts `all_injected_in_order` by comparing
 //! `RecordingInjector::recorded()` `pointer_x` values against `0..event_count`.
+//!
+//! # Harness Topology vs. Production
+//!
+//! In production the Input channel is **client → host only** (unidirectional in practice —
+//! the host receives input events and injects them; it never needs to reply on the same
+//! channel). This harness has the host **echo** every received event back to the client on
+//! the same bidirectional Input stream solely for RTT measurement. Do not interpret the
+//! host's echo behavior as validation of the real unidirectional host receive loop.
 //!
 //! # Connection lifetime
 //!
@@ -45,6 +57,9 @@ pub struct InputRttParams {
     ///
     /// Each event encodes its zero-based send index in `pointer_x` so injection order is
     /// verifiable without a separate sequence number.
+    ///
+    /// Maximum allowed value is 65 536 (`u16::MAX + 1`). Use [`InputRttError::TooManyEvents`]
+    /// for counts that exceed this limit.
     pub event_count: usize,
 }
 
@@ -57,7 +72,9 @@ pub struct InputEventMeasurement {
     pub send_instant: Instant,
     /// Instant at which the client received the echo for this event.
     pub recv_instant: Instant,
-    /// Round-trip time for this event in microseconds.
+    /// Round-trip time for this event in microseconds, measured from the instant the client
+    /// sent this event to the instant it received the echo. RTT is serialized per-event
+    /// (send then receive), not batch-pipelined.
     pub rtt_us: u64,
 }
 
@@ -101,17 +118,35 @@ pub enum InputRttError {
     /// The injector returned an error during the host receive loop.
     #[error("injection: {0}")]
     Injection(#[from] sh_input::InputError),
+    /// The stream ended before all events were exchanged.
+    #[error("incomplete stream: received {received} of {expected} expected events")]
+    IncompleteStream {
+        /// Number of events actually received/echoed.
+        received: usize,
+        /// Number of events expected.
+        expected: usize,
+    },
+    /// `event_count` exceeds the maximum encodable index (`u16::MAX + 1 = 65536`).
+    ///
+    /// The harness encodes the event index in `pointer_x` (a `u16` field). Requesting
+    /// more than 65 536 events would cause index wrapping and corrupt the RTT map.
+    #[error("too many events: {count} exceeds maximum of 65536")]
+    TooManyEvents {
+        /// The requested event count.
+        count: usize,
+    },
 }
 
 /// Construct the `index`-th synthetic [`InputEvent`] used by the harness.
 ///
-/// Encodes `index` (cast to `u16`) in `pointer_x` so the client can identify which send
-/// corresponds to each echo without a separate sequence-number field. `pointer_y` is varied
-/// by a simple formula to make each event distinct and increase content variety.
+/// Encodes `index` in `pointer_x` so the client can identify which send corresponds to each
+/// echo without a separate sequence-number field. `pointer_y` is varied by a simple formula
+/// to make each event distinct and increase content variety.
+///
+/// `index` must be less than 65 537 — validated at harness entry via [`InputRttError::TooManyEvents`].
 fn make_event(index: usize) -> InputEvent {
-    // Cast to u16; harness event counts stay well within u16::MAX in practice.
-    #[allow(clippy::cast_possible_truncation)]
-    let idx_u16 = index as u16;
+    // index is always < 65537 — validated at harness entry.
+    let idx_u16 = u16::try_from(index).unwrap_or(u16::MAX);
     InputEvent {
         event_type: EventType::PointerMove,
         modifiers: Modifiers::empty(),
@@ -125,42 +160,15 @@ fn make_event(index: usize) -> InputEvent {
     }
 }
 
-/// Compute percentile statistics over a **sorted** `u64` slice.
-///
-/// Returns `(min, median, p95, max)`. All four values are `0` for an empty slice.
-#[allow(clippy::arithmetic_side_effects)]
-fn percentiles(sorted: &[u64]) -> (u64, u64, u64, u64) {
-    let len = sorted.len();
-    if len == 0 {
-        return (0, 0, 0, 0);
-    }
-    let min = sorted.first().copied().unwrap_or(0);
-    let max = sorted.last().copied().unwrap_or(0);
-
-    let median = if len % 2 == 1 {
-        sorted.get(len / 2).copied().unwrap_or(0)
-    } else {
-        let lo = sorted.get(len / 2 - 1).copied().unwrap_or(0);
-        let hi = sorted.get(len / 2).copied().unwrap_or(0);
-        lo / 2 + hi / 2 + (lo % 2 + hi % 2) / 2
-    };
-
-    let p95_idx = len
-        .saturating_mul(95)
-        .saturating_add(99)
-        .saturating_div(100)
-        .saturating_sub(1)
-        .min(len.saturating_sub(1));
-    let p95 = sorted.get(p95_idx).copied().unwrap_or(0);
-
-    (min, median, p95, max)
-}
-
 /// Run the input RTT loopback harness.
 ///
 /// Stands up a loopback QUIC server and client, opens the reliable, highest-priority Input
 /// channel, sends `params.event_count` distinct events client→host, has the host inject each
 /// via a [`RecordingInjector`] and echo the raw bytes back, then computes RTT statistics.
+///
+/// Each event's RTT is measured with a **serialized round-trip**: the client sends event i,
+/// then blocks waiting for its echo before sending event i+1. This yields the true per-event
+/// transport RTT (not batch-inflated queue-drain time).
 ///
 /// `server_config` and `client_config` must be TLS-compatible with loopback — use
 /// [`sh_transport::self_signed_server_config`] / [`sh_transport::insecure_client_config`] for
@@ -172,17 +180,41 @@ fn percentiles(sorted: &[u64]) -> (u64, u64, u64, u64) {
 ///
 /// # Errors
 ///
+/// - [`InputRttError::TooManyEvents`] — `event_count` exceeds 65 536 (u16 index limit).
 /// - [`InputRttError::Transport`] — binding, connecting, or channel open/accept failed.
 /// - [`InputRttError::Join`] — a spawned task panicked.
 /// - [`InputRttError::Timeout`] — the overall deadline elapsed.
 /// - [`InputRttError::Protocol`] — an echo payload could not be decoded as an [`InputEvent`].
 /// - [`InputRttError::Injection`] — the [`RecordingInjector`] returned an error.
+/// - [`InputRttError::IncompleteStream`] — the stream ended before all events were exchanged.
 #[allow(clippy::arithmetic_side_effects)]
 pub async fn run_input_rtt_harness(
     server_config: quinn::ServerConfig,
     client_config: quinn::ClientConfig,
     params: InputRttParams,
 ) -> Result<InputRttReport, InputRttError> {
+    let event_count = params.event_count;
+
+    // Validate: pointer_x encodes the index as u16; reject counts that would overflow.
+    if event_count > usize::from(u16::MAX) + 1 {
+        return Err(InputRttError::TooManyEvents { count: event_count });
+    }
+
+    // Short-circuit for zero events: skip endpoint setup entirely and return a zero-stats
+    // report. The loopback handshake is unnecessary when there is nothing to measure.
+    if event_count == 0 {
+        return Ok(InputRttReport {
+            events_sent: 0,
+            events_echoed: 0,
+            rtt_min_us: 0,
+            rtt_median_us: 0,
+            rtt_p95_us: 0,
+            rtt_max_us: 0,
+            all_injected_in_order: true,
+            measurements: Vec::new(),
+        });
+    }
+
     // ── Endpoint setup ─────────────────────────────────────────────────────────
     let server_ep = ServerEndpoint::bind(
         "127.0.0.1:0"
@@ -202,8 +234,6 @@ pub async fn run_input_rtt_harness(
         .await
         .map_err(|e| InputRttError::Join(e.to_string()))?
         .map_err(InputRttError::Transport)?;
-
-    let event_count = params.event_count;
 
     // ── Deadline ──────────────────────────────────────────────────────────────
     // Budget: 20 s base + 1 s per 10 events (reliable, no loss expected; budget absorbs CI
@@ -239,8 +269,14 @@ pub async fn run_input_rtt_harness(
 
                 let bytes = match msg {
                     Some(b) => b,
-                    // Clean EOF before all events: stop early.
-                    None => break,
+                    // Clean EOF before all events: error immediately rather than awaiting the
+                    // client (which would deadlock — client is blocked waiting for echoes).
+                    None => {
+                        return Err(InputRttError::IncompleteStream {
+                            received: received_indices.len(),
+                            expected: event_count,
+                        })
+                    }
                 };
 
                 let event = InputEvent::decode(&bytes)?;
@@ -257,51 +293,51 @@ pub async fn run_input_rtt_harness(
         });
 
     // ── Client task ───────────────────────────────────────────────────────────
-    // Opens the Input channel, sends all events recording send timestamps, then reads all
-    // echoes and records RTT by matching on `pointer_x` (= send index).
+    // Opens the Input channel, interleaves send+recv per event: for each event i, records the
+    // send instant, sends the event, then immediately waits for its echo before proceeding to
+    // event i+1. This serialized per-event RTT is the true transport contribution — not
+    // batch-pipelined queue-drain time.
     let client_handle: tokio::task::JoinHandle<Result<Vec<InputEventMeasurement>, InputRttError>> =
         tokio::spawn(async move {
             let transport = QuicTransport::new(client_conn);
             let mut ch = transport.open_channel(ChannelSpec::input()).await?;
 
-            // Phase 1: send all events, capturing send timestamps.
-            let mut send_instants: Vec<Instant> = Vec::with_capacity(event_count);
+            let mut measurements: Vec<InputEventMeasurement> = Vec::with_capacity(event_count);
+
             for i in 0..event_count {
                 let event = make_event(i);
                 let wire = Bytes::from(event.encode().to_vec());
-                let t = Instant::now();
+                let send_instant = Instant::now();
                 ch.send(wire).await.map_err(InputRttError::Transport)?;
-                send_instants.push(t);
-            }
 
-            // Phase 2: read all echoes, compute per-event RTT.
-            let mut measurements: Vec<InputEventMeasurement> = Vec::with_capacity(event_count);
-            for _ in 0..event_count {
                 let msg = tokio::time::timeout(msg_timeout, ch.recv())
                     .await
                     .map_err(|_| InputRttError::Timeout)?
                     .map_err(InputRttError::Transport)?;
 
+                let recv_instant = Instant::now();
                 let bytes = match msg {
                     Some(b) => b,
-                    None => break,
+                    None => {
+                        return Err(InputRttError::IncompleteStream {
+                            received: i,
+                            expected: event_count,
+                        })
+                    }
                 };
 
-                let recv_instant = Instant::now();
-                let event = InputEvent::decode(&bytes)?;
-                let idx = usize::from(event.pointer_x);
-
-                // Guard against a corrupt echo carrying an out-of-range index.
-                if let Some(&send_instant) = send_instants.get(idx) {
-                    let elapsed = recv_instant.duration_since(send_instant).as_micros();
-                    let rtt_us = u64::try_from(elapsed).unwrap_or(u64::MAX);
-                    measurements.push(InputEventMeasurement {
-                        event_idx: idx,
-                        send_instant,
-                        recv_instant,
-                        rtt_us,
-                    });
-                }
+                let echo_event = InputEvent::decode(&bytes)?;
+                let idx = usize::from(echo_event.pointer_x);
+                let elapsed = recv_instant.duration_since(send_instant).as_micros();
+                // Monotonic-clock anomaly guard: with serialized per-event RTT, elapsed is
+                // always finite; u64::MAX sentinel is unreachable in practice.
+                let rtt_us = u64::try_from(elapsed).unwrap_or(u64::MAX);
+                measurements.push(InputEventMeasurement {
+                    event_idx: idx,
+                    send_instant,
+                    recv_instant,
+                    rtt_us,
+                });
             }
 
             // Signal the host that we have consumed all echoes.
@@ -322,15 +358,17 @@ pub async fn run_input_rtt_harness(
 
     // ── Order verification ─────────────────────────────────────────────────────
     // The reliable + ordered Input channel guarantees events arrive at the host in send order.
-    let all_injected_in_order = received_indices
-        .iter()
-        .enumerate()
-        .all(|(expected, &got)| usize::from(got) == expected);
+    // Count-complete: also verify that we received exactly the right number of events.
+    let all_injected_in_order = received_indices.len() == event_count
+        && received_indices
+            .iter()
+            .enumerate()
+            .all(|(expected, &got)| usize::from(got) == expected);
 
     // ── RTT statistics ─────────────────────────────────────────────────────────
     let mut rtts: Vec<u64> = measurements.iter().map(|m| m.rtt_us).collect();
     rtts.sort_unstable();
-    let (rtt_min_us, rtt_median_us, rtt_p95_us, rtt_max_us) = percentiles(&rtts);
+    let (rtt_min_us, rtt_median_us, rtt_p95_us, rtt_max_us) = crate::stats::percentiles(&rtts);
 
     Ok(InputRttReport {
         events_sent: event_count,
