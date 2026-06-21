@@ -10,6 +10,11 @@ use crate::{InputError, InputInjector};
 /// then assert on [`recorded`](RecordingInjector::recorded) to verify ordering,
 /// count, and content.
 ///
+/// The internal buffer **grows unbounded** — every injected event is retained. This is fine for
+/// tests; call [`clear`](RecordingInjector::clear) between assertion phases in long-running tests.
+/// It is not intended for production injection paths (use an allocation-free platform injector
+/// there).
+///
 /// # Example
 ///
 /// ```rust

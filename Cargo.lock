@@ -706,7 +706,6 @@ version = "0.0.0"
 dependencies = [
  "proptest",
  "sh-protocol",
- "sh-types",
  "thiserror",
 ]
 

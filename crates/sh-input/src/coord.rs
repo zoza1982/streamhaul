@@ -33,8 +33,10 @@
 //! ```
 //!
 //! Adding `32767` (⌊65535/2⌋) before integer division achieves **half-up rounding**
-//! (round half toward positive infinity). The maximum intermediate value is
-//! `65535 × 65534 + 32767 = 4_294_967_537`, which fits comfortably in a `u64`.
+//! (round half toward positive infinity). `n` (the axis extent) is accepted up to `u32::MAX`,
+//! so the maximum intermediate value is
+//! `65535 × (u32::MAX − 1) + 32767 = 281_470_681_645_057`, which fits comfortably in a `u64`
+//! (~65000× below `u64::MAX`).
 //!
 //! Edge-case invariants (verified by the test suite and the proptest):
 //!
@@ -42,7 +44,7 @@
 //! |---|---|---|
 //! | `0`     | origin     | origin (top-left pixel)          |
 //! | `65535` | origin     | origin + n − 1 (bottom-right pixel) |
-//! | `32767` | origin     | origin + round((n−1)/2)          |
+//! | `32767` | origin     | origin + ⌊(n−1)/2⌋               |
 //!
 //! A zero-extent axis (`n = 0`) is rejected at [`TargetRect`] construction time with
 //! [`crate::InputError::ZeroSizeAxis`].
@@ -119,8 +121,8 @@ impl CoordMapper {
     /// Returns [`InputError::ZeroSizeAxis`] when the rect has `width = 0` or `height = 0`.
     pub fn new(rect: TargetRect) -> Result<Self, InputError> {
         // TargetRect::new already validated; accept a pre-validated rect directly.
-        // Re-validate here as a defence in depth in case the caller constructed TargetRect
-        // via the public fields directly (which Rust allows on a non-exhaustive struct).
+        // Re-validate here as a defence in depth: TargetRect has public fields, so a caller
+        // can construct it directly without going through TargetRect::new — this guards that path.
         if rect.width == 0 || rect.height == 0 {
             return Err(InputError::ZeroSizeAxis {
                 width: rect.width,
@@ -174,8 +176,8 @@ impl CoordMapper {
 ///
 /// - `extent ≥ 2` (checked by early return for `extent == 1`), so `extent - 1 ≥ 1`.
 /// - `n ≤ 65535`, `e ≤ u32::MAX − 1 = 4_294_967_294`.
-/// - `n * e ≤ 65535 × 4_294_967_294 = 281_474_644_824_510`, well within `u64::MAX`.
-/// - `n * e + 32767 ≤ 281_474_644_857_277`, still well within `u64::MAX`.
+/// - `n * e ≤ 65535 × 4_294_967_294 = 281_470_681_612_290`, well within `u64::MAX`.
+/// - `n * e + 32767 ≤ 281_470_681_645_057`, still well within `u64::MAX` (~65000× below it).
 /// - Division by 65535 is unconditionally safe (constant, non-zero).
 /// - `offset ≤ (65535 × e + 32767) / 65535 ≤ e ≤ u32::MAX − 1`.
 ///   `i32::try_from` saturates at `i32::MAX` for pathological extents > 2 GiB

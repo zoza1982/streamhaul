@@ -9,7 +9,6 @@ rust-version.workspace = true
 
 [dependencies]
 sh-protocol = { path = "../sh-protocol" }
-sh-types = { path = "../sh-types" }
 thiserror.workspace = true
 
 [dev-dependencies]
