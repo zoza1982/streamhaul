@@ -684,6 +684,7 @@ dependencies = [
  "proptest",
  "quinn",
  "sh-codec-hw",
+ "sh-input",
  "sh-media",
  "sh-protocol",
  "sh-transport",
