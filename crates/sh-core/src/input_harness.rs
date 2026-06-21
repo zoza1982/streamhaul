@@ -22,8 +22,10 @@
 //! uses `pointer_x` (which encodes the send index `i as u16`) to key the RTT map. This lets
 //! the client detect reordering without a separate index field — the wire event itself carries
 //! the index. Because the Input channel is reliable and ordered, reordering is not expected,
-//! but the harness asserts `all_injected_in_order` by comparing
-//! `RecordingInjector::recorded()` `pointer_x` values against `0..event_count`.
+//! but the harness asserts `all_injected_in_order` by collecting each received event's
+//! `pointer_x` into a `received_indices` vector (as events arrive) and comparing it against
+//! `0..event_count`. (`RecordingInjector` is used only for the `inject()` side effect, not for
+//! the order check.)
 //!
 //! # Harness Topology vs. Production
 //!
@@ -143,9 +145,11 @@ pub enum InputRttError {
 /// echo without a separate sequence-number field. `pointer_y` is varied by a simple formula
 /// to make each event distinct and increase content variety.
 ///
-/// `index` must be less than 65 537 — validated at harness entry via [`InputRttError::TooManyEvents`].
+/// `index` is always ≤ `u16::MAX` (65535): the harness allows at most 65536 events (indices
+/// `0..=65535`), enforced at entry via [`InputRttError::TooManyEvents`], so the `try_from` below
+/// never falls back.
 fn make_event(index: usize) -> InputEvent {
-    // index is always < 65537 — validated at harness entry.
+    // index ≤ u16::MAX by the TooManyEvents guard at harness entry; the unwrap_or is unreachable.
     let idx_u16 = u16::try_from(index).unwrap_or(u16::MAX);
     InputEvent {
         event_type: EventType::PointerMove,
