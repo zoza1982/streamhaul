@@ -701,6 +701,15 @@ name = "sh-ice"
 version = "0.0.0"
 
 [[package]]
+name = "sh-input"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "sh-protocol",
+ "thiserror",
+]
+
+[[package]]
 name = "sh-media"
 version = "0.0.0"
 dependencies = [
