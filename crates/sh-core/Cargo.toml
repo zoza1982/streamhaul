@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-harness = ["dep:quinn", "dep:sh-codec-hw"]
+harness = ["dep:quinn", "dep:sh-codec-hw", "dep:sh-input"]
 
 [dependencies]
 sh-types = { path = "../sh-types" }
@@ -20,6 +20,7 @@ tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "ti
 thiserror.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 sh-codec-hw = { path = "../sh-codec-hw", optional = true }
+sh-input = { path = "../sh-input", optional = true }
 
 [dev-dependencies]
 sh-transport = { path = "../sh-transport", features = ["insecure-lan"] }
@@ -29,6 +30,10 @@ proptest.workspace = true
 
 [[test]]
 name = "loopback_harness"
+required-features = ["harness"]
+
+[[test]]
+name = "input_rtt_harness"
 required-features = ["harness"]
 
 [lints]
