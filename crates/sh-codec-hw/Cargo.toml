@@ -29,5 +29,16 @@ tracing.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 
+[features]
+## Enable the HEVC / H.265 codec rung in the degradation ladder and capability offers.
+##
+## **OFF by default** — the OSS Apache-2.0 build must not enable HEVC, which is encumbered by
+## overlapping patent pools (MPEG-LA, Access Advance, Velos).  Enabling this feature produces a
+## **commercial build** that requires a valid HEVC license from the patent-pool holder(s) (see
+## `docs/adr/0004-oss-codec-and-licensing.md`).  Neither this crate nor the workspace bundles
+## a software H.265 encoder; HEVC is always accessed via OS system codec APIs
+## (VideoToolbox / Media Foundation / VA-API).
+hevc = []
+
 [lints]
 workspace = true
