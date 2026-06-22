@@ -11,7 +11,9 @@ rust-version.workspace = true
 sh-media = { path = "../sh-media" }
 sh-protocol = { path = "../sh-protocol" }
 sh-types = { path = "../sh-types" }
+sh-adaptive = { path = "../sh-adaptive" }
 bytes.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
