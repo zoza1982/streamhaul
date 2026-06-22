@@ -664,6 +664,10 @@ dependencies = [
 [[package]]
 name = "sh-adaptive"
 version = "0.0.0"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "sh-codec-hw"

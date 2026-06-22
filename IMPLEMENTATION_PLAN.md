@@ -106,14 +106,14 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 
 | ID | Task | Crates | Depends | Agent | Tests | Status | PR |
 |----|------|--------|---------|-------|-------|:------:|----|
-| P2-1 | `sh-adaptive`: `CongestionController` trait + **SCReAM** (native path) | sh-adaptive | P1 | network-engineer | sim: adapt to bandwidth caps | ☐ | |
+| P2-1 | `sh-adaptive`: `CongestionController` trait + **SCReAM** (native path) | sh-adaptive | P1 | network-engineer | sim: adapt to bandwidth caps | ✅ | |
 | P2-2 | Rate allocator across channels (video/audio/file budgets) | sh-adaptive | P2-1 | network-engineer | allocation unit | ☐ | |
 | P2-3 | Content classifier (4-signal heuristic + hysteresis FSM, LLD §5.2) | sh-adaptive | P1 | realtime-systems-engineer | FSM unit (no flapping) | ☐ | |
 | P2-4 | Encoder reconfigure + **double-buffered mode switch** (4:2:0↔4:4:4, glitch-free) | sh-codec-hw | P2-3 | realtime-systems-engineer | switch test; NVENC session-limit guard | ☐ | |
 | P2-5 | HEVC enable (commercial build feature flag) + codec negotiation/degradation ladder (ADR-0004) | sh-codec-hw, sh-protocol | P0-7 | realtime-systems-engineer | negotiation matrix | ☐ | |
 | P2-6 | Loss recovery: rolling intra-refresh + adaptive FEC + selective NACK + forced IDR (LLD §4.4) | sh-adaptive, sh-protocol | P2-1 | network-engineer, realtime-systems-engineer | induced-loss recovery test | ☐ | |
 
-**Gate P2:** ☐ smooth adapt under loss/caps · ☐ Game↔Work no flapping · ☐ keyframe/loss recovery verified.
+**Gate P2:** 🟡 smooth adapt under loss/caps (SCReAM sim verified, P2-1 ✅) · ☐ Game↔Work no flapping · ☐ keyframe/loss recovery verified. **Progress: 1/6 tasks done.**
 
 ---
 
