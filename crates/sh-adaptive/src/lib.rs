@@ -1,12 +1,20 @@
 //! `sh-adaptive` — Congestion control, content classification, and rate allocation for Streamhaul.
 //!
-//! This crate provides the [`CongestionController`] trait and a concrete **SCReAM** (Self-Clocked
-//! Rate Adaptation for Multimedia) implementation following [RFC 8298] for the native (QUIC) path.
-//! A GCC implementation for the WebRTC path arrives in Phase 4.
+//! This crate provides:
+//!
+//! - The [`CongestionController`] trait and a concrete **SCReAM** (Self-Clocked Rate Adaptation
+//!   for Multimedia) implementation following [RFC 8298] for the native (QUIC) path. A GCC
+//!   implementation for the WebRTC path arrives in Phase 4.
+//! - The **content classifier** (LLD §5.2): a 4-signal heuristic plus hysteresis FSM that maps
+//!   real-time screen-content signals to [`classifier::ContentMode`] (`Work`, `Scrolling`,
+//!   `Game`). The score function is swappable behind [`classifier::ScoreProvider`] for v2 ML.
+//! - The **rate allocator** ([`allocator::RateAllocator`]): splits the SCReAM target bitrate
+//!   across Video, Audio, Input, Control, Clipboard, and File channels following the product
+//!   priority order in `LLD.md` §3.2.
 //!
 //! # Design
 //!
-//! The crate is organized around a single trait seam:
+//! The crate is organized around trait seams that decouple each subsystem:
 //!
 //! - [`CongestionController`] — the shared seam between `sh-adaptive` and the pacer in
 //!   `sh-transport`. Every controller (SCReAM, GCC) implements this trait.
@@ -14,14 +22,18 @@
 //!   SCReAM (native path) and GCC (WebRTC path) can consume the same struct.
 //! - [`Bitrate`] — a bits-per-second newtype used throughout the adaptive layer.
 //! - [`ScreamController`] — the SCReAM implementation.
-//! - [`allocator::RateAllocator`] — cross-channel rate allocator; splits the SCReAM target bitrate
-//!   across Video, Audio, Input, Control, Clipboard, and File channels following the product
-//!   priority order defined in `LLD.md` §3.2.
+//! - [`classifier::ScoreProvider`] — maps [`classifier::Signals`] → score; v1 uses
+//!   [`classifier::HeuristicScoreProvider`]; v2 swaps in an ONNX provider without touching the
+//!   FSM.
+//! - [`classifier::ContentClassifier`] — the FSM; holds a `Box<dyn ScoreProvider>` and exposes
+//!   `on_tick(&Signals) -> ContentMode`.
+//! - [`allocator::RateAllocator`] — cross-channel rate allocator.
 //!
 //! # Clock injection
 //!
 //! Library code **never calls `std::time::Instant::now()`**. Callers pass the current `Instant`
-//! into every feedback call (`on_feedback`). This keeps all behaviour deterministic and testable.
+//! into every feedback call (`on_feedback`). The content classifier is tick-driven (no wall-clock
+//! state) — call [`classifier::ContentClassifier::on_tick`] once per 4-frame group.
 //!
 //! # Rate allocation
 //!
@@ -44,17 +56,43 @@
 //! // audio_encoder.set_bitrate(allocation.audio());
 //! ```
 //!
+//! # Content classification
+//!
+//! ```rust
+//! use sh_adaptive::classifier::{
+//!     ContentClassifier, HeuristicScoreProvider, Signals, AppClass,
+//! };
+//!
+//! let mut classifier = ContentClassifier::new(Box::new(HeuristicScoreProvider));
+//!
+//! // Every 4 frames, build Signals and call on_tick:
+//! let signals = Signals::from_raw(
+//!     0.9,              // mb_diff_fraction: 90% of macroblocks changed
+//!     0.85,             // dirty_rect_fraction: 85% of screen dirty
+//!     AppClass::Game,   // foreground app is a game
+//!     false,            // not fullscreen-exclusive
+//!     1200.0,           // cursor at 1200 px/s
+//! );
+//! let mode = classifier.on_tick(&signals);
+//! // mode starts as Work; Game is entered after GAME_ENTER_DWELL=8 consecutive high-score ticks.
+//! # let _ = mode;
+//! ```
+//!
 //! [RFC 8298]: https://www.rfc-editor.org/rfc/rfc8298
 #![deny(missing_docs)]
 
 pub mod allocator;
 pub mod bitrate;
+pub mod classifier;
 pub mod controller;
 pub mod scream;
 pub mod stats;
 
 pub use allocator::{AllocatorConfig, ChannelAllocation, RateAllocator};
 pub use bitrate::Bitrate;
+pub use classifier::{
+    AppClass, ContentClassifier, ContentMode, HeuristicScoreProvider, Score, ScoreProvider, Signals,
+};
 pub use controller::CongestionController;
 pub use scream::{ScreamConfig, ScreamController};
 pub use stats::TransportStats;
