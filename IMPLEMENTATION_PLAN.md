@@ -111,7 +111,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | P2-3 | Content classifier (4-signal heuristic + hysteresis FSM, LLD §5.2) | sh-adaptive | P1 | realtime-systems-engineer | FSM unit (no flapping) | ✅ | #22 |
 | P2-4 | Encoder reconfigure + **double-buffered mode switch** (4:2:0↔4:4:4, glitch-free) | sh-codec-hw | P2-3 | realtime-systems-engineer | switch test; NVENC session-limit guard | ☐ | |
 | P2-5 | HEVC enable (commercial build feature flag) + codec negotiation/degradation ladder (ADR-0004) | sh-codec-hw, sh-protocol | P0-7 | realtime-systems-engineer | negotiation matrix | ☐ | |
-| P2-6 | Loss recovery: rolling intra-refresh + adaptive FEC + selective NACK + forced IDR (LLD §4.4) | sh-adaptive, sh-protocol | P2-1 | network-engineer, realtime-systems-engineer | induced-loss recovery test | ✅ | |
+| P2-6 | Loss recovery: rolling intra-refresh + adaptive FEC + selective NACK + forced IDR (LLD §4.4) | sh-adaptive, sh-protocol | P2-1 | network-engineer, realtime-systems-engineer | induced-loss recovery test | ✅ | #23 |
 
 **Gate P2:** 🟡 smooth adapt under loss/caps (SCReAM sim verified, P2-1 ✅) · 🟡 cross-channel rate allocator (priority-ordered floors + video bulk + file leftover, P2-2 ✅) · ✅ Game↔Work no flapping (hysteresis FSM + 93 deterministic tests, P2-3 ✅) · ✅ keyframe/loss recovery verified (P2-6: tiered RTT-band policy, IDR suppression, rolling intra-refresh, NACK bitmap, gap detector — 20 tests all pass; escalation trace NACK→FEC→IDR confirmed). **Progress: 4/6 tasks done.**
 
