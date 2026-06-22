@@ -1,0 +1,715 @@
+//! Cross-channel rate allocator for Streamhaul.
+//!
+//! This module splits the total send budget produced by [`CongestionController::target_bitrate`]
+//! across the six logical [`ChannelId`] channels, enforcing the product invariants from `LLD.md`
+//! §1 and §3.2:
+//!
+//! # Priority order
+//!
+//! Allocation proceeds in strict priority order, top to bottom:
+//!
+//! 1. **Input** (reserve, non-starvable) — input events are tiny and reliable;
+//!    they get a small fixed floor **first**, even at near-zero total budgets.
+//! 2. **Control** (reserve) — RPC and session control messages take the next fixed floor.
+//! 3. **Clipboard** (reserve) — clipboard sync takes a small fixed floor.
+//! 4. **Audio** (configurable floor, default 96 kbps) — voice intelligibility is more important
+//!    than video quality; audio gets its floor before video takes the bulk. If the total is below
+//!    the sum of the above reserves plus the audio floor, audio still wins over video and file.
+//! 5. **Video** (bulk, up to `video_max`) — consumes `min(remaining, video_max)` of the
+//!    post-floor budget. The lower bound is 0; when the budget is tight, video gets whatever
+//!    remains after the floors (which may be zero). A hard video minimum is structurally
+//!    unenforceable in this waterfall without risking over-commitment: callers should compare
+//!    `allocation.video()` against their encoder's floor and decide to degrade or drop frames —
+//!    the allocator cannot guarantee a video floor without over-committing.
+//! 6. **File** (leftover) — file transfer is last in line. It receives only what is left after
+//!    all other channels are satisfied. This is the "congestion-isolated" policy described in
+//!    `LLD.md` §3.2: file transfer never starves video. True per-flow QUIC isolation (a separate
+//!    QUIC stream not competing at the packet level) is transport-level and tracked separately;
+//!    here we express the *budget* isolation — file may only spend the leftover.
+//!
+//! # Degenerate / hostile totals
+//!
+//! When `total` is less than the sum of all configured floors, budgets are dispensed in the
+//! priority order above until the budget is exhausted. Channels that cannot be served get
+//! [`Bitrate::ZERO`]. The sum of allocations always equals `total` exactly (lossless waterfall);
+//! no channel is ever negative or NaN.
+//! `total == 0` produces all-zero allocations. `total == u64::MAX` saturates arithmetic safely.
+//!
+//! # Caller integration
+//!
+//! The typical control-loop integration is:
+//!
+//! ```rust
+//! # use sh_adaptive::{ScreamConfig, ScreamController, CongestionController, allocator::{AllocatorConfig, RateAllocator}};
+//! # use sh_adaptive::stats::TransportStats;
+//! # use std::time::Instant;
+//! # let config = AllocatorConfig::default();
+//! let allocator = RateAllocator::new(config);
+//! # let mut controller = ScreamController::new(ScreamConfig::default());
+//! // In the control-tick callback:
+//! // (controller has already received feedback via on_feedback)
+//! let allocation = allocator.allocate(controller.target_bitrate());
+//! // Hand allocations to the encoder / pacer:
+//! // encoder.set_bitrate(allocation.video());
+//! // audio_encoder.set_bitrate(allocation.audio());
+//! // file_pacer.set_budget(allocation.file());
+//! ```
+
+use sh_types::{Bitrate, ChannelId};
+
+// ── Public config ─────────────────────────────────────────────────────────────
+
+/// Per-channel bitrate floors, reserves, and video cap for [`RateAllocator`].
+///
+/// All fields are inclusive bounds. Defaults are chosen to reflect practical Streamhaul
+/// requirements: tiny reserves for control channels, a comfortable audio floor, and a wide video
+/// operating range.
+///
+/// # Conservation invariant
+///
+/// **Any** combination of field values is safe. The allocator is a saturating priority waterfall,
+/// so `allocation.sum() == total` holds exactly for every possible config and every possible `total`,
+/// including pathological values like `u64::MAX`. No validation is needed: there is no incoherent
+/// config, and no field combination can violate the conservation invariant or produce a negative
+/// allocation.
+#[derive(Debug, Clone)]
+pub struct AllocatorConfig {
+    /// Fixed floor reserved for the Input channel (highest priority).
+    ///
+    /// Input events are tiny (< 200 bytes per event, hundreds per second at most → well under
+    /// 1 Mbps in practice). The reserve is deliberately small so it never meaningfully reduces
+    /// the video budget, yet it guarantees input is served even at near-zero total.
+    ///
+    /// Default: 32 kbps.
+    pub input_reserve: Bitrate,
+
+    /// Fixed floor reserved for the Control channel (session RPC, keepalives).
+    ///
+    /// Default: 32 kbps.
+    pub control_reserve: Bitrate,
+
+    /// Fixed floor reserved for the Clipboard channel.
+    ///
+    /// Default: 32 kbps.
+    pub clipboard_reserve: Bitrate,
+
+    /// Minimum bitrate guaranteed to the Audio channel before video receives anything beyond its
+    /// own floor.
+    ///
+    /// Voice intelligibility takes precedence over video quality. When the network budget is
+    /// tight, the audio floor is preserved at the expense of video. Setting this to
+    /// [`Bitrate::ZERO`] disables the audio priority guarantee.
+    ///
+    /// Default: 96 kbps (comfortable Opus stereo; 64 kbps is the practical minimum for Opus).
+    pub audio_min: Bitrate,
+
+    /// Maximum bitrate that video may consume. Video receives `min(remaining, video_max)` of
+    /// the post-floor budget (after ALL floors — input, control, clipboard, and audio — are
+    /// satisfied). Video never receives more than this regardless of how much total budget
+    /// remains. Surplus above `video_max` flows to the File channel as leftover.
+    ///
+    /// Default: 20 Mbps (high-quality 4K remote desktop stream with HEVC).
+    pub video_max: Bitrate,
+}
+
+impl Default for AllocatorConfig {
+    fn default() -> Self {
+        Self {
+            input_reserve: Bitrate::from_kbps(32),
+            control_reserve: Bitrate::from_kbps(32),
+            clipboard_reserve: Bitrate::from_kbps(32),
+            audio_min: Bitrate::from_kbps(96),
+            video_max: Bitrate::from_mbps(20),
+        }
+    }
+}
+
+// ── Allocation result ─────────────────────────────────────────────────────────
+
+/// Per-channel bitrate allocations produced by [`RateAllocator::allocate`].
+///
+/// Fields are private to preserve the `sum() == total` invariant: callers cannot fabricate a
+/// bogus `total` or mutate individual channel values after allocation. Use the named accessors
+/// ([`video()`], [`audio()`], etc.) or [`get`] for channel-generic access.
+///
+/// The sum of all per-channel allocations always equals `total()` exactly (lossless waterfall).
+///
+/// [`video()`]: ChannelAllocation::video
+/// [`audio()`]: ChannelAllocation::audio
+/// [`get`]: ChannelAllocation::get
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelAllocation {
+    input: Bitrate,
+    control: Bitrate,
+    clipboard: Bitrate,
+    audio: Bitrate,
+    video: Bitrate,
+    file: Bitrate,
+    /// Total budget passed to [`RateAllocator::allocate`].
+    total: Bitrate,
+}
+
+impl ChannelAllocation {
+    /// Allocation for [`ChannelId::Input`].
+    #[must_use]
+    pub fn input(&self) -> Bitrate {
+        self.input
+    }
+
+    /// Allocation for [`ChannelId::Control`].
+    #[must_use]
+    pub fn control(&self) -> Bitrate {
+        self.control
+    }
+
+    /// Allocation for [`ChannelId::Clipboard`].
+    #[must_use]
+    pub fn clipboard(&self) -> Bitrate {
+        self.clipboard
+    }
+
+    /// Allocation for [`ChannelId::Audio`].
+    #[must_use]
+    pub fn audio(&self) -> Bitrate {
+        self.audio
+    }
+
+    /// Allocation for [`ChannelId::Video`].
+    #[must_use]
+    pub fn video(&self) -> Bitrate {
+        self.video
+    }
+
+    /// Allocation for [`ChannelId::File`].
+    #[must_use]
+    pub fn file(&self) -> Bitrate {
+        self.file
+    }
+
+    /// Total budget that was passed to [`RateAllocator::allocate`].
+    ///
+    /// Stored for convenience so callers can verify that the sum of fields equals this or can
+    /// present the total alongside the per-channel breakdown in diagnostics.
+    #[must_use]
+    pub fn total(&self) -> Bitrate {
+        self.total
+    }
+
+    /// Look up the allocation for an arbitrary [`ChannelId`].
+    ///
+    /// Useful when callers iterate over channels generically rather than accessing named
+    /// accessors.
+    #[must_use]
+    pub fn get(&self, channel: ChannelId) -> Bitrate {
+        match channel {
+            ChannelId::Input => self.input,
+            ChannelId::Control => self.control,
+            ChannelId::Clipboard => self.clipboard,
+            ChannelId::Audio => self.audio,
+            ChannelId::Video => self.video,
+            ChannelId::File => self.file,
+        }
+    }
+
+    /// The sum of all per-channel allocations.
+    ///
+    /// Guaranteed to equal `self.total()` exactly (lossless waterfall). Uses saturating addition
+    /// internally (overflow is impossible given each field is `<= total`, but we saturate defensively).
+    #[must_use]
+    pub fn sum(&self) -> Bitrate {
+        self.input
+            .saturating_add(self.control)
+            .saturating_add(self.clipboard)
+            .saturating_add(self.audio)
+            .saturating_add(self.video)
+            .saturating_add(self.file)
+    }
+}
+
+// ── Allocator ─────────────────────────────────────────────────────────────────
+
+/// Cross-channel rate allocator.
+///
+/// Takes the total send budget from the congestion controller and distributes it across the six
+/// Streamhaul channels according to the documented priority order and configurable floors/caps.
+///
+/// `RateAllocator` is a **pure function** of `(total, config)`: it holds no mutable state beyond
+/// the configuration. Calling [`allocate`] with the same `total` always returns the same result.
+/// There are no interior locks, async state, or platform dependencies.
+///
+/// # Usage
+///
+/// Construct once at session start, then call [`allocate`] on every control tick:
+///
+/// ```rust
+/// use sh_adaptive::allocator::{AllocatorConfig, RateAllocator};
+/// use sh_types::Bitrate;
+///
+/// let allocator = RateAllocator::new(AllocatorConfig::default());
+/// let alloc = allocator.allocate(Bitrate::from_mbps(2));
+/// assert_eq!(alloc.sum(), Bitrate::from_mbps(2)); // lossless: sum == total exactly
+/// // Video gets the bulk; audio gets its floor; file gets leftover (may be zero).
+/// assert!(alloc.video() >= alloc.file());
+/// ```
+///
+/// [`allocate`]: RateAllocator::allocate
+#[derive(Debug, Clone)]
+pub struct RateAllocator {
+    config: AllocatorConfig,
+}
+
+impl RateAllocator {
+    /// Construct a new `RateAllocator` with the given configuration.
+    ///
+    /// # Conservation guarantee
+    ///
+    /// All field values are accepted without validation. The allocation is a saturating priority
+    /// waterfall whose final step assigns the remainder to file, so `allocation.sum() == total`
+    /// holds **exactly** for **any** config and **any** `total` (including `u64::MAX`). No field
+    /// combination can over-commit (sum > total) or drop budget (sum < total).
+    #[must_use]
+    pub fn new(config: AllocatorConfig) -> Self {
+        Self { config }
+    }
+
+    /// Allocate `total` across all channels according to the configured priority order.
+    ///
+    /// The returned [`ChannelAllocation`] satisfies:
+    /// - `sum() == total` exactly (lossless: the final step assigns the remainder to file)
+    /// - All per-channel values are `>= Bitrate::ZERO` (no negative rates)
+    /// - Priority order is strictly respected (see module-level doc for details)
+    #[must_use]
+    pub fn allocate(&self, total: Bitrate) -> ChannelAllocation {
+        let c = &self.config;
+        let mut remaining = total;
+
+        // 1. Input reserve (highest priority — must never be starved).
+        let input = c.input_reserve.clamp(Bitrate::ZERO, remaining);
+        remaining = remaining.saturating_sub(input);
+
+        // 2. Control reserve.
+        let control = c.control_reserve.clamp(Bitrate::ZERO, remaining);
+        remaining = remaining.saturating_sub(control);
+
+        // 3. Clipboard reserve.
+        let clipboard = c.clipboard_reserve.clamp(Bitrate::ZERO, remaining);
+        remaining = remaining.saturating_sub(clipboard);
+
+        // 4. Audio floor (served before video).
+        let audio = c.audio_min.clamp(Bitrate::ZERO, remaining);
+        remaining = remaining.saturating_sub(audio);
+
+        // 5. Video: min(remaining, video_max). No lower bound — when the budget is tight, video
+        //    gets whatever is left after the floors, which may be zero. Callers should compare
+        //    video() against their encoder's floor and decide to degrade or drop frames.
+        let video = remaining.clamp(Bitrate::ZERO, c.video_max);
+        remaining = remaining.saturating_sub(video);
+
+        // 6. File: pure leftover after video. File never starves video.
+        let file = remaining;
+
+        ChannelAllocation {
+            input,
+            control,
+            clipboard,
+            audio,
+            video,
+            file,
+            total,
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Build a default allocator for convenience in multiple tests.
+    fn default_alloc() -> RateAllocator {
+        RateAllocator::new(AllocatorConfig::default())
+    }
+
+    // ── Sum invariant (proptest) ───────────────────────────────────────────────
+
+    proptest! {
+        /// For any total bitrate, the sum of channel allocations equals the total EXACTLY:
+        /// the waterfall is lossless (`file = remaining` captures every bps not consumed by the
+        /// earlier steps), so nothing is dropped and nothing is over-committed.
+        #[test]
+        fn prop_sum_equals_total(total_bps in 0u64..=u64::MAX) {
+            let alloc = default_alloc();
+            let result = alloc.allocate(Bitrate::from_bps(total_bps));
+            prop_assert_eq!(result.sum(), result.total(),
+                "sum {} != total {}", result.sum().as_bps(), result.total().as_bps());
+        }
+
+        /// sum() == get(Input) + get(Control) + get(Clipboard) + get(Audio) + get(Video) + get(File).
+        #[test]
+        fn prop_get_matches_named_fields(total_bps in 0u64..=u64::MAX) {
+            let alloc = default_alloc();
+            let result = alloc.allocate(Bitrate::from_bps(total_bps));
+            let via_get = result.get(ChannelId::Input)
+                .saturating_add(result.get(ChannelId::Control))
+                .saturating_add(result.get(ChannelId::Clipboard))
+                .saturating_add(result.get(ChannelId::Audio))
+                .saturating_add(result.get(ChannelId::Video))
+                .saturating_add(result.get(ChannelId::File));
+            prop_assert_eq!(result.sum(), via_get);
+        }
+
+        /// No channel allocation ever exceeds the total.
+        #[test]
+        fn prop_no_channel_exceeds_total(total_bps in 0u64..=u64::MAX) {
+            let alloc = default_alloc();
+            let result = alloc.allocate(Bitrate::from_bps(total_bps));
+            let total = Bitrate::from_bps(total_bps);
+            prop_assert!(result.input()     <= total);
+            prop_assert!(result.control()   <= total);
+            prop_assert!(result.clipboard() <= total);
+            prop_assert!(result.audio()     <= total);
+            prop_assert!(result.video()     <= total);
+            prop_assert!(result.file()      <= total);
+        }
+
+        /// Video never exceeds video_max regardless of total.
+        #[test]
+        fn prop_video_never_exceeds_video_max(total_bps in 0u64..=u64::MAX) {
+            let config = AllocatorConfig::default();
+            let video_max = config.video_max;
+            let alloc = RateAllocator::new(config);
+            let result = alloc.allocate(Bitrate::from_bps(total_bps));
+            prop_assert!(result.video() <= video_max,
+                "video {} > video_max {}", result.video().as_bps(), video_max.as_bps());
+        }
+
+        /// File behaviour across all three crossover regions:
+        /// - `total > floor_sum + video_max`: file > ZERO and video == video_max (surplus to file).
+        /// - `total <= floor_sum`: file == ZERO (budget exhausted by floors or below).
+        /// - middle (`floor_sum < total <= floor_sum + video_max`): file == ZERO and video ramps,
+        ///   `video == total - floor_sum`. The exact crossover `total == floor_sum + video_max`
+        ///   lands here (file == 0, video == video_max).
+        #[test]
+        fn prop_file_crossover_invariants(total_bps in 0u64..=u64::MAX) {
+            let config = AllocatorConfig::default();
+            let floor_sum = config.input_reserve
+                .saturating_add(config.control_reserve)
+                .saturating_add(config.clipboard_reserve)
+                .saturating_add(config.audio_min);
+            let video_max = config.video_max;
+            let alloc = RateAllocator::new(config);
+            let total = Bitrate::from_bps(total_bps);
+            let result = alloc.allocate(total);
+
+            let above_video_max = floor_sum.saturating_add(video_max);
+            if total > above_video_max {
+                prop_assert!(result.file() > Bitrate::ZERO,
+                    "expected file > 0 when total ({}) > floor_sum + video_max ({})",
+                    total_bps, above_video_max.as_bps());
+                prop_assert_eq!(result.video(), video_max,
+                    "expected video == video_max above the crossover (total {})", total_bps);
+            } else if total <= floor_sum {
+                prop_assert_eq!(result.file(), Bitrate::ZERO,
+                    "expected file == 0 when total ({}) <= floor_sum ({})",
+                    total_bps, floor_sum.as_bps());
+            } else {
+                // Ramp zone: floors satisfied, video filling, file not yet funded.
+                prop_assert_eq!(result.file(), Bitrate::ZERO,
+                    "expected file == 0 in ramp zone (total {})", total_bps);
+                prop_assert_eq!(result.video(), total.saturating_sub(floor_sum),
+                    "expected video == total - floor_sum in ramp zone (total {})", total_bps);
+            }
+        }
+
+        /// Conservation + priority order hold for ARBITRARY configs (not just the default).
+        ///
+        /// Locks two invariants under non-default field values: (1) `sum() == total` exactly
+        /// (lossless waterfall), and (2) the audio floor is served before video — when the budget
+        /// covers all reserves plus the audio floor, audio receives exactly `audio_min`. An
+        /// audio/video swap in the waterfall would break (2) while still passing (1).
+        #[test]
+        fn prop_conservation_arbitrary_config(
+            total_bps          in 0u64..=u64::MAX,
+            input_reserve_bps  in 0u64..=u64::MAX,
+            control_reserve_bps in 0u64..=u64::MAX,
+            clipboard_reserve_bps in 0u64..=u64::MAX,
+            audio_min_bps      in 0u64..=u64::MAX,
+            video_max_bps      in 0u64..=u64::MAX,
+        ) {
+            let config = AllocatorConfig {
+                input_reserve:     Bitrate::from_bps(input_reserve_bps),
+                control_reserve:   Bitrate::from_bps(control_reserve_bps),
+                clipboard_reserve: Bitrate::from_bps(clipboard_reserve_bps),
+                audio_min:         Bitrate::from_bps(audio_min_bps),
+                video_max:         Bitrate::from_bps(video_max_bps),
+            };
+            let alloc = RateAllocator::new(config);
+            let total = Bitrate::from_bps(total_bps);
+            let result = alloc.allocate(total);
+            // (1) Lossless conservation: sum is exactly the total.
+            prop_assert_eq!(result.sum(), total,
+                "sum {} != total {} with arbitrary config",
+                result.sum().as_bps(), total_bps);
+            // Every channel is bounded by the total.
+            prop_assert!(result.input()     <= total);
+            prop_assert!(result.control()   <= total);
+            prop_assert!(result.clipboard() <= total);
+            prop_assert!(result.audio()     <= total);
+            prop_assert!(result.video()     <= total);
+            prop_assert!(result.file()      <= total);
+            // (2) Audio-before-video priority. Only assert when the floor threshold does NOT
+            // overflow u64 (a saturated threshold would let huge individual reserves drain the
+            // budget before audio, which is correct behaviour, not a priority violation).
+            let floor_threshold = input_reserve_bps
+                .checked_add(control_reserve_bps)
+                .and_then(|s| s.checked_add(clipboard_reserve_bps))
+                .and_then(|s| s.checked_add(audio_min_bps));
+            if let Some(threshold) = floor_threshold {
+                if total_bps >= threshold {
+                    prop_assert_eq!(result.audio(), Bitrate::from_bps(audio_min_bps),
+                        "audio {} != audio_min {} when budget covers the floors (total {})",
+                        result.audio().as_bps(), audio_min_bps, total_bps);
+                }
+            }
+        }
+    }
+
+    // ── Priority order ─────────────────────────────────────────────────────────
+
+    /// At zero total, all allocations are zero.
+    #[test]
+    fn zero_total_produces_zero_allocations() {
+        let result = default_alloc().allocate(Bitrate::ZERO);
+        assert_eq!(result.input(), Bitrate::ZERO);
+        assert_eq!(result.control(), Bitrate::ZERO);
+        assert_eq!(result.clipboard(), Bitrate::ZERO);
+        assert_eq!(result.audio(), Bitrate::ZERO);
+        assert_eq!(result.video(), Bitrate::ZERO);
+        assert_eq!(result.file(), Bitrate::ZERO);
+        assert_eq!(result.sum(), Bitrate::ZERO);
+    }
+
+    /// At 1 bps total, only Input gets anything (it has the highest priority).
+    #[test]
+    fn one_bps_goes_to_input_only() {
+        let result = default_alloc().allocate(Bitrate::from_bps(1));
+        assert_eq!(
+            result.input(),
+            Bitrate::from_bps(1),
+            "input should win at 1 bps"
+        );
+        assert_eq!(result.control(), Bitrate::ZERO);
+        assert_eq!(result.clipboard(), Bitrate::ZERO);
+        assert_eq!(result.audio(), Bitrate::ZERO);
+        assert_eq!(result.video(), Bitrate::ZERO);
+        assert_eq!(result.file(), Bitrate::ZERO);
+    }
+
+    /// Just above the input reserve: input fills, control gets a little, rest zero.
+    #[test]
+    fn just_above_input_reserve_fills_input_then_control() {
+        let config = AllocatorConfig::default();
+        // Total = input_reserve + 1 bps
+        let total = config.input_reserve.saturating_add(Bitrate::from_bps(1));
+        let result = RateAllocator::new(config.clone()).allocate(total);
+        assert_eq!(result.input(), config.input_reserve);
+        assert_eq!(result.control(), Bitrate::from_bps(1));
+        assert_eq!(result.clipboard(), Bitrate::ZERO);
+        assert_eq!(result.audio(), Bitrate::ZERO);
+        assert_eq!(result.video(), Bitrate::ZERO);
+        assert_eq!(result.file(), Bitrate::ZERO);
+        assert_eq!(result.sum(), total);
+    }
+
+    /// At total == input_reserve + control_reserve + clipboard_reserve: all three reserves filled,
+    /// audio and video and file get zero.
+    #[test]
+    fn exactly_three_reserves_no_audio_no_video_no_file() {
+        let config = AllocatorConfig::default();
+        let total = config
+            .input_reserve
+            .saturating_add(config.control_reserve)
+            .saturating_add(config.clipboard_reserve);
+        let result = RateAllocator::new(config.clone()).allocate(total);
+        assert_eq!(result.input(), config.input_reserve);
+        assert_eq!(result.control(), config.control_reserve);
+        assert_eq!(result.clipboard(), config.clipboard_reserve);
+        assert_eq!(result.audio(), Bitrate::ZERO);
+        assert_eq!(result.video(), Bitrate::ZERO);
+        assert_eq!(result.file(), Bitrate::ZERO);
+        assert_eq!(result.sum(), total);
+    }
+
+    // ── Audio floor ────────────────────────────────────────────────────────────
+
+    /// Audio gets its full floor when the budget allows it.
+    #[test]
+    fn audio_floor_respected_when_budget_allows() {
+        let config = AllocatorConfig::default();
+        // total = all three reserves + audio_min exactly
+        let total = config
+            .input_reserve
+            .saturating_add(config.control_reserve)
+            .saturating_add(config.clipboard_reserve)
+            .saturating_add(config.audio_min);
+        let result = RateAllocator::new(config.clone()).allocate(total);
+        assert_eq!(
+            result.audio(),
+            config.audio_min,
+            "audio should get its full floor"
+        );
+        assert_eq!(result.video(), Bitrate::ZERO);
+        assert_eq!(result.file(), Bitrate::ZERO);
+        assert_eq!(result.sum(), total);
+    }
+
+    /// When total is between the three reserves and reserves+audio_min, audio gets less than
+    /// its floor but video and file still get zero (audio wins over video even below its floor).
+    #[test]
+    fn audio_wins_over_video_when_below_audio_floor() {
+        let config = AllocatorConfig::default();
+        // Put 1 bps above the three reserves — not enough for the full audio floor.
+        let total = config
+            .input_reserve
+            .saturating_add(config.control_reserve)
+            .saturating_add(config.clipboard_reserve)
+            .saturating_add(Bitrate::from_bps(1));
+        let result = RateAllocator::new(config).allocate(total);
+        assert_eq!(
+            result.audio(),
+            Bitrate::from_bps(1),
+            "audio should win over video even when below its floor"
+        );
+        assert_eq!(result.video(), Bitrate::ZERO);
+        assert_eq!(result.file(), Bitrate::ZERO);
+    }
+
+    // ── Video bulk ─────────────────────────────────────────────────────────────
+
+    /// At a comfortable total (2 Mbps), video gets the bulk and file may get zero.
+    #[test]
+    fn video_gets_bulk_at_2mbps() {
+        let result = default_alloc().allocate(Bitrate::from_mbps(2));
+        // floors: 32+32+32+96 = 192 kbps
+        // remaining for video: 2000 - 192 = 1808 kbps
+        let expected_video = Bitrate::from_kbps(1808);
+        assert_eq!(
+            result.video(),
+            expected_video,
+            "video should take the remaining budget at 2 Mbps; got {}",
+            result.video()
+        );
+        // file gets zero because video_max (20 Mbps) is not reached
+        assert_eq!(result.file(), Bitrate::ZERO);
+        assert_eq!(result.sum(), Bitrate::from_mbps(2));
+    }
+
+    /// At 20 Mbps total, video hits video_max; file gets any leftover.
+    #[test]
+    fn video_capped_at_video_max_leaving_file_surplus() {
+        let config = AllocatorConfig::default();
+        // total well above video_max (20 Mbps) — use 25 Mbps
+        let total = Bitrate::from_mbps(25);
+        let result = RateAllocator::new(config.clone()).allocate(total);
+        // Video must be capped at video_max.
+        assert_eq!(
+            result.video(),
+            config.video_max,
+            "video should be capped at video_max"
+        );
+        // File must be non-zero.
+        assert!(
+            result.file() > Bitrate::ZERO,
+            "file should get the surplus above video_max; got {}",
+            result.file()
+        );
+        assert_eq!(result.sum(), total);
+    }
+
+    /// As total grows from video_max + floors, video reaches video_max before file gets a
+    /// large share. Verify the crossover point.
+    #[test]
+    fn file_gets_large_share_only_after_video_reaches_max() {
+        let config = AllocatorConfig::default();
+        let alloc = RateAllocator::new(config.clone());
+
+        // Floors consumed before video: input + control + clipboard + audio
+        let floor_sum = config
+            .input_reserve
+            .saturating_add(config.control_reserve)
+            .saturating_add(config.clipboard_reserve)
+            .saturating_add(config.audio_min);
+
+        // total = floors + video_max − 1 bps: video just below video_max, file = 0.
+        let total_just_below = floor_sum
+            .saturating_add(config.video_max)
+            .saturating_sub(Bitrate::from_bps(1));
+        let result_below = alloc.allocate(total_just_below);
+        assert_eq!(
+            result_below.file(),
+            Bitrate::ZERO,
+            "file must be zero when total is just below the video_max crossover"
+        );
+
+        // total = floors + video_max + 1 bps: video exactly at video_max, file = 1 bps.
+        let total_above = floor_sum
+            .saturating_add(config.video_max)
+            .saturating_add(Bitrate::from_bps(1));
+        let result_above = alloc.allocate(total_above);
+        assert_eq!(
+            result_above.video(),
+            config.video_max,
+            "video must be exactly video_max at crossover"
+        );
+        assert_eq!(
+            result_above.file(),
+            Bitrate::from_bps(1),
+            "file must be 1 bps immediately above the video_max crossover"
+        );
+    }
+
+    // ── File never starves video ────────────────────────────────────────────────
+
+    /// File never exceeds video at any total. Once video reaches video_max, file gets the
+    /// remainder — but below video_max the video allocation always dominates file.
+    #[test]
+    fn file_never_starves_video_below_video_max() {
+        let alloc = default_alloc();
+        // Sweep across the range where video is below video_max (0 to floors + video_max).
+        for &kbps in &[0u64, 100, 192, 300, 500, 1000, 2000, 5000, 10_000, 20_000] {
+            let result = alloc.allocate(Bitrate::from_kbps(kbps));
+            assert!(
+                result.video() >= result.file(),
+                "at {}kbps total: video {} < file {}",
+                kbps,
+                result.video().as_kbps(),
+                result.file().as_kbps()
+            );
+        }
+    }
+
+    // ── Degenerate / hostile totals ────────────────────────────────────────────
+
+    /// u64::MAX total does not panic and produces a valid (finite) allocation.
+    #[test]
+    fn u64_max_total_no_panic_no_overflow() {
+        let alloc = default_alloc();
+        let result = alloc.allocate(Bitrate::from_bps(u64::MAX));
+        // sum() must not overflow and must be <= u64::MAX.
+        assert!(result.sum() <= Bitrate::from_bps(u64::MAX));
+        // video must be capped at video_max.
+        assert_eq!(result.video(), AllocatorConfig::default().video_max);
+    }
+
+    /// Allocation is deterministic: same input always produces same output.
+    #[test]
+    fn allocation_is_deterministic() {
+        let alloc = default_alloc();
+        let total = Bitrate::from_mbps(10);
+        let a = alloc.allocate(total);
+        let b = alloc.allocate(total);
+        assert_eq!(a, b);
+    }
+}
