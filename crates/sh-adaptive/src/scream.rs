@@ -1101,7 +1101,10 @@ mod tests {
         println!("[session_restart] after 31s gap: {after_restart}");
 
         // After cold-restart, target should be near the initial bitrate, not at peak.
-        // Allow up to initial + 5 Mbps (the CWND was reset but one step of slow-start ran).
+        // The cold-restart branch resets CWND to initial and re-derives the target via
+        // update_target_bitrate(), then returns early (apply_increase is NOT called), so the target
+        // equals initial_bitrate exactly. Allow +5 Mbps headroom as a conservative bound against
+        // future floating-point rounding drift.
         let initial = cfg.initial_bitrate;
         assert!(
             after_restart <= initial.saturating_add(Bitrate::from_mbps(5)),

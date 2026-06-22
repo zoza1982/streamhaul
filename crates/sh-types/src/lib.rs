@@ -77,12 +77,13 @@ impl Bitrate {
         if !bps.is_finite() {
             return Self(u64::MAX);
         }
-        // Finite, non-negative. Values beyond 1.844e19 exceed u64::MAX but f64 rounds
-        // u64::MAX up; clamp any value >= 2^64 to u64::MAX.
-        if bps >= 1.844_674_407_370_955_2e19_f64 {
+        // Finite, non-negative. `u64::MAX as f64` rounds UP to the next representable double
+        // (2^64), so any finite bps at or above that value would truncate unsafely; saturate it.
+        const U64_MAX_AS_F64: f64 = u64::MAX as f64;
+        if bps >= U64_MAX_AS_F64 {
             return Self(u64::MAX);
         }
-        // SAFETY: value is finite, in [0, u64::MAX) (guarded above).
+        // Invariant: bps is finite and in [0.0, 2^64), so the truncating cast is exact and in range.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Self(bps as u64)
     }
@@ -120,7 +121,9 @@ impl Bitrate {
 
     /// Clamp `self` to the range `[min, max]`.
     ///
-    /// If `min > max`, returns `min` (diverges from [`Ord::clamp`] which panics; this method never panics).
+    /// For well-formed ranges (`min <= max`) this matches [`Ord::clamp`] semantics. If `min > max`
+    /// the result is unspecified (it returns `min` or `max` depending on `self`), but unlike
+    /// [`Ord::clamp`] this method never panics.
     #[inline]
     #[must_use]
     pub fn clamp(self, min: Self, max: Self) -> Self {
