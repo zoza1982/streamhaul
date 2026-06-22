@@ -20,13 +20,12 @@ static KS_A: OnceLock<SoftwareKeystore> = OnceLock::new();
 static KS_B: OnceLock<SoftwareKeystore> = OnceLock::new();
 
 fn runtime() -> &'static Runtime {
+    // A fuzz harness that cannot build its (current-thread) runtime cannot run; abort rather
+    // than fall back to a multi-thread runtime (which needs the `rt-multi-thread` feature).
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .build()
-            .unwrap_or_else(|_| {
-                tokio::runtime::Runtime::new()
-                    .unwrap_or_else(|_| std::process::abort())
-            })
+            .unwrap_or_else(|_| std::process::abort())
     })
 }
 
@@ -49,7 +48,12 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
 
-    let _ = code.check_not_expired(&clock);
+    // check_not_expired consumes the code and yields the ValidPairingCode typestate that
+    // start_with_rng requires (enforces "no exchange from an unchecked/expired code").
+    let valid = match code.check_not_expired(&clock) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
 
     let mut rng = rand_core::OsRng;
     let h = [0u8; 32];
@@ -57,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(mut exc) = PakeExchange::start_with_rng(
         &mut rng,
         PakeRole::Initiator,
-        &code,
+        &valid,
         id_a,
         id_b,
         &h,

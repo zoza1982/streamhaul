@@ -22,16 +22,11 @@ static KS: OnceLock<SoftwareKeystore> = OnceLock::new();
 
 fn runtime() -> Option<&'static Runtime> {
     RT.get_or_init(|| {
+        // A fuzz harness that cannot build its current-thread runtime cannot run; abort rather
+        // than fall back to a multi-thread runtime (which needs the `rt-multi-thread` feature).
         tokio::runtime::Builder::new_current_thread()
             .build()
-            // SAFETY: if the runtime cannot be constructed the fuzzer iteration is a no-op;
-            // we return a sentinel value that the caller checks. However, OnceLock requires
-            // we always store *something*, so we fall back to a minimal multi-thread runtime.
-            // If that also fails there is nothing sensible to do — the process exits.
-            .unwrap_or_else(|_| {
-                tokio::runtime::Runtime::new()
-                    .unwrap_or_else(|_| std::process::abort())
-            })
+            .unwrap_or_else(|_| std::process::abort())
     });
     RT.get()
 }
