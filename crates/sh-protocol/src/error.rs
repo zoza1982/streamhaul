@@ -43,4 +43,7 @@ pub enum ProtocolError {
     /// `monitor_id` exceeds [`crate::MAX_MONITOR_ID`] (does not fit the 4-bit wire field).
     #[error("monitor_id {0} exceeds 4-bit maximum")]
     MonitorIdTooLarge(u8),
+    /// `cumulative_lost` exceeds [`crate::MAX_CUMULATIVE_LOST`] (does not fit the 24-bit wire field).
+    #[error("cumulative_lost {0} exceeds 24-bit maximum")]
+    CumulativeLostTooLarge(u32),
 }

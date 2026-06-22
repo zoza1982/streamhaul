@@ -5,20 +5,23 @@
 //! order). Decoding treats every input as hostile — it never panics and never indexes out of bounds;
 //! malformed input returns [`ProtocolError`]. See `LLD.md` §3.1 for the field layouts.
 //!
-//! Covers the [`CommonHeader`], [`VideoHeader`], the [`InputEvent`] (P1-2), and control-channel
-//! framing ([`encode_control`]/[`decode_control`], P1-2). Audio and feedback message types land with
-//! their phases. Each message type lives in its own module; the public surface is re-exported here.
+//! Covers the [`CommonHeader`], [`VideoHeader`], the [`InputEvent`] (P1-2), control-channel
+//! framing ([`encode_control`]/[`decode_control`], P1-2), and the 25-byte [`NackFeedback`]
+//! message (P2-6). Audio and remaining feedback types land with their phases. Each message type
+//! lives in its own module; the public surface is re-exported here.
 
 mod bits;
 mod common;
 mod control;
 mod error;
+mod feedback;
 mod input;
 mod video;
 
 pub use common::{CommonHeader, Flags};
 pub use control::{decode_control, encode_control, ControlFrame, CONTROL_HEADER_LEN};
 pub use error::ProtocolError;
+pub use feedback::{NackFeedback, MAX_CUMULATIVE_LOST, NACK_FEEDBACK_LEN};
 pub use input::{EventType, InputEvent, Modifiers};
 pub use video::{Codec, FrameType, Priority, VideoHeader};
 
