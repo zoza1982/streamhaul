@@ -64,8 +64,12 @@ impl Fingerprint {
     /// Computes a fingerprint from the given verifying key.
     pub(crate) fn from_verifying_key(key: &VerifyingKey) -> Self {
         let digest = Sha256::digest(key.as_bytes());
-        // Format as lowercase hex without allocating intermediate strings.
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        // Build the hex string in one allocation.
+        let mut hex = String::with_capacity(64);
+        for b in digest.iter() {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
         Self(hex)
     }
 
@@ -80,8 +84,14 @@ impl Fingerprint {
     ///
     /// Suitable for SAS-style attended display. **Do not use for automated identity checks**;
     /// use [`as_str`](Self::as_str) for the full fingerprint.
+    ///
+    /// # Panics
+    ///
+    /// Never panics. The inner string is always exactly 64 ASCII hex characters (invariant
+    /// maintained by the sole constructor [`Fingerprint::from_verifying_key`]), so the
+    /// `[..16]` slice is always in-bounds.
     pub fn short(&self) -> &str {
-        // Safety: the string is always exactly 64 ASCII hex characters; 16 is in-bounds.
+        // Invariant: the string is always exactly 64 ASCII hex characters; 16 is in-bounds.
         &self.0[..16]
     }
 }
@@ -162,8 +172,12 @@ impl DeviceIdentity {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::CryptoError::MalformedKey`] if the bytes are not a valid Ed25519
-    /// compressed point.
+    /// Returns [`crate::CryptoError::MalformedKey`] if:
+    /// - The bytes do not decompress to a valid Ed25519 curve point, or
+    /// - The key is a small-order (weak) point in a torsion subgroup. Small-order keys are
+    ///   rejected as a defense-in-depth measure: they can never be pinned in the trust store,
+    ///   appear in a `BindCert`, or be used in signature verification — even though
+    ///   [`Signature::verify`] already uses `verify_strict` which would also reject them.
     ///
     /// # Examples
     ///
@@ -179,11 +193,21 @@ impl DeviceIdentity {
     /// # });
     /// ```
     pub fn from_public_key_bytes(bytes: &[u8; 32]) -> Result<Self, crate::CryptoError> {
-        VerifyingKey::from_bytes(bytes)
-            .map(Self::from_verifying_key)
-            .map_err(|_| crate::CryptoError::MalformedKey {
+        let key =
+            VerifyingKey::from_bytes(bytes).map_err(|_| crate::CryptoError::MalformedKey {
                 reason: "bytes do not form a valid Ed25519 compressed point",
-            })
+            })?;
+        // Defense-in-depth: reject small-order (weak) public keys before they can be pinned
+        // in the trust store. A small-order key lies in a torsion subgroup, not the prime-order
+        // subgroup, and allows an attacker to forge signatures that verify under `verify()`
+        // (cofactored). Even with `verify_strict`, we want to prevent weak keys from ever
+        // entering the identity/trust machinery so they cannot appear in BindCert or audit logs.
+        if key.is_weak() {
+            return Err(crate::CryptoError::MalformedKey {
+                reason: "public key is a small-order (weak) point and cannot be trusted",
+            });
+        }
+        Ok(Self::from_verifying_key(key))
     }
 
     /// Returns the inner [`ed25519_dalek::VerifyingKey`].
@@ -277,16 +301,68 @@ mod tests {
 
     #[test]
     fn debug_does_not_contain_full_key_bytes() {
-        let key = make_key();
-        let id = DeviceIdentity::from_verifying_key(key);
+        // Use a fixed signing key so we can derive the exact public key hex and assert
+        // it is absent from the Debug output.
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let vk = signing_key.verifying_key();
+        let pubkey_hex: String = vk.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let id = DeviceIdentity::from_verifying_key(vk);
         let debug_str = format!("{id:?}");
-        // The signing key is not in scope here; we just ensure the full 64-char fingerprint
-        // is not accidentally emitted (we only show the 16-char short form in Debug).
+        // The raw 32-byte public key hex must not appear in Debug output.
+        assert!(
+            !debug_str.contains(&pubkey_hex),
+            "Debug must not expose the raw public key bytes, got: {debug_str}"
+        );
+        // The full 64-char fingerprint must not appear (we only show the 16-char short form).
         assert!(
             !debug_str.contains(id.fingerprint().as_str()),
             "Debug should show short fingerprint only, got: {debug_str}"
         );
         assert!(debug_str.contains(id.fingerprint().short()));
+    }
+
+    /// Defense-in-depth: `from_public_key_bytes` must reject small-order (weak) keys
+    /// so they can never be pinned in the trust store or appear in a BindCert.
+    ///
+    /// The Ed25519 curve has a cofactor of 8. The eight small-order points (the torsion
+    /// subgroup) are known constants. We test three of them here; the others follow by
+    /// symmetry. If this test fails, someone removed the `is_weak()` check.
+    #[test]
+    fn small_order_public_key_rejected() {
+        // Known small-order points on the Ed25519 curve (from RFC 8032 / libsodium tests).
+        // Each is a valid compressed y-coordinate that decompresses to a torsion point.
+        let small_order_keys: &[[u8; 32]] = &[
+            // The identity element: (0, 1) → y = 1, sign bit 0.
+            {
+                let mut b = [0u8; 32];
+                b[0] = 0x01;
+                b
+            },
+            // Point of order 2: (0, -1) → y = p-1 in compressed form.
+            // In Ed25519, p = 2^255 - 19, so -1 mod p = p-1.
+            // Compressed: bytes of (p-1), low bit = sign of x = 0 → 0xec, 0xff * 30, 0x7f.
+            [
+                0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+            // A well-known order-4 torsion point used in libsodium's test vectors.
+            [
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00,
+            ],
+        ];
+
+        for key_bytes in small_order_keys {
+            let result = DeviceIdentity::from_public_key_bytes(key_bytes);
+            // Either the bytes don't decompress at all (MalformedKey from from_bytes),
+            // or they decompress but is_weak() triggers. Either way: must be Err.
+            assert!(
+                result.is_err(),
+                "from_public_key_bytes must reject small-order key: {key_bytes:02x?}"
+            );
+        }
     }
 
     #[test]

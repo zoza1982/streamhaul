@@ -35,11 +35,17 @@
 //!
 //! - **Ed25519**: RFC 8032, implemented by `ed25519-dalek` 2.x (which in turn uses
 //!   `curve25519-dalek`). The `zeroize` feature is enabled; `SigningKey` zeroes its memory on
-//!   drop.
+//!   drop. Verification uses `verify_strict` (not `verify`) to reject small-order public keys
+//!   and non-canonical signatures — see ADR 0006 for the rationale.
 //! - **SHA-256**: fingerprint derivation via `sha2` 0.10.x.
 //! - **OsRng**: production key generation uses `rand_core::OsRng` (backed by `getrandom`).
 //!   Test constructors accept an arbitrary `CryptoRng + RngCore` so tests are deterministic and
 //!   seedable without touching the OS entropy pool.
+//!
+//! ## Design decisions
+//!
+//! Identity / fingerprint design, the `verify_strict` choice, the TOFU trust-store data model,
+//! and revocation policy are recorded in [ADR 0006](../../../docs/adr/0006-device-identity-fingerprint-and-verification.md).
 
 #![deny(missing_docs)]
 

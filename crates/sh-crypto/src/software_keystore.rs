@@ -19,19 +19,30 @@
 //! - `trust_peer` is idempotent. Calling it for an already-trusted peer is a no-op.
 //! - `revoke_peer` is idempotent. Revoking a never-trusted peer is a no-op.
 //! - **Re-trust after revocation is permitted.** If a peer is revoked and then `trust_peer`
-//!   is called again, the peer is moved from the revoked set back to the trusted set. Rationale:
+//!   is called again, the peer's state moves from `Revoked` back to `Trusted`. Rationale:
 //!   the operator may rotate a device and re-pair it under the same identity (e.g., after a
 //!   factory reset). Requiring a new identity for re-pairing would be overly restrictive for the
-//!   P3-1 software store. Hardware keystores (P3+ follow-up) may enforce stricter policies.
+//!   P3-1 software store.
+//!
+//!   **Production / hardware keystores** should make revocation sticky: once revoked, re-trust
+//!   must require a distinct, explicitly operator-confirmed action rather than the ordinary
+//!   first-pairing `trust_peer` path. The P3-3 pairing layer must surface any implicit
+//!   re-trust-after-revoke to the operator. See IMPLEMENTATION_PLAN.md entry R-HW-KS.
+//!
+//! # Trust store data model
+//!
+//! The trust state for each fingerprint is held in a single `HashMap<String, TrustState>` rather
+//! than two separate `HashSet`s. This makes "trusted AND not revoked" (or any other combination)
+//! structurally unrepresentable — a fingerprint can only be in one state at a time.
 //!
 //! # Thread safety
 //!
-//! The trust/revoke sets are protected by a `std::sync::RwLock`, which allows concurrent
-//! `is_trusted` reads. `trust_peer` and `revoke_peer` take a write lock. No async-aware lock is
-//! used because the critical section is extremely short (a hash-set lookup/insert) and never
-//! calls external I/O — blocking the thread for a nanosecond is acceptable.
+//! The trust map is protected by a `std::sync::RwLock`, which allows concurrent `is_trusted`
+//! reads. `trust_peer` and `revoke_peer` take a write lock. No async-aware lock is used because
+//! the critical section is extremely short (a hash-map lookup/insert) and never calls external
+//! I/O — blocking the thread for a nanosecond is acceptable.
 
-use std::{collections::HashSet, fmt, sync::RwLock};
+use std::{collections::HashMap, fmt, sync::RwLock};
 
 use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey};
@@ -39,12 +50,26 @@ use rand_core::{CryptoRng, OsRng, RngCore};
 
 use crate::{keystore::Keystore, CryptoError, DeviceIdentity, Signature};
 
+/// The trust state of a peer identity in the local trust store.
+///
+/// A fingerprint maps to exactly one state, preventing the "in both sets" invariant
+/// bug that two `HashSet`s would allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustState {
+    /// The peer is pinned and trusted.
+    Trusted,
+    /// The peer has been explicitly revoked.
+    Revoked,
+}
+
 /// The inner state of the software keystore, behind an `RwLock`.
 struct Inner {
-    /// Fingerprints of trusted peers (pinned, not revoked).
-    trusted: HashSet<String>,
-    /// Fingerprints of explicitly revoked peers.
-    revoked: HashSet<String>,
+    /// Maps peer fingerprints to their current trust state.
+    ///
+    /// A missing entry means the peer has never been seen (equivalent to "untrusted but not
+    /// explicitly revoked"). The single-map design makes it structurally unrepresentable for a
+    /// fingerprint to be simultaneously Trusted and Revoked.
+    peers: HashMap<String, TrustState>,
 }
 
 /// A portable, in-memory [`Keystore`] backed by an Ed25519 signing key.
@@ -79,8 +104,10 @@ pub struct SoftwareKeystore {
     /// enabled (which it is in our configuration — see `Cargo.toml`). The key bytes are
     /// zeroed when the field is dropped. No public accessor exists for this field.
     ///
-    /// The key is `Box`ed to give it a stable heap address, avoiding accidental copies on
-    /// stack moves. The stack pointer to the `Box` is the only copy.
+    /// The key is `Box`ed so that the secret 32-byte scalar lives at a single, stable heap
+    /// address. This reduces the risk of the scalar being scattered across multiple stack frames
+    /// or appearing in crash dumps / core files at more than one location. The stack pointer
+    /// to the `Box` is the only live reference to the allocation; the scalar itself stays put.
     signing_key: Box<SigningKey>,
     /// The cached public identity (derived once at construction; never changes).
     identity: DeviceIdentity,
@@ -163,8 +190,7 @@ impl SoftwareKeystore {
             signing_key: Box::new(key),
             identity,
             inner: RwLock::new(Inner {
-                trusted: HashSet::new(),
-                revoked: HashSet::new(),
+                peers: HashMap::new(),
             }),
         }
     }
@@ -197,14 +223,14 @@ impl Keystore for SoftwareKeystore {
 
     async fn trust_peer(&self, id: &DeviceIdentity) -> Result<(), CryptoError> {
         let fp = Self::fp(id).to_owned();
-        // Re-trust after revocation: remove from the revoked set and add to trusted.
-        // See module doc for the policy rationale.
+        // Insert or overwrite: moves the fingerprint to Trusted regardless of prior state.
+        // Re-trust after revocation is the documented policy for SoftwareKeystore.
+        // See module doc for rationale and the R-HW-KS note for production implications.
         let mut inner = self
             .inner
             .write()
             .map_err(|_| CryptoError::Backend("trust store lock poisoned".into()))?;
-        inner.revoked.remove(&fp);
-        inner.trusted.insert(fp);
+        inner.peers.insert(fp, TrustState::Trusted);
         Ok(())
     }
 
@@ -213,22 +239,21 @@ impl Keystore for SoftwareKeystore {
             .inner
             .read()
             .map_err(|_| CryptoError::Backend("trust store lock poisoned".into()))?;
-        // Trusted iff pinned AND not revoked.
-        // Note: `revoke_peer` always removes from `trusted`, so this check is
-        // `trusted.contains(fp)` alone, but we double-check the revoked set for
-        // safety in case of implementation bugs.
-        let fp = Self::fp(id);
-        Ok(inner.trusted.contains(fp) && !inner.revoked.contains(fp))
+        // The single-map design means Trusted and Revoked are mutually exclusive by construction.
+        Ok(matches!(
+            inner.peers.get(Self::fp(id)),
+            Some(TrustState::Trusted)
+        ))
     }
 
     async fn revoke_peer(&self, id: &DeviceIdentity) -> Result<(), CryptoError> {
         let fp = Self::fp(id).to_owned();
+        // Insert or overwrite: moves the fingerprint to Revoked regardless of prior state.
         let mut inner = self
             .inner
             .write()
             .map_err(|_| CryptoError::Backend("trust store lock poisoned".into()))?;
-        inner.trusted.remove(&fp);
-        inner.revoked.insert(fp);
+        inner.peers.insert(fp, TrustState::Revoked);
         Ok(())
     }
 }
@@ -408,17 +433,40 @@ mod tests {
 
     #[tokio::test]
     async fn debug_does_not_contain_signing_key() {
-        let ks = seeded(20);
+        // Construct from a KNOWN SigningKey so we can derive the exact 32-byte secret scalar
+        // and assert it is absent from the Debug output.
+        let key_bytes_seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec,
+            0x2c, 0x44, 0xda, 0x10, 0x28, 0x19, 0xfa, 0x88, 0x5d, 0x93, 0x20, 0x50, 0x32, 0x2a,
+            0x22, 0x6f, 0xa0, 0xbb,
+        ];
+        let signing_key = SigningKey::from_bytes(&key_bytes_seed);
+        let scalar_hex: String = signing_key
+            .to_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let ks = SoftwareKeystore::from_signing_key(signing_key);
         let id = ks.device_identity().await.unwrap();
         let debug_str = format!("{ks:?}");
-        // The signing key bytes are never accessible, but we can ensure the Debug output
-        // does not contain any 32-byte hex strings that could be the key scalar.
-        // The fingerprint (public) is fine to appear.
-        assert!(debug_str.contains("SoftwareKeystore"));
-        // No explicit private key field should be present.
+
+        // The actual 32-byte secret scalar hex must not appear.
+        assert!(
+            !debug_str.contains(&scalar_hex),
+            "Debug must not expose the secret signing key scalar, got: {debug_str}"
+        );
+        // The field name must not be present (no accidental struct-derive leakage).
         assert!(!debug_str.contains("signing_key"));
-        // Debug of DeviceIdentity shows only the short fingerprint (16 chars).
-        assert!(debug_str.contains(id.fingerprint().short()));
+        assert!(debug_str.contains("SoftwareKeystore"));
+        // DeviceIdentity in Debug shows only the short fingerprint (16 chars), not the full one.
+        assert!(
+            debug_str.contains(id.fingerprint().short()),
+            "Debug should include the short fingerprint"
+        );
+        assert!(
+            !debug_str.contains(id.fingerprint().as_str()),
+            "Debug must not expose the full 64-char fingerprint"
+        );
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@
 //! `Debug` renders only a placeholder. The 64 bytes are not secret (they are sent on the wire)
 //! but including them in debug logs creates large, unreadable noise.
 
-use ed25519_dalek::{Signature as DalekSignature, Verifier};
+use ed25519_dalek::Signature as DalekSignature;
 
 use crate::{CryptoError, DeviceIdentity};
 
@@ -119,9 +119,15 @@ impl Signature {
     /// # });
     /// ```
     pub fn verify(&self, identity: &DeviceIdentity, data: &[u8]) -> Result<(), CryptoError> {
+        // Use `verify_strict` rather than `verify` to reject:
+        // - small-order public keys (e.g. the identity/torsion-subgroup points), and
+        // - non-canonical ("malleable") `R` components in the signature itself.
+        // This is mandatory for a device-identity TRUST ROOT: accepting small-order keys
+        // would break the signature-uniqueness assumptions relied on by BindCert, anti-replay
+        // logic, and audit receipts downstream.
         identity
             .verifying_key()
-            .verify(data, &self.0)
+            .verify_strict(data, &self.0)
             .map_err(|_| CryptoError::Signature)
     }
 }
@@ -212,12 +218,56 @@ mod tests {
 
     #[tokio::test]
     async fn debug_does_not_expose_bytes() {
-        let ks = make_ks_seeded(5);
+        // Use a KNOWN key so we can assert the actual secret scalar hex is absent.
+        use rand_core::SeedableRng;
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+        let ks = SoftwareKeystore::generate_with_rng(rng);
         let sig = ks.sign(b"secret").await.unwrap();
+        let raw_bytes = sig.encode();
+        let raw_hex: String = raw_bytes.iter().map(|b| format!("{b:02x}")).collect();
         let debug = format!("{sig:?}");
-        // Verify it does not contain raw hex bytes (64 bytes = 128 hex chars).
-        assert!(!debug.contains("00000000"));
+        // The actual 64 raw bytes (128 hex chars) must not appear in Debug output.
+        assert!(
+            !debug.contains(&raw_hex[..16]),
+            "Debug must not expose raw signature bytes"
+        );
         assert!(debug.contains("Signature"));
+    }
+
+    /// Regression test for the `verify_strict` requirement.
+    ///
+    /// A small-order `R` point (the Ed25519/ristretto255 identity element encoded as 32 zero
+    /// bytes followed by a 1) is a canonical representation of a torsion point. A signature
+    /// with R = identity and S = 0 trivially satisfies the non-strict batch equation
+    /// `[8][S]B = [8]R + [8][H]A` when A is also small-order, but `verify_strict` rejects it.
+    ///
+    /// This test MUST fail if someone reverts to `verify()`. The all-zeros 64-byte signature
+    /// used by `garbage_signature_fails_verify` does NOT cover this because dalek parses it
+    /// as R = compressed identity (valid small-order point) and S = 0, which the non-strict
+    /// verifier may accept under a small-order public key.
+    #[test]
+    fn small_order_r_signature_rejected_by_verify_strict() {
+        // Use a normal (non-small-order) verifying key — verify_strict must reject this
+        // signature because its R component encodes a small-order point.
+        use rand_core::SeedableRng;
+        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(99);
+        let ks = SoftwareKeystore::generate_with_rng(rng);
+        // Build the identity synchronously using block_on since Keystore is async.
+        let id = tokio_test::block_on(ks.device_identity()).unwrap();
+
+        // A signature whose R component is the compressed identity point on Ed25519:
+        // RFC 8032 encodes the neutral element as y = 1 (bit pattern: 0x01 in byte 0,
+        // rest zero). S = 0.  `verify_strict` rejects signatures where R is small-order.
+        let mut small_order_sig_bytes = [0u8; 64];
+        small_order_sig_bytes[0] = 0x01; // y-coordinate = 1 → identity/neutral point
+
+        let sig = Signature::decode(&small_order_sig_bytes).unwrap();
+        let result = sig.verify(&id, b"any data");
+        assert!(
+            result.is_err(),
+            "verify_strict must reject a signature with a small-order R point; \
+             if this assertion fails, verify() was used instead of verify_strict()"
+        );
     }
 
     proptest! {
@@ -234,13 +284,10 @@ mod tests {
             use rand_core::SeedableRng;
             let rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
             let ks = SoftwareKeystore::generate_with_rng(rng);
-            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
-            rt.block_on(async {
-                let id = ks.device_identity().await.unwrap();
-                let sig = ks.sign(&msg).await.unwrap();
-                prop_assert!(sig.verify(&id, &msg).is_ok());
-                Ok(())
-            }).unwrap();
+            // Use tokio_test::block_on instead of spinning up a fresh runtime per iteration.
+            let id = tokio_test::block_on(ks.device_identity()).unwrap();
+            let sig = tokio_test::block_on(ks.sign(&msg)).unwrap();
+            prop_assert!(sig.verify(&id, &msg).is_ok());
         }
     }
 }

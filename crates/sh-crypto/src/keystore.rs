@@ -3,7 +3,7 @@
 //! # Design
 //!
 //! `Keystore` is deliberately **async and object-safe** (`Send + Sync + 'static`) so it can be
-//! held behind a `Box<dyn Keystore>` or `Arc<dyn Keystore>` and called from async tasks without
+//! held behind a `Box<dyn Keystore>` or `Arc<dyn Keystore + 'static>` and called from async tasks without
 //! concern for which thread supplies the key material. On platforms with a hardware security
 //! module (TPM 2.0, Secure Enclave, DPAPI, StrongBox), the async boundary lets HSM calls block
 //! without stalling the QUIC I/O executor.
@@ -32,8 +32,9 @@ use crate::{CryptoError, DeviceIdentity, Signature};
 ///
 /// # Object safety
 ///
-/// This trait is object-safe. It can be used as `Box<dyn Keystore>` or
-/// `Arc<dyn Keystore>` to allow runtime selection of keystore backends (software vs. hardware).
+/// This trait is object-safe. It can be used as `Box<dyn Keystore>` or `Arc<dyn Keystore>` to
+/// allow runtime selection of keystore backends (software vs. hardware). The `'static` bound is
+/// required for `Arc<dyn Keystore>` to be safely sent across thread or task boundaries.
 ///
 /// # Security contract
 ///
@@ -57,7 +58,7 @@ use crate::{CryptoError, DeviceIdentity, Signature};
 /// # });
 /// ```
 #[async_trait]
-pub trait Keystore: Send + Sync {
+pub trait Keystore: Send + Sync + 'static {
     /// Returns this device's Ed25519 public identity (verifying key + fingerprint).
     ///
     /// The returned value contains **only public data** — no signing key material is ever
@@ -93,12 +94,19 @@ pub trait Keystore: Send + Sync {
     /// This operation is **idempotent**: calling `trust_peer` for an already-trusted identity
     /// is not an error and has no observable effect.
     ///
-    /// # Re-trust after revocation policy
+    /// # Re-trust after revocation
     ///
-    /// Implementations document their specific policy. [`SoftwareKeystore`][crate::SoftwareKeystore]
-    /// rejects re-trust of a revoked identity — once revoked, the identity stays revoked until
-    /// a new call to `trust_peer` that succeeds — but see [`SoftwareKeystore`] for the exact
-    /// semantics (re-trust after revocation is allowed but revokes the `is_revoked` flag).
+    /// Re-trust policy after revocation is **implementation-defined**:
+    ///
+    /// - [`SoftwareKeystore`][crate::SoftwareKeystore] **permits** re-trust. Calling
+    ///   `trust_peer` on a previously revoked identity moves it back to the trusted state.
+    ///   This supports the "factory reset and re-pair" scenario without requiring a new key.
+    ///
+    /// - Production / hardware keystores **should** make revocation sticky: once revoked,
+    ///   an identity should require a distinct, explicitly operator-confirmed action to be
+    ///   re-trusted — not the ordinary first-pairing `trust_peer` path. See the module
+    ///   documentation on [`SoftwareKeystore`][crate::SoftwareKeystore] and
+    ///   `IMPLEMENTATION_PLAN.md` entry `R-HW-KS`.
     ///
     /// # Errors
     ///
