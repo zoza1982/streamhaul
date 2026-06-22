@@ -8,6 +8,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Leaf crate: Clock/SystemClock/FixedClock wall-clock abstraction lives here so that
+# sh-transport and other crates can use it without depending on sh-crypto.
+sh-types = { path = "../sh-types" }
+
 # Ed25519 signing/verification (RFC 8032). `zeroize` feature zeroes `SigningKey`
 # on drop via `ZeroizeOnDrop`. `rand_core` feature enables `SigningKey::generate(rng)`.
 # `fast` selects the pre-computed-table fast path. `std` is required for error types.
@@ -31,7 +35,6 @@ thiserror.workspace = true
 snow.workspace = true
 x25519-dalek.workspace = true
 hkdf.workspace = true
-hmac.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 

@@ -20,12 +20,20 @@ use x25519_dalek::StaticSecret;
 static RT: OnceLock<Runtime> = OnceLock::new();
 static KS: OnceLock<SoftwareKeystore> = OnceLock::new();
 
-fn runtime() -> &'static Runtime {
+fn runtime() -> Option<&'static Runtime> {
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_current_thread()
             .build()
-            .expect("tokio runtime")
-    })
+            // SAFETY: if the runtime cannot be constructed the fuzzer iteration is a no-op;
+            // we return a sentinel value that the caller checks. However, OnceLock requires
+            // we always store *something*, so we fall back to a minimal multi-thread runtime.
+            // If that also fails there is nothing sensible to do — the process exits.
+            .unwrap_or_else(|_| {
+                tokio::runtime::Runtime::new()
+                    .unwrap_or_else(|_| std::process::abort())
+            })
+    });
+    RT.get()
 }
 
 fn keystore() -> &'static SoftwareKeystore {
@@ -33,6 +41,7 @@ fn keystore() -> &'static SoftwareKeystore {
 }
 
 fuzz_target!(|data: &[u8]| {
+    let Some(rt) = runtime() else { return };
     let clock = FixedClock(1_000_000_000);
     // A fixed static secret is intentional: we are fuzzing the *message parser*, not
     // key-generation. The key is constant across iterations so the fuzzer can build
@@ -41,11 +50,11 @@ fuzz_target!(|data: &[u8]| {
 
     // Build a fresh handshake per iteration — NoiseHandshake is stateful and must not
     // be reused across iterations. The keystore (signing key) is shared and read-only.
-    let result = runtime().block_on(sh_crypto::NoiseHandshake::responder_xk(
+    // Ephemeral generation is handled by snow's OS-backed default resolver; no RNG param.
+    let result = rt.block_on(sh_crypto::NoiseHandshake::responder_xk(
         keystore(),
         local_static,
         &[],
-        rand_core::OsRng,
         &clock,
     ));
 

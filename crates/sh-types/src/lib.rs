@@ -1,12 +1,103 @@
 //! Core shared types for Streamhaul.
 //!
 //! This is the workspace **leaf crate**: it depends on no other Streamhaul crate, so every other
-//! crate may depend on it without creating cycles. It holds stable identifiers, time units, and the
-//! shared error type. See [`LLD.md`](https://github.com/zoza1982/streamhaul/blob/main/LLD.md) §1–§3.
+//! crate may depend on it without creating cycles. It holds stable identifiers, time units, the
+//! wall-clock abstraction, and the shared error type.
+//!
+//! See [`LLD.md`](https://github.com/zoza1982/streamhaul/blob/main/LLD.md) §1–§3.
+//!
+//! # Clock abstraction
+//!
+//! [`Clock`], [`SystemClock`], and [`FixedClock`] live here (not in `sh-crypto`) so that crates
+//! like `sh-transport` (P3-4 rekey timers) can inject wall-clock time without pulling in the full
+//! `sh-crypto` / `snow` dependency tree. `sh-crypto` re-exports these from its own `clock` module
+//! for ergonomics.
+//!
+//! Note: `sh-media` has a separate `MonotonicClock` (monotonic microseconds since session epoch)
+//! for audio/video timing — that is a distinct concern from this wall-clock abstraction for
+//! certificate validity windows.
 
 use std::fmt;
 use std::ops::{Add, Sub};
 use thiserror::Error;
+
+// ─── Wall-clock abstraction ────────────────────────────────────────────────
+
+/// An injected wall-clock abstraction.
+///
+/// Implementations must return a monotonically non-decreasing value of Unix epoch
+/// seconds (UTC). The system implementation calls [`std::time::SystemTime::now`];
+/// test implementations use a fixed or advancing value.
+///
+/// # Fallback semantics
+///
+/// If the system clock is unavailable, implementations must return `i64::MAX`. This is
+/// the conservative choice: a `BindCert` validated against `i64::MAX` will always fail
+/// the `NOT_AFTER` check (the cert appears perpetually expired), preventing acceptance
+/// of potentially-valid credentials during a clock failure.
+///
+/// # Examples
+///
+/// ```
+/// use sh_types::{Clock, SystemClock};
+///
+/// let clock = SystemClock;
+/// let now = clock.now_unix_secs();
+/// assert!(now > 0, "system clock must return a positive epoch");
+/// ```
+pub trait Clock: Send + Sync + 'static {
+    /// Returns the current time as a Unix epoch timestamp (seconds since 1970-01-01T00:00:00Z).
+    ///
+    /// # Panics
+    ///
+    /// Implementations must not panic on a clock read. If the system clock is unavailable,
+    /// return `i64::MAX` (conservative: treats all certs as perpetually expired).
+    fn now_unix_secs(&self) -> i64;
+}
+
+/// The production [`Clock`] backed by [`std::time::SystemTime`].
+///
+/// # Examples
+///
+/// ```
+/// use sh_types::{Clock, SystemClock};
+/// let clock = SystemClock;
+/// let now = clock.now_unix_secs();
+/// assert!(now > 0);
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_unix_secs(&self) -> i64 {
+        // If the system clock is before the Unix epoch or the duration overflows i64,
+        // return i64::MAX (conservative: all certs appear expired, nothing is accepted).
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX)
+    }
+}
+
+/// A fixed-time [`Clock`] for use in tests.
+///
+/// Returns a constant value for every call to [`Clock::now_unix_secs`].
+///
+/// # Examples
+///
+/// ```
+/// use sh_types::{Clock, FixedClock};
+/// let clock = FixedClock(1_000_000);
+/// assert_eq!(clock.now_unix_secs(), 1_000_000);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct FixedClock(pub i64);
+
+impl Clock for FixedClock {
+    fn now_unix_secs(&self) -> i64 {
+        self.0
+    }
+}
 
 /// A network bitrate measured in **bits per second** (bps).
 ///

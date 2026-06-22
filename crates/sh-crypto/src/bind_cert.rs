@@ -89,6 +89,12 @@ pub const DTLS_FPR_ALG_SHA256: u8 = 0x01;
 /// this many seconds in the future relative to our clock without rejecting the cert.
 const CLOCK_SKEW_TOLERANCE_SECS: i64 = 300;
 
+/// Default validity duration for a [`BindCert`] built by [`NoiseHandshake`] internals: 24 hours.
+///
+/// This constant names the magic number that would otherwise be `86_400`; it is used by
+/// [`crate::noise`] in `make_bind_cert` and in tests that exercise expiry at the 24 h boundary.
+pub const BIND_CERT_VALIDITY_SECS: i64 = 24 * 60 * 60;
+
 // ─── Parsed representation ──────────────────────────────────────────────────
 
 /// A parsed `BindCert`.
@@ -293,6 +299,13 @@ impl BindCert {
                     reason: "TBS too short for DTLS_FPR_ALG",
                 })?;
 
+        // ADR-0007 §2.1: only two algorithm bytes are defined.
+        if dtls_fpr_alg != DTLS_FPR_ALG_NONE && dtls_fpr_alg != DTLS_FPR_ALG_SHA256 {
+            return Err(CryptoError::MalformedBindCert {
+                reason: "unknown DTLS_FPR_ALG",
+            });
+        }
+
         // Extract DTLS_FPR_COMMIT (32 bytes at offset 79).
         let mut dtls_fpr_commit = [0u8; 32];
         let fpr_slice = tbs_bytes
@@ -301,6 +314,13 @@ impl BindCert {
                 reason: "TBS too short for DTLS_FPR_COMMIT",
             })?;
         dtls_fpr_commit.copy_from_slice(fpr_slice);
+
+        // ADR-0007 §2.1 canonical encoding: when ALG=0x00 (none), COMMIT must be all-zeros.
+        if dtls_fpr_alg == DTLS_FPR_ALG_NONE && dtls_fpr_commit != [0u8; 32] {
+            return Err(CryptoError::MalformedBindCert {
+                reason: "DTLS_FPR_COMMIT must be zero when ALG=0x00",
+            });
+        }
 
         // Extract PLATFORM_ATTEST_LEN (u16 BE at offset 111).
         let pa_len_arr: [u8; 2] = tbs_bytes
@@ -610,7 +630,10 @@ impl<'a, K: Keystore> BindCertBuilder<'a, K> {
 
     /// Sets a DTLS fingerprint commitment (for WebRTC / P4-5).
     ///
-    /// `alg` must be [`DTLS_FPR_ALG_SHA256`] and `commit` the SHA-256 of the DTLS SPKI.
+    /// `alg` must be [`DTLS_FPR_ALG_SHA256`] (`0x01`) and `commit` the SHA-256 of the DTLS SPKI.
+    /// [`build`](Self::build) returns [`CryptoError::MalformedBindCert`] if `alg` is unknown
+    /// (i.e. not `DTLS_FPR_ALG_NONE` or `DTLS_FPR_ALG_SHA256`) or if ALG=`0x00` but commit is
+    /// non-zero.
     #[must_use]
     pub fn dtls_fpr(mut self, alg: u8, commit: [u8; 32]) -> Self {
         self.dtls_fpr_alg = alg;
@@ -648,6 +671,19 @@ impl<'a, K: Keystore> BindCertBuilder<'a, K> {
         if self.platform_attest.len() > MAX_PLATFORM_ATTEST_LEN {
             return Err(CryptoError::MalformedBindCert {
                 reason: "platform_attest blob exceeds 4096 bytes",
+            });
+        }
+
+        // ADR-0007 §2.1: reject unknown DTLS_FPR_ALG values.
+        if self.dtls_fpr_alg != DTLS_FPR_ALG_NONE && self.dtls_fpr_alg != DTLS_FPR_ALG_SHA256 {
+            return Err(CryptoError::MalformedBindCert {
+                reason: "unknown DTLS_FPR_ALG",
+            });
+        }
+        // ADR-0007 §2.1 canonical encoding: when ALG=0x00, COMMIT must be all-zeros.
+        if self.dtls_fpr_alg == DTLS_FPR_ALG_NONE && self.dtls_fpr_commit != [0u8; 32] {
+            return Err(CryptoError::MalformedBindCert {
+                reason: "DTLS_FPR_COMMIT must be zero when ALG=0x00",
             });
         }
 
@@ -1051,6 +1087,100 @@ mod tests {
             &tbs[121..129],
             &issued_at.to_be_bytes(),
             "ISSUED_AT bytes mismatch"
+        );
+    }
+
+    /// ADR-0007 §2.1: an unknown DTLS_FPR_ALG byte must be rejected by `decode()`.
+    #[tokio::test]
+    async fn unknown_dtls_fpr_alg_rejected_by_decode() {
+        let ks = SoftwareKeystore::generate();
+        let id = ks.device_identity().await.unwrap();
+        let mut device_id_digest = [0u8; 32];
+        device_id_digest.copy_from_slice(Sha256::digest(id.public_key_bytes()).as_slice());
+        let ns = [0u8; 32];
+        // Use an unknown ALG byte (0x02); commit is zero to avoid a secondary error.
+        let tbs = build_tbs(
+            &device_id_digest,
+            &ns,
+            0x02, // unknown ALG
+            &[0u8; 32],
+            &[],
+            NOW + VALID_FOR,
+            NOW,
+        );
+        let sig = ks.sign(&tbs).await.unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(tbs.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&tbs);
+        wire.extend_from_slice(&sig.encode());
+        let result = BindCert::decode(&wire);
+        assert!(
+            matches!(result, Err(CryptoError::MalformedBindCert { reason }) if reason.contains("unknown DTLS_FPR_ALG")),
+            "unknown DTLS_FPR_ALG must be rejected; got: {result:?}"
+        );
+    }
+
+    /// ADR-0007 §2.1: ALG=0x00 with a non-zero DTLS_FPR_COMMIT must be rejected by `decode()`.
+    #[tokio::test]
+    async fn alg_none_nonzero_commit_rejected_by_decode() {
+        let ks = SoftwareKeystore::generate();
+        let id = ks.device_identity().await.unwrap();
+        let mut device_id_digest = [0u8; 32];
+        device_id_digest.copy_from_slice(Sha256::digest(id.public_key_bytes()).as_slice());
+        let ns = [0u8; 32];
+        // ALG=0x00 but commit is non-zero: violates canonical encoding.
+        let tbs = build_tbs(
+            &device_id_digest,
+            &ns,
+            DTLS_FPR_ALG_NONE,
+            &[0xFFu8; 32], // non-zero commit
+            &[],
+            NOW + VALID_FOR,
+            NOW,
+        );
+        let sig = ks.sign(&tbs).await.unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(tbs.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&tbs);
+        wire.extend_from_slice(&sig.encode());
+        let result = BindCert::decode(&wire);
+        assert!(
+            matches!(result, Err(CryptoError::MalformedBindCert { reason }) if reason.contains("DTLS_FPR_COMMIT must be zero")),
+            "ALG=0x00 with non-zero commit must be rejected; got: {result:?}"
+        );
+    }
+
+    /// ADR-0007 §2.1: unknown DTLS_FPR_ALG must be rejected by `BindCertBuilder::build()`.
+    #[tokio::test]
+    async fn unknown_dtls_fpr_alg_rejected_by_builder() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let result = BindCertBuilder::new(&ks)
+            .noise_static([0u8; 32])
+            .valid_for_secs(VALID_FOR)
+            .dtls_fpr(0x42, [0u8; 32]) // unknown ALG
+            .build(&clock)
+            .await;
+        assert!(
+            matches!(result, Err(CryptoError::MalformedBindCert { reason }) if reason.contains("unknown DTLS_FPR_ALG")),
+            "builder must reject unknown DTLS_FPR_ALG; got: {result:?}"
+        );
+    }
+
+    /// ADR-0007 §2.1: builder must reject ALG=0x00 with a non-zero commit.
+    #[tokio::test]
+    async fn alg_none_nonzero_commit_rejected_by_builder() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let result = BindCertBuilder::new(&ks)
+            .noise_static([0u8; 32])
+            .valid_for_secs(VALID_FOR)
+            .dtls_fpr(DTLS_FPR_ALG_NONE, [0xDEu8; 32]) // ALG=none but non-zero commit
+            .build(&clock)
+            .await;
+        assert!(
+            matches!(result, Err(CryptoError::MalformedBindCert { reason }) if reason.contains("DTLS_FPR_COMMIT must be zero")),
+            "builder must reject ALG=0x00 with non-zero commit; got: {result:?}"
         );
     }
 

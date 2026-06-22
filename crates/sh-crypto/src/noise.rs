@@ -39,13 +39,12 @@
 //! ```
 
 use hkdf::Hkdf;
-use rand_core::{CryptoRng, RngCore};
 use sha2::Sha256;
 use snow::Builder;
 use zeroize::Zeroizing;
 
 use crate::{
-    bind_cert::{BindCert, BindCertBuilder},
+    bind_cert::{BindCert, BindCertBuilder, BIND_CERT_VALIDITY_SECS},
     clock::Clock,
     CryptoError, DeviceIdentity, Keystore,
 };
@@ -158,27 +157,31 @@ fn receive_bind_cert_at(role: HandshakeRole, pattern: NoisePattern) -> u8 {
 ///
 /// Raw cipher state is never exposed. The underlying `snow::TransportState` zeroizes its
 /// keys on drop.
+///
+/// The handshake hash `h` is NOT stored here; the single authoritative copy lives in
+/// [`HandshakeOutcome::handshake_hash`]. `NoiseSession` only holds the HKDF PRK derived from
+/// `h` at split time, which is sufficient for `export_keying_material`. This avoids holding two
+/// independent copies of root session material in memory.
 pub struct NoiseSession {
     transport: snow::TransportState,
-    /// The Noise handshake hash `h` captured at split time (SHA-256, 32 bytes).
+    /// HKDF pseudo-random key derived once from the handshake hash `h` at split time.
     ///
     /// Wrapped in `Zeroizing` so the session root material is erased when the session drops.
-    handshake_hash: Zeroizing<[u8; 32]>,
-    /// HKDF pseudo-random key derived from `h` for the `export_keying_material` seam.
     prk: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for NoiseSession {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NoiseSession")
-            .field("handshake_hash", &"<32 bytes>")
-            .finish_non_exhaustive()
+        f.debug_struct("NoiseSession").finish_non_exhaustive()
     }
 }
 
 impl NoiseSession {
-    fn new(transport: snow::TransportState, handshake_hash: [u8; 32]) -> Result<Self, CryptoError> {
-        let hkdf = Hkdf::<Sha256>::new(None, &handshake_hash);
+    fn new(
+        transport: snow::TransportState,
+        handshake_hash: &[u8; 32],
+    ) -> Result<Self, CryptoError> {
+        let hkdf = Hkdf::<Sha256>::new(None, handshake_hash.as_slice());
         let mut prk_buf = Zeroizing::new([0u8; 32]);
         hkdf.expand(b"shp-noise-prk", prk_buf.as_mut())
             .map_err(|_| CryptoError::HandshakeFailed {
@@ -186,7 +189,6 @@ impl NoiseSession {
             })?;
         Ok(Self {
             transport,
-            handshake_hash: Zeroizing::new(handshake_hash),
             prk: prk_buf,
         })
     }
@@ -227,16 +229,9 @@ impl NoiseSession {
             })
     }
 
-    /// Returns the Noise handshake hash `h` captured at split time (SHA-256, 32 bytes).
-    ///
-    /// Used by P3-3 (SAS derivation). A MITM cannot produce the same `h` on both sides.
-    pub fn handshake_hash(&self) -> &[u8; 32] {
-        &self.handshake_hash
-    }
-
     /// Derives keying material from the session for use by P3-4 (channel subkeys).
     ///
-    /// Uses HKDF-SHA-256 over an internal PRK derived from the handshake hash.
+    /// Uses HKDF-SHA-256 over an internal PRK derived from the handshake hash at split time.
     /// `label` and `context` are additional inputs; `out` is filled with the derived bytes.
     ///
     /// The HKDF info string is length-prefixed as `u32_be(label_len) || label || u32_be(ctx_len)
@@ -244,7 +239,8 @@ impl NoiseSession {
     ///
     /// # Errors
     ///
-    /// Returns [`CryptoError::HandshakeFailed`] if HKDF expansion fails (e.g. output too long).
+    /// Returns [`CryptoError::HandshakeFailed`] if HKDF expansion fails (e.g. output too long
+    /// or label/context byte length exceeds `u32::MAX`).
     ///
     /// # Panics
     ///
@@ -262,8 +258,12 @@ impl NoiseSession {
         })?;
         // Length-prefix both label and context so no two distinct (label, context) pairs
         // produce the same info string, regardless of whether the inputs contain null bytes.
-        let label_len = u32::try_from(label.len()).unwrap_or(u32::MAX);
-        let ctx_len = u32::try_from(context.len()).unwrap_or(u32::MAX);
+        let label_len = u32::try_from(label.len()).map_err(|_| CryptoError::HandshakeFailed {
+            reason: "label exceeds u32 length limit",
+        })?;
+        let ctx_len = u32::try_from(context.len()).map_err(|_| CryptoError::HandshakeFailed {
+            reason: "context exceeds u32 length limit",
+        })?;
         let capacity = 4_usize
             .saturating_add(label.len())
             .saturating_add(4)
@@ -368,9 +368,9 @@ impl std::fmt::Debug for HandshakeOutcome {
 /// let clock = SystemClock;
 /// let (mut initiator, mut responder) = tokio::join!(
 ///     NoiseHandshake::initiator_xk(
-///         &client_ks, client_static, host_pub.to_bytes(), &[], OsRng, &clock
+///         &client_ks, client_static, host_pub.to_bytes(), &[], &clock
 ///     ),
-///     NoiseHandshake::responder_xk(&host_ks, host_static, &[], OsRng, &clock),
+///     NoiseHandshake::responder_xk(&host_ks, host_static, &[], &clock),
 /// );
 /// # });
 /// ```
@@ -392,6 +392,11 @@ pub struct NoiseHandshake {
     peer_bind_cert: Option<BindCert>,
     /// The verified peer identity (set once BindCert checks 2–5 pass).
     peer_identity: Option<DeviceIdentity>,
+    /// Poison flag. Set to `true` if any `read_message` or `write_message` call returns an error
+    /// after advancing snow's internal state. Once poisoned, every subsequent call returns
+    /// `HandshakeFailed { reason: "handshake already aborted" }` to prevent operating on a
+    /// desynced state machine.
+    failed: bool,
 }
 
 impl std::fmt::Debug for NoiseHandshake {
@@ -451,21 +456,25 @@ impl NoiseHandshake {
     ) -> Result<BindCert, CryptoError> {
         BindCertBuilder::new(keystore)
             .noise_static(local_static_pub)
-            .valid_for_secs(86_400) // 24 hours
+            .valid_for_secs(BIND_CERT_VALIDITY_SECS)
             .build(clock)
             .await
     }
 
-    // 8 arguments: all are required for the Noise pattern + role + crypto configuration.
+    // 7 arguments: all are required for the Noise pattern + role + crypto configuration.
     // The per-role/pattern constructors (initiator_xk, etc.) each call this once, so the
     // parameter count is not visible at the call sites. Private fn — suppress the lint.
+    //
+    // NOTE: ephemeral key generation is handled entirely by snow's default resolver (backed by
+    // the OS CSPRNG). There is no `rng` parameter because snow does not accept external entropy
+    // for ephemerals — see `snow::Builder` docs. Determinism in tests comes from the injected
+    // `Clock`; handshake message bytes are legitimately non-deterministic.
     #[allow(clippy::too_many_arguments)]
-    async fn new_inner<K: Keystore, R: CryptoRng + RngCore>(
+    async fn new_inner<K: Keystore>(
         keystore: &K,
         local_static: x25519_dalek::StaticSecret,
         peer_static_pub: Option<[u8; 32]>,
         session_context: &[u8],
-        _rng: R,
         clock: &dyn Clock,
         pattern: NoisePattern,
         role: HandshakeRole,
@@ -511,6 +520,7 @@ impl NoiseHandshake {
             local_ed25519_pub,
             peer_bind_cert: None,
             peer_identity: None,
+            failed: false,
         })
     }
 
@@ -521,8 +531,10 @@ impl NoiseHandshake {
     /// `local_static`: our X25519 static secret.
     /// `peer_static_pub`: the host's known X25519 static public key (32 bytes).
     /// `session_context`: QUIC exporter output or empty slice for tests.
-    /// `rng`: injected CSPRNG (currently unused; reserved for ephemeral generation in future).
     /// `clock`: injected clock for BindCert validity.
+    ///
+    /// Ephemeral key generation is handled by snow's default resolver (backed by the OS CSPRNG).
+    /// Handshake message bytes are legitimately non-deterministic.
     ///
     /// # Errors
     ///
@@ -531,12 +543,11 @@ impl NoiseHandshake {
     /// # Panics
     ///
     /// Never panics.
-    pub async fn initiator_xk<K: Keystore, R: CryptoRng + RngCore>(
+    pub async fn initiator_xk<K: Keystore>(
         keystore: &K,
         local_static: x25519_dalek::StaticSecret,
         peer_static_pub: [u8; 32],
         session_context: &[u8],
-        rng: R,
         clock: &dyn Clock,
     ) -> Result<Self, CryptoError> {
         Self::new_inner(
@@ -544,7 +555,6 @@ impl NoiseHandshake {
             local_static,
             Some(peer_static_pub),
             session_context,
-            rng,
             clock,
             NoisePattern::Xk,
             HandshakeRole::Initiator,
@@ -557,6 +567,8 @@ impl NoiseHandshake {
     /// `local_static`: our X25519 static secret.
     /// `session_context`: QUIC exporter output or empty slice for tests.
     ///
+    /// Ephemeral key generation is handled by snow's default resolver (backed by the OS CSPRNG).
+    ///
     /// # Errors
     ///
     /// Returns [`CryptoError::HandshakeFailed`] or [`CryptoError::Backend`] on failure.
@@ -564,11 +576,10 @@ impl NoiseHandshake {
     /// # Panics
     ///
     /// Never panics.
-    pub async fn responder_xk<K: Keystore, R: CryptoRng + RngCore>(
+    pub async fn responder_xk<K: Keystore>(
         keystore: &K,
         local_static: x25519_dalek::StaticSecret,
         session_context: &[u8],
-        rng: R,
         clock: &dyn Clock,
     ) -> Result<Self, CryptoError> {
         Self::new_inner(
@@ -576,7 +587,6 @@ impl NoiseHandshake {
             local_static,
             None,
             session_context,
-            rng,
             clock,
             NoisePattern::Xk,
             HandshakeRole::Responder,
@@ -588,6 +598,8 @@ impl NoiseHandshake {
     ///
     /// `peer_static_pub`: the host's pinned X25519 static public key.
     ///
+    /// Ephemeral key generation is handled by snow's default resolver (backed by the OS CSPRNG).
+    ///
     /// # Errors
     ///
     /// Returns [`CryptoError::HandshakeFailed`] or [`CryptoError::Backend`] on failure.
@@ -595,12 +607,11 @@ impl NoiseHandshake {
     /// # Panics
     ///
     /// Never panics.
-    pub async fn initiator_ik<K: Keystore, R: CryptoRng + RngCore>(
+    pub async fn initiator_ik<K: Keystore>(
         keystore: &K,
         local_static: x25519_dalek::StaticSecret,
         peer_static_pub: [u8; 32],
         session_context: &[u8],
-        rng: R,
         clock: &dyn Clock,
     ) -> Result<Self, CryptoError> {
         Self::new_inner(
@@ -608,7 +619,6 @@ impl NoiseHandshake {
             local_static,
             Some(peer_static_pub),
             session_context,
-            rng,
             clock,
             NoisePattern::Ik,
             HandshakeRole::Initiator,
@@ -618,6 +628,8 @@ impl NoiseHandshake {
 
     /// Creates an IK responder handshake (host, post-pairing reconnect).
     ///
+    /// Ephemeral key generation is handled by snow's default resolver (backed by the OS CSPRNG).
+    ///
     /// # Errors
     ///
     /// Returns [`CryptoError::HandshakeFailed`] or [`CryptoError::Backend`] on failure.
@@ -625,11 +637,10 @@ impl NoiseHandshake {
     /// # Panics
     ///
     /// Never panics.
-    pub async fn responder_ik<K: Keystore, R: CryptoRng + RngCore>(
+    pub async fn responder_ik<K: Keystore>(
         keystore: &K,
         local_static: x25519_dalek::StaticSecret,
         session_context: &[u8],
-        rng: R,
         clock: &dyn Clock,
     ) -> Result<Self, CryptoError> {
         Self::new_inner(
@@ -637,7 +648,6 @@ impl NoiseHandshake {
             local_static,
             None,
             session_context,
-            rng,
             clock,
             NoisePattern::Ik,
             HandshakeRole::Responder,
@@ -653,12 +663,20 @@ impl NoiseHandshake {
     ///
     /// # Errors
     ///
-    /// Returns [`CryptoError::HandshakeFailed`] if the underlying snow state machine errors.
+    /// - [`CryptoError::HandshakeFailed`] with reason `"handshake already aborted"` if any
+    ///   prior call to `read_message` or `write_message` returned an error (poisoned state).
+    /// - [`CryptoError::HandshakeFailed`] if the underlying snow state machine errors.
     ///
     /// # Panics
     ///
     /// Never panics.
     pub fn write_message(&mut self) -> Result<Vec<u8>, CryptoError> {
+        if self.failed {
+            return Err(CryptoError::HandshakeFailed {
+                reason: "handshake already aborted",
+            });
+        }
+
         let payload = if self.message_idx == self.send_at {
             // Payload = ed25519_pubkey[32] || bind_cert_wire
             let bind_cert_wire = self.local_bind_cert.encode();
@@ -676,6 +694,7 @@ impl NoiseHandshake {
         // 65535 is more than sufficient.
         let mut buf = vec![0u8; 65535];
         let n = self.state.write_message(&payload, &mut buf).map_err(|_| {
+            self.failed = true;
             CryptoError::HandshakeFailed {
                 reason: "snow write_message failed",
             }
@@ -695,21 +714,55 @@ impl NoiseHandshake {
     ///
     /// # Errors
     ///
-    /// Returns typed `CryptoError` variants on any validation failure.
+    /// - [`CryptoError::HandshakeFailed`] with reason `"handshake already aborted"` if any
+    ///   prior call to `read_message` or `write_message` returned an error (poisoned state).
+    /// - Other typed `CryptoError` variants on any validation failure. After any error, the
+    ///   handshake is permanently poisoned and all subsequent calls return the above.
     ///
     /// # Panics
     ///
     /// Never panics.
     pub fn read_message(&mut self, msg: &[u8], clock: &dyn Clock) -> Result<(), CryptoError> {
+        if self.failed {
+            return Err(CryptoError::HandshakeFailed {
+                reason: "handshake already aborted",
+            });
+        }
+
         let mut payload_buf = vec![0u8; 65535];
+        // If snow's read_message fails, the state is not advanced and we have not advanced
+        // message_idx — no desync. Poison anyway since the session is unrecoverable.
         let n = self
             .state
             .read_message(msg, &mut payload_buf)
-            .map_err(|_| CryptoError::HandshakeFailed {
-                reason: "snow read_message failed (MAC failure or state error)",
+            .map_err(|_| {
+                self.failed = true;
+                CryptoError::HandshakeFailed {
+                    reason: "snow read_message failed (MAC failure or state error)",
+                }
             })?;
         payload_buf.truncate(n);
 
+        // Snow advanced its internal state. Any error from here onwards would desync
+        // snow's state from message_idx — poison the handshake immediately on any failure.
+        let bind_cert_result = self.read_message_bind_cert(&payload_buf, clock);
+        if let Err(ref _e) = bind_cert_result {
+            self.failed = true;
+            return bind_cert_result;
+        }
+
+        self.message_idx = self.message_idx.saturating_add(1);
+        Ok(())
+    }
+
+    /// Inner helper: parse and verify the BindCert payload (if expected at this message index).
+    ///
+    /// Separated from `read_message` so the poisoning logic is easy to reason about.
+    fn read_message_bind_cert(
+        &mut self,
+        payload_buf: &[u8],
+        clock: &dyn Clock,
+    ) -> Result<(), CryptoError> {
         if self.message_idx == self.receive_at {
             // Parse: ed25519_pubkey[32] || bind_cert_wire
             let pubkey_slice = payload_buf
@@ -740,8 +793,6 @@ impl NoiseHandshake {
             self.peer_identity = Some(peer_identity);
             self.peer_bind_cert = Some(bind_cert);
         }
-
-        self.message_idx = self.message_idx.saturating_add(1);
         Ok(())
     }
 
@@ -764,6 +815,11 @@ impl NoiseHandshake {
         self,
         keystore: &K,
     ) -> Result<HandshakeOutcome, CryptoError> {
+        if self.failed {
+            return Err(CryptoError::HandshakeFailed {
+                reason: "handshake already aborted",
+            });
+        }
         if !self.state.is_handshake_finished() {
             return Err(CryptoError::HandshakeFailed {
                 reason: "handshake not yet complete",
@@ -801,8 +857,9 @@ impl NoiseHandshake {
                 .map_err(|_| CryptoError::HandshakeFailed {
                     reason: "snow into_transport_mode failed",
                 })?;
-        // Pass a copy to NoiseSession::new (which wraps it in its own Zeroizing).
-        let session = NoiseSession::new(transport, *handshake_hash)?;
+        // Derive the session PRK from the handshake hash; the hash itself is stored only in
+        // HandshakeOutcome — NoiseSession does not duplicate it.
+        let session = NoiseSession::new(transport, &handshake_hash)?;
 
         Ok(HandshakeOutcome {
             transport: session,
@@ -855,6 +912,7 @@ impl NoiseHandshake {
 )]
 mod tests {
     use super::*;
+    use crate::bind_cert::BIND_CERT_VALIDITY_SECS;
     use crate::clock::FixedClock;
     use crate::{Keystore, SoftwareKeystore};
     use rand_core::OsRng;
@@ -880,17 +938,11 @@ mod tests {
         init_ks.trust_peer(&resp_id).await.unwrap();
         resp_ks.trust_peer(&init_id).await.unwrap();
 
-        let mut init = NoiseHandshake::initiator_xk(
-            init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            clock,
-        )
-        .await
-        .unwrap();
-        let mut resp = NoiseHandshake::responder_xk(resp_ks, resp_static, &[], OsRng, clock)
+        let mut init =
+            NoiseHandshake::initiator_xk(init_ks, init_static, resp_pub.to_bytes(), &[], clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(resp_ks, resp_static, &[], clock)
             .await
             .unwrap();
 
@@ -930,17 +982,11 @@ mod tests {
         init_ks.trust_peer(&resp_id).await.unwrap();
         resp_ks.trust_peer(&init_id).await.unwrap();
 
-        let mut init = NoiseHandshake::initiator_ik(
-            init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            clock,
-        )
-        .await
-        .unwrap();
-        let mut resp = NoiseHandshake::responder_ik(resp_ks, resp_static, &[], OsRng, clock)
+        let mut init =
+            NoiseHandshake::initiator_ik(init_ks, init_static, resp_pub.to_bytes(), &[], clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_ik(resp_ks, resp_static, &[], clock)
             .await
             .unwrap();
 
@@ -1002,9 +1048,9 @@ mod tests {
         let init_ks = SoftwareKeystore::generate();
         let resp_ks = SoftwareKeystore::generate();
         let (io, ro) = do_xk_handshake(&init_ks, &resp_ks, &clock).await;
+        // Both sides must agree on the handshake hash (the single authoritative copy lives in
+        // HandshakeOutcome; NoiseSession does not duplicate it).
         assert_eq!(io.handshake_hash, ro.handshake_hash);
-        assert_eq!(io.transport.handshake_hash(), &*io.handshake_hash);
-        assert_eq!(ro.transport.handshake_hash(), &*ro.handshake_hash);
     }
 
     // ─── Encrypt/decrypt after handshake ─────────────────────────────────
@@ -1114,17 +1160,11 @@ mod tests {
 
         // Initiator expects resp_pub as the known responder static (XK "K" = known).
         // MITM acts as the responder but with mitm_static.
-        let mut init = NoiseHandshake::initiator_xk(
-            &init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            &clock,
-        )
-        .await
-        .unwrap();
-        let mut mitm_resp = NoiseHandshake::responder_xk(&resp_ks, mitm_static, &[], OsRng, &clock)
+        let mut init =
+            NoiseHandshake::initiator_xk(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut mitm_resp = NoiseHandshake::responder_xk(&resp_ks, mitm_static, &[], &clock)
             .await
             .unwrap();
 
@@ -1155,17 +1195,11 @@ mod tests {
         resp_ks.trust_peer(&init_id).await.unwrap();
 
         // Initiator uses IK with known resp_pub; MITM uses mitm_static.
-        let mut init = NoiseHandshake::initiator_ik(
-            &init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            &clock,
-        )
-        .await
-        .unwrap();
-        let mut mitm_resp = NoiseHandshake::responder_ik(&resp_ks, mitm_static, &[], OsRng, &clock)
+        let mut init =
+            NoiseHandshake::initiator_ik(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut mitm_resp = NoiseHandshake::responder_ik(&resp_ks, mitm_static, &[], &clock)
             .await
             .unwrap();
 
@@ -1197,19 +1231,13 @@ mod tests {
 
         // Initiator uses XK (pattern_id 0x01); responder uses IK (pattern_id 0x02).
         // Prologue mismatch → MAC failure on the first read.
-        let mut init = NoiseHandshake::initiator_xk(
-            &init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            &clock,
-        )
-        .await
-        .unwrap();
+        let mut init =
+            NoiseHandshake::initiator_xk(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
 
         let resp_static2 = StaticSecret::random_from_rng(OsRng);
-        let mut resp = NoiseHandshake::responder_ik(&resp_ks, resp_static2, &[], OsRng, &clock)
+        let mut resp = NoiseHandshake::responder_ik(&resp_ks, resp_static2, &[], &clock)
             .await
             .unwrap();
 
@@ -1236,17 +1264,11 @@ mod tests {
         init_ks.trust_peer(&resp_id).await.unwrap();
         // (do NOT call resp_ks.trust_peer(&init_id))
 
-        let mut init = NoiseHandshake::initiator_xk(
-            &init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            &clock,
-        )
-        .await
-        .unwrap();
-        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], OsRng, &clock)
+        let mut init =
+            NoiseHandshake::initiator_xk(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], &clock)
             .await
             .unwrap();
 
@@ -1266,9 +1288,9 @@ mod tests {
 
     #[tokio::test]
     async fn expired_bindcert_rejected() {
-        // BindCerts are built at `now`; verify happens at `now + 86_401` (after 24h validity).
+        // BindCerts are built at `now`; verify happens at `now + BIND_CERT_VALIDITY_SECS + 1`.
         let build_clock = FixedClock(NOW);
-        let verify_clock = FixedClock(NOW + 86_401);
+        let verify_clock = FixedClock(NOW + BIND_CERT_VALIDITY_SECS + 1);
 
         let init_ks = SoftwareKeystore::generate();
         let resp_ks = SoftwareKeystore::generate();
@@ -1282,21 +1304,19 @@ mod tests {
         init_ks.trust_peer(&resp_id).await.unwrap();
         resp_ks.trust_peer(&init_id).await.unwrap();
 
-        // Both sides build with build_clock (so their certs expire at NOW + 86_400).
+        // Both sides build with build_clock (so their certs expire at NOW + BIND_CERT_VALIDITY_SECS).
         let mut init = NoiseHandshake::initiator_xk(
             &init_ks,
             init_static,
             resp_pub.to_bytes(),
             &[],
-            OsRng,
             &build_clock,
         )
         .await
         .unwrap();
-        let mut resp =
-            NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], OsRng, &build_clock)
-                .await
-                .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], &build_clock)
+            .await
+            .unwrap();
 
         let msg0 = init.write_message().unwrap();
         resp.read_message(&msg0, &build_clock).unwrap();
@@ -1318,17 +1338,11 @@ mod tests {
         let resp_pub = x25519_dalek::PublicKey::from(&resp_static);
         let init_static = StaticSecret::random_from_rng(OsRng);
 
-        let mut init = NoiseHandshake::initiator_xk(
-            &init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            &clock,
-        )
-        .await
-        .unwrap();
-        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], OsRng, &clock)
+        let mut init =
+            NoiseHandshake::initiator_xk(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], &clock)
             .await
             .unwrap();
 
@@ -1353,17 +1367,11 @@ mod tests {
         let resp_pub = x25519_dalek::PublicKey::from(&resp_static);
         let init_static = StaticSecret::random_from_rng(OsRng);
 
-        let mut init = NoiseHandshake::initiator_xk(
-            &init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            &clock,
-        )
-        .await
-        .unwrap();
-        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], OsRng, &clock)
+        let mut init =
+            NoiseHandshake::initiator_xk(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], &clock)
             .await
             .unwrap();
 
@@ -1444,15 +1452,13 @@ mod tests {
             init_static,
             resp_pub.to_bytes(),
             &[],
-            OsRng,
             &build_clock,
         )
         .await
         .unwrap();
-        let mut resp =
-            NoiseHandshake::responder_ik(&resp_ks, resp_static, &[], OsRng, &build_clock)
-                .await
-                .unwrap();
+        let mut resp = NoiseHandshake::responder_ik(&resp_ks, resp_static, &[], &build_clock)
+            .await
+            .unwrap();
 
         // IK msg 0 carries the initiator's BindCert; responder reads it with verify_clock.
         let msg0 = init.write_message().unwrap();
@@ -1479,17 +1485,11 @@ mod tests {
         init_ks.trust_peer(&resp_id).await.unwrap();
         // resp_ks does NOT trust init_ks.
 
-        let mut init = NoiseHandshake::initiator_ik(
-            &init_ks,
-            init_static,
-            resp_pub.to_bytes(),
-            &[],
-            OsRng,
-            &clock,
-        )
-        .await
-        .unwrap();
-        let mut resp = NoiseHandshake::responder_ik(&resp_ks, resp_static, &[], OsRng, &clock)
+        let mut init =
+            NoiseHandshake::initiator_ik(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_ik(&resp_ks, resp_static, &[], &clock)
             .await
             .unwrap();
 
@@ -1526,5 +1526,60 @@ mod tests {
         // Both sides got a valid outcome → static binding was verified as step 4 of 6.
         assert_eq!(io.pattern, NoisePattern::Ik);
         assert_eq!(ro.pattern, NoisePattern::Ik);
+    }
+
+    // ─── Poisoned-state tests ─────────────────────────────────────────────
+    //
+    // Once read_message or write_message returns an error, snow's internal state may have
+    // advanced (message already consumed) while message_idx has not. To prevent operating on
+    // a desynced state machine, the handshake is permanently poisoned. Every subsequent call
+    // must return the clear `HandshakeFailed { reason: "handshake already aborted" }` error.
+
+    /// After a MAC failure on `read_message`, all subsequent `read_message` calls must return
+    /// `HandshakeFailed { reason: "handshake already aborted" }`, not an opaque snow error.
+    #[tokio::test]
+    async fn poisoned_handshake_subsequent_call_returns_clear_error() {
+        let clock = FixedClock(NOW);
+        let init_ks = SoftwareKeystore::generate();
+        let resp_ks = SoftwareKeystore::generate();
+
+        let resp_static = StaticSecret::random_from_rng(OsRng);
+        let resp_pub = x25519_dalek::PublicKey::from(&resp_static);
+        let init_static = StaticSecret::random_from_rng(OsRng);
+
+        let mut init =
+            NoiseHandshake::initiator_xk(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], &clock)
+            .await
+            .unwrap();
+
+        // First, produce a valid msg0 so we have a reference.
+        let msg0 = init.write_message().unwrap();
+        // Feed a truncated / corrupted message — this causes a MAC failure inside snow.
+        let first_err = resp.read_message(&msg0[..4], &clock);
+        assert!(first_err.is_err(), "truncated message must be rejected");
+
+        // Now the handshake is poisoned. A second call — even with the valid message —
+        // must return the clear aborted error, not an opaque snow state-machine error.
+        let second_err = resp.read_message(&msg0, &clock);
+        assert!(
+            matches!(
+                second_err,
+                Err(CryptoError::HandshakeFailed { reason }) if reason == "handshake already aborted"
+            ),
+            "post-failure call must return 'handshake already aborted'; got: {second_err:?}"
+        );
+
+        // complete() must also return the clear aborted error (not panic).
+        let complete_err = resp.complete(&resp_ks).await;
+        assert!(
+            matches!(
+                complete_err,
+                Err(CryptoError::HandshakeFailed { reason }) if reason == "handshake already aborted"
+            ),
+            "complete() after poisoning must return 'handshake already aborted'; got: {complete_err:?}"
+        );
     }
 }
