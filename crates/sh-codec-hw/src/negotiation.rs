@@ -79,7 +79,10 @@
 //! assert!(first.is_some());
 //! ```
 
-use sh_protocol::Codec;
+use sh_protocol::{
+    capability::{CODEC_DISC_AV1, CODEC_DISC_H264, CODEC_DISC_H265},
+    Codec,
+};
 
 /// Re-exported for caller convenience: codec ladder construction depends on [`ContentMode`].
 ///
@@ -91,24 +94,38 @@ pub use sh_adaptive::classifier::ContentMode;
 
 /// Build flavor controlling which codecs are eligible for the ladder.
 ///
-/// `Oss` is the default Apache-2.0 build; `Commercial` adds HEVC.  In production the flavor is
-/// derived from whether the `hevc` Cargo feature is enabled (see
-/// [`BuildFlavor::from_compile_time`]).
+/// ## Compile-time gating (ADR-0004)
+///
+/// `BuildFlavor::Commercial` is **only available when the `hevc` Cargo feature is enabled**.
+/// When the feature is OFF (the default OSS / Apache-2.0 build) the variant does not exist in
+/// the type system, and [`BuildFlavor::from_compile_time`] always returns `BuildFlavor::Oss`.
+/// This makes it structurally impossible for an OSS build to name `Commercial` in a `match` arm
+/// or pass it to [`CodecNegotiator::ladder`] — the licensing boundary is enforced by the
+/// compiler, not by caller discipline.
+///
+/// When the `hevc` feature is ON (commercial build) `Commercial` is exposed and the negotiation
+/// ladder adds an HEVC rung at the top.  Enabling this feature requires a valid HEVC license
+/// from the patent-pool holder(s); see `docs/adr/0004-oss-codec-and-licensing.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildFlavor {
     /// OSS / Apache-2.0 build: AV1 + H.264 only.  HEVC is never offered or selected.
     Oss,
+
     /// Commercial build: adds HEVC to the top of the ladder.
     ///
+    /// **Only available when the `hevc` Cargo feature is enabled** (commercial builds).
     /// Requires a valid HEVC license from the patent-pool holder(s) (ADR-0004).
+    ///
+    /// An OSS build compiled without `--features hevc` cannot name this variant.
+    #[cfg(feature = "hevc")]
     Commercial,
 }
 
 impl BuildFlavor {
     /// Return the build flavor derived from compile-time feature flags.
     ///
-    /// Returns [`BuildFlavor::Commercial`] when the `hevc` Cargo feature is enabled,
-    /// [`BuildFlavor::Oss`] otherwise.
+    /// Returns `BuildFlavor::Commercial` (available only with `--features hevc`) when the `hevc`
+    /// Cargo feature is enabled, [`BuildFlavor::Oss`] otherwise.
     ///
     /// # Examples
     ///
@@ -135,11 +152,6 @@ impl BuildFlavor {
         }
     }
 }
-
-// Codec discriminant bit-positions (matching `sh_protocol::capability` and the video wire format).
-const DISC_H264: u8 = 0; // Codec::H264
-const DISC_H265: u8 = 1; // Codec::H265 (HEVC)
-const DISC_AV1: u8 = 2; // Codec::Av1
 
 /// Per-endpoint codec capabilities, derived by probing the OS encoder/decoder APIs at startup.
 ///
@@ -264,7 +276,7 @@ impl CodecCapabilities {
             return true;
         }
         // Browsers always support H.264 decode.
-        if self.is_browser && disc == DISC_H264 {
+        if self.is_browser && disc == CODEC_DISC_H264 {
             return true;
         }
         false
@@ -313,9 +325,9 @@ impl CodecChoice {
 #[must_use]
 pub fn choice_to_discriminant(choice: &CodecChoice) -> u8 {
     match choice.codec {
-        Codec::H264 => DISC_H264,
-        Codec::H265 => DISC_H265,
-        Codec::Av1 => DISC_AV1,
+        Codec::H264 => CODEC_DISC_H264,
+        Codec::H265 => CODEC_DISC_H265,
+        Codec::Av1 => CODEC_DISC_AV1,
         Codec::Raw => 3, // Raw never appears in a real ladder; included for exhaustiveness.
     }
 }
@@ -473,24 +485,45 @@ impl CodecNegotiator {
     ///
     /// Returns a `Vec` (rather than a `&'static [...]`) because [`CodecChoice`] has no
     /// `const`-constructible path in stable Rust — the enum field ([`Codec`]) is not `Copy`-const.
+    ///
+    /// ## HEVC compile-time gate (ADR-0004)
+    ///
+    /// The `BuildFlavor::Commercial` variant and the `Codec::H265` rung both require the `hevc`
+    /// Cargo feature.  Because `Commercial` is `#[cfg(feature = "hevc")]`-gated on the enum, an
+    /// OSS build cannot even construct a `Commercial` value and therefore can never reach the HEVC
+    /// rung in this function (fix 1b — structural invariant).  As a belt-and-suspenders backstop
+    /// (fix 1a), the `Commercial` arm itself also guards the `Codec::H265` push with
+    /// `#[cfg(feature = "hevc")]`, so that if the enum guard is ever relaxed by a future refactor,
+    /// the rung is still absent from the ladder in OSS builds.
     fn candidate_rungs(mode: ContentMode, flavor: BuildFlavor) -> Vec<CodecChoice> {
         match (flavor, mode) {
-            // ── Commercial builds ─────────────────────────────────────────
-            (BuildFlavor::Commercial, ContentMode::Game | ContentMode::Scrolling) => {
-                // HEVC HW → AV1 HW → H264 HW (no SW rung in commercial)
-                vec![
-                    CodecChoice::hw(Codec::H265),
-                    CodecChoice::hw(Codec::Av1),
-                    CodecChoice::hw(Codec::H264),
-                ]
-            }
-            (BuildFlavor::Commercial, ContentMode::Work) => {
-                // Same order, no SW rung (Work mode never SW-encodes in any flavor).
-                vec![
-                    CodecChoice::hw(Codec::H265),
-                    CodecChoice::hw(Codec::Av1),
-                    CodecChoice::hw(Codec::H264),
-                ]
+            // ── Commercial builds (requires `hevc` feature) ───────────────
+            //
+            // Both `ContentMode::Game|Scrolling` and `ContentMode::Work` produce the same rung
+            // set for the commercial ladder (HEVC HW → AV1 HW → H264 HW; no SW rung in any
+            // mode), so a single `(Commercial, _)` arm covers all three modes.
+            #[cfg(feature = "hevc")]
+            (BuildFlavor::Commercial, _) => {
+                // Belt-and-suspenders (fix 1a): even inside the Commercial arm, the H265 rung is
+                // only pushed under `#[cfg(feature = "hevc")]`.  This ensures that if the
+                // `Commercial` enum guard is ever relaxed, H265 still cannot enter the ladder in
+                // an OSS build.
+                //
+                // In practice, when `hevc` is OFF:
+                // - `BuildFlavor::Commercial` does not exist (fix 1b), so this arm is
+                //   unreachable.  The cfg-guard here is the airtight backstop.
+                #[cfg(feature = "hevc")]
+                let h265_rung = Some(CodecChoice::hw(Codec::H265));
+                #[cfg(not(feature = "hevc"))]
+                let h265_rung: Option<CodecChoice> = None;
+
+                let mut rungs = Vec::with_capacity(3);
+                if let Some(r) = h265_rung {
+                    rungs.push(r);
+                }
+                rungs.push(CodecChoice::hw(Codec::Av1));
+                rungs.push(CodecChoice::hw(Codec::H264));
+                rungs
             }
             // ── OSS builds ────────────────────────────────────────────────
             (BuildFlavor::Oss, ContentMode::Game | ContentMode::Scrolling) => {
@@ -520,14 +553,14 @@ impl CodecNegotiator {
         let local_can_encode = if candidate.hardware {
             // Hardware rung: local must have HW encode capability.
             // Apple exception: AV1 is never available for HW encode on Apple.
-            if local.is_apple && disc == DISC_AV1 {
+            if local.is_apple && disc == CODEC_DISC_AV1 {
                 false
             } else {
                 local.can_hw_encode(disc)
             }
         } else {
             // Software rung (only H264 SW exists).
-            disc == DISC_H264 && local.sw_h264_encode_available
+            disc == CODEC_DISC_H264 && local.sw_h264_encode_available
         };
 
         if !local_can_encode {
@@ -811,6 +844,12 @@ mod tests {
     }
 
     // ── Feature flag: OSS build never produces HEVC ───────────────────────────
+    //
+    // These tests verify ADR-0004's licensing invariant: an OSS build (hevc feature OFF) MUST
+    // never produce a ladder containing Codec::H265, and the capability offer MUST NOT carry the
+    // H265 mask bit.  The structural guarantee is that BuildFlavor::Commercial does not exist in
+    // an OSS build, so these tests only exercise BuildFlavor::Oss — which is the only value
+    // available.  The cfg-gating in candidate_rungs (fix 1a) is the belt-and-suspenders backstop.
 
     #[test]
     fn oss_ladder_never_contains_hevc() {
@@ -826,11 +865,81 @@ mod tests {
         }
     }
 
+    /// Prove that an OSS build cannot emit H265 via the ladder, for all three content modes,
+    /// even when both peers advertise full capabilities (including H265 HW in their masks).
+    ///
+    /// This test is compiled and run in the default (no `hevc` feature) build.  Because
+    /// `BuildFlavor::Commercial` does not exist in that build, every possible `BuildFlavor` value
+    /// (`Oss`) is covered here.  The `#[cfg(not(feature = "hevc"))]` attribute makes this an
+    /// **OSS-only** test — the commercial test is below, guarded by `#[cfg(feature = "hevc")]`.
+    #[test]
+    #[cfg(not(feature = "hevc"))]
+    fn oss_build_commercial_path_never_emits_h265() {
+        use sh_protocol::capability::{encode_caps, CODEC_DISC_H265};
+
+        // Both peers advertise H265 HW encode/decode in their masks.  Even so, an OSS build
+        // (hevc feature OFF) must never produce a ladder with H265 or a capability offer with
+        // the H265 mask bit.
+        let full_with_h265 = CodecCapabilities {
+            hw_encode_mask: 0b0000_0111, // H264 + H265 + AV1 all set
+            hw_decode_mask: 0b0000_0111,
+            sw_h264_encode_available: true,
+            is_apple: false,
+            is_browser: false,
+        };
+
+        for mode in [ContentMode::Game, ContentMode::Work, ContentMode::Scrolling] {
+            // In an OSS build, BuildFlavor::Oss is the only available flavor.
+            let ladder =
+                CodecNegotiator::ladder(&full_with_h265, &full_with_h265, mode, BuildFlavor::Oss);
+            assert!(
+                !ladder.iter().any(|r| r.codec == Codec::H265),
+                "OSS build: ladder must never contain H265 even when both peers advertise it \
+                 (mode={mode:?})"
+            );
+        }
+
+        // Also verify that the wire offer produced from full_caps (which has H265 in the mask
+        // because it's a capability advertisement, not a negotiation) does NOT set the H265 bit
+        // when coming from an OSS negotiate result (selected_codec is always Oss-compliant).
+        // The wire offer uses the raw hw_encode_mask; an OSS host's hardware prober would never
+        // set the H265 bit, but as a belt check, verify encode_caps accepts mask=0b0000_0111
+        // (any peer mask) and that a round-trip does not synthesize H265 in selected_codec.
+        let wire = full_with_h265.to_wire_offer();
+        // An offer (not an answer) carries selected_codec = None.
+        assert_eq!(
+            wire.selected_codec, None,
+            "OSS capability offer must never carry a selected H265 codec"
+        );
+        // The ladder result never sets selected_codec = Some(CODEC_DISC_H265).
+        let h265_disc = CODEC_DISC_H265;
+        let ladder = CodecNegotiator::ladder(
+            &full_with_h265,
+            &full_with_h265,
+            ContentMode::Game,
+            BuildFlavor::Oss,
+        );
+        for rung in &ladder {
+            let disc = choice_to_discriminant(rung);
+            assert_ne!(
+                disc, h265_disc,
+                "OSS build: no ladder rung may have H265 discriminant"
+            );
+        }
+        // encode_caps validates the offer does not carry the H265 selected_codec.
+        let encoded = encode_caps(&wire).expect("encode_caps must succeed for a valid offer");
+        // SELECTED_CODEC byte (index 3) must be 0xFF (no selection) for an offer.
+        assert_eq!(
+            encoded[3], 0xFF,
+            "OSS offer SELECTED_CODEC must be sentinel"
+        );
+    }
+
     // ── Commercial ladder leads with HEVC (runtime test, `--features hevc`) ───
 
     #[test]
     #[cfg(feature = "hevc")]
-    fn commercial_ladder_leads_with_hevc() {
+    fn commercial_game_ladder_leads_with_hevc() {
         let local = full_caps();
         let remote = full_caps();
         let ladder =
