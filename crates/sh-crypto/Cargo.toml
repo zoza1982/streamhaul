@@ -7,5 +7,41 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[dependencies]
+# Ed25519 signing/verification (RFC 8032). `zeroize` feature zeroes `SigningKey`
+# on drop via `ZeroizeOnDrop`. `rand_core` feature enables `SigningKey::generate(rng)`.
+# `fast` selects the pre-computed-table fast path. `std` is required for error types.
+ed25519-dalek.workspace = true
+
+# SHA-256 for DeviceIdentity fingerprint computation.
+sha2.workspace = true
+
+# `RngCore` / `CryptoRng` bounds for `generate_with_rng` constructor
+# (OsRng is in the same crate behind the `getrandom` feature).
+rand_core.workspace = true
+
+# Erasure of `async fn` in the `Keystore` trait for object safety.
+async-trait.workspace = true
+
+# Structured logging. Keys and signatures MUST NOT appear in log output.
+tracing.workspace = true
+
+# Typed error construction.
+thiserror.workspace = true
+
+[dev-dependencies]
+# Property-based testing: arbitrary messages must sign+verify; arbitrary bytes
+# into Signature::decode must never panic.
+proptest.workspace = true
+
+# Async test executor for Keystore tests.
+tokio = { version = "1", features = ["rt", "macros"] }
+
+# Seedable CSPRNG for deterministic, reproducible tests (rand_core 0.6 compat).
+rand_chacha = "0.3"
+
+# `block_on` helper for async doc-tests.
+tokio-test = "0.4"
+
 [lints]
 workspace = true
