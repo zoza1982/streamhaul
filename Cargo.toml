@@ -2,7 +2,7 @@
 resolver = "2"
 # cargo-fuzz crates are their own workspaces and need a nightly toolchain; keep them out of the
 # main workspace so `cargo build/clippy/test --workspace` and CI never touch them.
-exclude = ["crates/sh-protocol/fuzz", "crates/sh-core/fuzz", "crates/sh-transport/fuzz", "crates/sh-codec-hw/fuzz"]
+exclude = ["crates/sh-protocol/fuzz", "crates/sh-core/fuzz", "crates/sh-transport/fuzz", "crates/sh-codec-hw/fuzz", "crates/sh-crypto/fuzz"]
 members = [
     "crates/sh-types",
     "crates/sh-protocol",
@@ -37,6 +37,31 @@ bitflags = "2"
 bytes = "1"
 tokio = { version = "1", features = ["net", "rt", "sync"] }
 tracing = "0.1"
+
+# Cryptographic dependencies (P3+). Pinned to specific minor versions because
+# any upgrade to crypto primitives requires a security review.
+#
+# ed25519-dalek 2.x: RFC-8032-compliant Ed25519 sign/verify.
+# - `zeroize`: enables `ZeroizeOnDrop` for `SigningKey` (zeroes memory on drop).
+# - `rand_core`: exposes `SigningKey::generate(rng)` for key generation.
+# - `fast`: pre-computed tables for faster signing (no extra deps).
+# - `std`: enables the standard library (required for error types).
+# 2.2.0 is the latest stable 2.x release; we do NOT use the 3.0 RC because
+# it is pre-release and has not been audited.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["zeroize", "rand_core", "std", "fast"] }
+
+# zeroize 1.x: explicit zeroing of secret key material on drop.
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+# sha2 0.10.x: SHA-256 for DeviceIdentity fingerprint derivation.
+sha2 = { version = "0.10.9", default-features = false, features = ["std"] }
+
+# rand_core 0.6.x: the version required by ed25519-dalek 2.x for the
+# `CryptoRng` / `RngCore` bounds used by `SigningKey::generate`.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# async-trait 0.1: erasure of `async fn` in object-safe trait definitions.
+async-trait = "0.1"
 
 # Workspace-wide lints enforce the CLAUDE.md panic-ban and safety posture.
 # Members opt in with `[lints] workspace = true`. CI runs clippy with `-D warnings`,
