@@ -12,11 +12,11 @@
 //!
 //! Recovery strategy is tiered by RTT:
 //!
-//! | RTT range | Primary strategy |
-//! |-----------|-----------------|
-//! | < 150 ms  | NACK-first; IDR at gap ≥ 3 |
-//! | 150–300 ms | Skip NACK; FEC+refresh; IDR at gap ≥ 2 |
-//! | > 300 ms  | FEC+refresh only; IDR on any freeze (gap ≥ 1) |
+//! | RTT range    | Primary strategy |
+//! |--------------|-----------------|
+//! | < 150 ms     | NACK-first (capped at 16 seqs); IDR at gap ≥ 3 or loss ≥ 5% |
+//! | 150–300 ms   | Skip NACK; FEC+refresh; IDR at gap ≥ 2 or loss ≥ 5% |
+//! | > 300 ms     | FEC+refresh only; IDR on any freeze (gap ≥ 1) |
 //!
 //! ## IDR suppression
 //!
@@ -35,24 +35,16 @@ use std::time::{Duration, Instant};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// RTT below which NACK is the primary action (< 100 ms sub-band boundary).
+/// Lower boundary of the mid-band RTT range (150 ms).
 ///
-/// Documented as a named constant for the spec-required bandwidth table; the implementation
-/// uses [`RTT_SKIP_NACK`] (150 ms) as the gate since both <50 ms and 50–150 ms sub-bands
-/// permit NACK, and only above 150 ms do we skip the NACK tier.
-#[allow(dead_code)]
-const RTT_NACK_MAX: Duration = Duration::from_millis(100);
-
-/// RTT at or above which we skip NACK and fall through to FEC/IDR.
+/// Below this threshold, NACK is the primary loss-recovery action.
+/// At or above this threshold, NACK is skipped and FEC/IDR take over.
 ///
-/// In the 150–300 ms band NACK round-trips are too long to be useful; FEC and
-/// intra-refresh are preferred.
-const RTT_SKIP_NACK: Duration = Duration::from_millis(150);
-
-/// RTT at or above which IDR is triggered at frame gap ≥ 2 instead of ≥ 3.
+/// Also marks the lower boundary of the 150–300 ms band in the gap-threshold
+/// calculation (IDR triggered at gap ≥ 2 rather than ≥ 3 in this band).
 ///
-/// Used as the lower boundary of the 150–300 ms band in the gap-threshold calculation.
-const RTT_IDR_AT_GAP2: Duration = Duration::from_millis(150);
+/// // RTT_SKIP_NACK and RTT_IDR_AT_GAP2 are identical; unified as RTT_MID_BAND_LOW
+const RTT_MID_BAND_LOW: Duration = Duration::from_millis(150);
 
 /// RTT above which we enter the >300 ms band (FEC+refresh only; IDR on any freeze).
 const RTT_HIGH: Duration = Duration::from_millis(300);
@@ -101,6 +93,16 @@ pub enum RecoveryAction {
 }
 
 /// Per-feedback loss state consumed by [`LossRecoveryController`].
+///
+/// ## Trust invariant
+///
+/// `LossState` MUST be constructed from **locally observed** receiver statistics
+/// (e.g., via [`GapDetector`]). The `fraction_lost` and `cumulative_lost` fields
+/// of `NackFeedback` are **remote peer claims** — acting on them directly enables
+/// IDR/bandwidth amplification attacks. Never build `LossState` from peer-asserted counters.
+///
+/// `missing_seqs` MUST be derived from the 16-entry [`GapDetector`] window; the NACK
+/// emission is capped at 16 entries to match the 16-bit bitmap design.
 #[derive(Debug, Clone)]
 pub struct LossState {
     /// Round-trip time.
@@ -173,6 +175,11 @@ impl LossRecoveryController {
     /// window `max(500 ms, 2 × RTT)` return [`RecoveryAction::None`]. Non-monotonic `now`
     /// (i.e. `now` earlier than the stored `last_idr_request`) is handled safely: the
     /// suppression window is treated as not yet expired, so `None` is returned.
+    ///
+    /// ## Security
+    ///
+    /// `state` MUST be built from locally observed receiver statistics, not from
+    /// peer-reported `NackFeedback` counters. See [`LossState`] for the trust invariant.
     pub fn on_feedback(&mut self, state: &LossState, now: Instant) -> RecoveryAction {
         // Clamp RTT: minimum 100 µs (sub-100 µs is a measurement artefact).
         let rtt = state.rtt.max(Duration::from_micros(100));
@@ -246,23 +253,26 @@ fn determine_action(
     fec_ratio: f64,
     missing_seqs: &[u16],
 ) -> RecoveryAction {
-    // Tier 1: NACK if RTT < 150 ms AND consecutive_loss <= 2 AND we have missing seqs.
+    // Tier 1: NACK if RTT < 150 ms AND consecutive_loss <= 2 AND loss_5s < 5% AND we have missing seqs.
     // The NACK band covers both the <50 ms and 50–150 ms sub-bands since both allow NACKs.
-    if rtt < RTT_SKIP_NACK
+    // High loss (>= FEC_LOSS_THRESHOLD) blocks NACK to avoid bandwidth amplification.
+    if rtt < RTT_MID_BAND_LOW
         && consecutive_loss <= NACK_MAX_CONSECUTIVE_LOSS
+        && loss_5s < FEC_LOSS_THRESHOLD
         && !missing_seqs.is_empty()
     {
         let requests = missing_seqs
             .iter()
+            .take(16)
             .map(|&seq| NackRequest { seq })
             .collect();
         return RecoveryAction::Nack(requests);
     }
 
     // Determine the gap threshold based on the RTT band:
-    // - RTT in [150 ms, 300 ms): use the mid threshold (gap >= 2)
+    // - RTT in [150 ms, 300 ms]: use the mid threshold (gap >= 2)
     // - All other bands: use the default threshold (gap >= 3)
-    let idr_gap_threshold = if rtt >= RTT_IDR_AT_GAP2 && rtt < RTT_HIGH {
+    let idr_gap_threshold = if rtt >= RTT_MID_BAND_LOW && rtt <= RTT_HIGH {
         IDR_FRAME_GAP_THRESHOLD_MID
     } else {
         IDR_FRAME_GAP_THRESHOLD
@@ -272,8 +282,7 @@ fn determine_action(
     let needs_idr = frame_gap >= idr_gap_threshold
         || loss_5s >= FEC_LOSS_THRESHOLD
         || (time_since_keyframe > MAX_KEYFRAME_AGE && loss_5s > STALE_KEYFRAME_LOSS_THRESHOLD)
-        || (rtt > RTT_HIGH && frame_gap >= 1)
-        || (rtt >= Duration::from_millis(200) && loss_5s > 0.0);
+        || (rtt > RTT_HIGH && frame_gap >= 1);
 
     if needs_idr {
         return RecoveryAction::ForcedIdr;
@@ -312,6 +321,7 @@ fn determine_action(
 /// Risk Register as R-FEC. This task provides the framing hooks (`NackFeedback.nack_bitmap` in
 /// `sh-protocol`) and the ratio policy here so callers can wire up the FEC channel budget and
 /// signal the target ratio to the encoder; the symbol codec slots in without API changes.
+#[derive(Debug, Clone)]
 pub struct FecPolicy {
     min_ratio: f64,
     max_ratio: f64,
@@ -395,6 +405,7 @@ pub struct GapReport {
 /// Sequence numbers are 16-bit and wrap at 2^16. The detector handles wrap using
 /// wrapping arithmetic: a seq is "newer" than the current highest if its wrapping distance
 /// forward is < 32768.
+#[derive(Debug, Clone)]
 pub struct GapDetector {
     /// The highest sequence number seen so far (`None` if no packets received).
     highest_seq: Option<u16>,
@@ -463,12 +474,14 @@ impl GapDetector {
                     self.last_received_seq = Some(seq);
                 } else {
                     // seq is older than highest — mark it as received in the window.
+                    // Do NOT update last_received_seq here; it must only advance to higher
+                    // seq values. Updating it for a late/reordered packet would produce a
+                    // spurious non-zero frame_gap on the next build_report call.
                     let back = highest.wrapping_sub(seq);
                     if back > 0 && back <= 16 {
                         let bit_pos = u32::from(back).saturating_sub(1);
                         self.received_mask |= 1u16.wrapping_shl(bit_pos);
                     }
-                    self.last_received_seq = Some(seq);
                 }
             }
         }
@@ -561,8 +574,9 @@ pub struct RefreshStripe {
 ///
 /// ## Usage
 ///
-/// Call [`RollingIntraRefresh::next`] once per encoded frame to get the stripe that should
+/// Call [`RollingIntraRefresh::advance`] once per encoded frame to get the stripe that should
 /// be intra-coded in that frame. After `period()` frames the cycle repeats from stripe 0.
+#[derive(Debug, Clone)]
 pub struct RollingIntraRefresh {
     fps: u32,
     current_stripe: u32,
@@ -757,24 +771,26 @@ mod tests {
     #[test]
     fn test_rtt_band_150_300_skips_nack() {
         let mut ctrl = LossRecoveryController::new();
-        // RTT = 200 ms → skip NACK tier; FEC covers if loss_5s < fec_ratio.
-        // frame_gap=1, loss_5s=0.01 < fec_ratio=0.10 → RelyOnFec (not Nack despite missing_seqs).
+        // RTT=200ms → in mid-band (150–300ms): NACK tier is skipped entirely.
+        // loss_5s=0.01 < FEC_LOSS_THRESHOLD(0.05) → IDR not triggered by loss.
+        // frame_gap=1 < IDR_FRAME_GAP_THRESHOLD_MID(2) → IDR not triggered by gap.
+        // The old (rtt >= 200ms && loss_5s > 0.0) condition has been removed.
+        // loss_5s=0.01 < fec_ratio=0.10 and frame_gap=1 ≤ 1 → RelyOnFec.
         let mut state = make_state(200, 1, 0.01, 1, 0.10, vec![99]);
         state.time_since_keyframe = Duration::from_secs(1);
         let now = Instant::now();
         let action = ctrl.on_feedback(&state, now);
-        // RTT=200ms hits (rtt >= 200ms && loss_5s > 0.0) → ForcedIdr.
-        // Wait — 0.01 > 0.0 is true, so the IDR condition fires.
-        // Let's check: rtt >= 200ms AND loss_5s > 0.0 → ForcedIdr.
-        assert_eq!(action, RecoveryAction::ForcedIdr);
+        assert_eq!(action, RecoveryAction::RelyOnFec);
     }
 
     #[test]
     fn test_rtt_band_150_300_fec_when_no_loss() {
         let mut ctrl = LossRecoveryController::new();
-        // RTT = 200 ms, loss_5s = 0.0 → no loss_5s > 0.0 condition.
+        // RTT=200ms (mid-band 150–300ms): NACK skipped; no IDR conditions fire.
         // frame_gap=1 < IDR_FRAME_GAP_THRESHOLD_MID(2) → no IDR from gap.
-        // loss_5s=0.0 < fec_ratio=0.10 → RelyOnFec.
+        // loss_5s=0.0 < FEC_LOSS_THRESHOLD(0.05) → no IDR from loss.
+        // loss_5s=0.0 < fec_ratio=0.10 and frame_gap=1 ≤ 1 → RelyOnFec.
+        // Post-fix behavior: RTT band correctly covers 150–300ms inclusive via rtt <= RTT_HIGH.
         let state = make_state(200, 1, 0.0, 1, 0.10, vec![99]);
         let now = Instant::now();
         let action = ctrl.on_feedback(&state, now);
@@ -880,6 +896,140 @@ mod tests {
         assert_eq!(report.consecutive_loss, 2);
         assert!(report.missing_seqs.contains(&4));
         assert!(report.missing_seqs.contains(&3));
+    }
+
+    /// Regression test for fix #1: late/reordered packets must NOT update `last_received_seq`.
+    #[test]
+    fn test_gap_detector_late_packet_no_false_gap() {
+        let mut gd = GapDetector::new();
+        // Receive seqs 1–10 in order; each report should have frame_gap=0.
+        for seq in 1u16..=10 {
+            let report = gd.on_receive(seq);
+            assert_eq!(
+                report.frame_gap, 0,
+                "in-order seq {seq} should have frame_gap=0"
+            );
+        }
+        // Now receive seq 5 as a late duplicate.
+        let late_report = gd.on_receive(5);
+        // frame_gap must still be 0 — not (10 - 5 = 5).
+        assert_eq!(
+            late_report.frame_gap, 0,
+            "late packet seq=5 must not update last_received_seq; expected frame_gap=0"
+        );
+        // seq 5 was already received, so it must NOT appear in missing_seqs.
+        assert!(
+            !late_report.missing_seqs.contains(&5),
+            "seq 5 was already received; must not be in missing_seqs"
+        );
+    }
+
+    /// Regression test for fix #2: high loss in NACK band must fall through to IDR, not NACK.
+    #[test]
+    fn test_nack_high_loss_falls_through_to_idr() {
+        let mut ctrl = LossRecoveryController::new();
+        // RTT=80ms (< 150ms NACK band), loss_5s=0.20 (>= FEC_LOSS_THRESHOLD=0.05)
+        // → NACK guard fires, falls through to IDR evaluation.
+        // frame_gap=0 < IDR_FRAME_GAP_THRESHOLD(3), but loss_5s >= FEC_LOSS_THRESHOLD → ForcedIdr.
+        let state = LossState {
+            rtt: Duration::from_millis(80),
+            consecutive_loss: 1,
+            loss_5s: 0.20,
+            frame_gap: 0,
+            time_since_keyframe: Duration::from_secs(1),
+            fec_ratio: 0.05,
+            missing_seqs: vec![100, 101],
+        };
+        let now = Instant::now();
+        let action = ctrl.on_feedback(&state, now);
+        assert_eq!(
+            action,
+            RecoveryAction::ForcedIdr,
+            "high loss_5s (>= 5%) in NACK band must NOT produce Nack; expected ForcedIdr"
+        );
+    }
+
+    /// Regression test for fix #4: NACK emission must be capped at 16 entries.
+    #[test]
+    fn test_nack_emission_capped_at_16() {
+        let mut ctrl = LossRecoveryController::new();
+        // Build missing_seqs with 20 entries.
+        let missing: Vec<u16> = (0u16..20).collect();
+        let state = LossState {
+            rtt: Duration::from_millis(50),
+            consecutive_loss: 0,
+            loss_5s: 0.0,
+            frame_gap: 0,
+            time_since_keyframe: Duration::from_secs(1),
+            fec_ratio: 0.05,
+            missing_seqs: missing,
+        };
+        let now = Instant::now();
+        let action = ctrl.on_feedback(&state, now);
+        if let RecoveryAction::Nack(requests) = action {
+            assert!(
+                requests.len() <= 16,
+                "NACK emission must be capped at 16; got {}",
+                requests.len()
+            );
+        }
+        // If action is not Nack (e.g., loss triggers IDR), the test still passes —
+        // we just verify the cap when Nack is produced.
+    }
+
+    /// RTT band boundary tests for 149ms, 150ms, 300ms, and 301ms.
+    #[test]
+    fn test_rtt_band_boundaries() {
+        // At RTT=149ms: still in NACK band (< 150ms). loss_5s=0.03 < 5%, missing=[99].
+        // consecutive_loss=1 <= NACK_MAX_CONSECUTIVE_LOSS → expect Nack.
+        {
+            let mut ctrl = LossRecoveryController::new();
+            let state = make_state(149, 1, 0.03, 0, 0.10, vec![99]);
+            let action = ctrl.on_feedback(&state, Instant::now());
+            assert!(
+                matches!(action, RecoveryAction::Nack(_)),
+                "RTT=149ms should be in NACK band; got {action:?}"
+            );
+        }
+
+        // At RTT=150ms: enters mid-band (>= 150ms), NACK skipped.
+        // loss_5s=0.0 < FEC_LOSS_THRESHOLD, frame_gap=1 < IDR_FRAME_GAP_THRESHOLD_MID(2).
+        // loss_5s=0.0 < fec_ratio=0.10 → RelyOnFec.
+        {
+            let mut ctrl = LossRecoveryController::new();
+            let state = make_state(150, 0, 0.0, 1, 0.10, vec![]);
+            let action = ctrl.on_feedback(&state, Instant::now());
+            assert_eq!(
+                action,
+                RecoveryAction::RelyOnFec,
+                "RTT=150ms should be in mid-band; expected RelyOnFec"
+            );
+        }
+
+        // At RTT=300ms: 300ms is INCLUSIVE of mid-band (rtt <= RTT_HIGH).
+        // frame_gap=1 < IDR_FRAME_GAP_THRESHOLD_MID(2), loss_5s=0.0 → RelyOnFec.
+        {
+            let mut ctrl = LossRecoveryController::new();
+            let state = make_state(300, 0, 0.0, 1, 0.10, vec![]);
+            let action = ctrl.on_feedback(&state, Instant::now());
+            assert_eq!(
+                action,
+                RecoveryAction::RelyOnFec,
+                "RTT=300ms should be inclusive of mid-band (rtt <= RTT_HIGH); expected RelyOnFec"
+            );
+        }
+
+        // At RTT=301ms: above mid-band (rtt > RTT_HIGH). Any frame_gap >= 1 → ForcedIdr.
+        {
+            let mut ctrl = LossRecoveryController::new();
+            let state = make_state(301, 0, 0.0, 1, 0.10, vec![]);
+            let action = ctrl.on_feedback(&state, Instant::now());
+            assert_eq!(
+                action,
+                RecoveryAction::ForcedIdr,
+                "RTT=301ms (> 300ms) with frame_gap=1 should trigger ForcedIdr"
+            );
+        }
     }
 
     // ── FecPolicy tests ───────────────────────────────────────────────────────
@@ -1004,6 +1154,18 @@ mod tests {
                 time_since_keyframe_s: 1,
                 delta_ms: 2000,
             },
+            TraceStep {
+                label: "150–300ms band, loss_5s=0.03 (sub-5%), frame_gap=1 → RelyOnFec",
+                rtt_ms: 200,
+                consecutive_loss: 1,
+                loss_5s: 0.03,
+                frame_gap: 1,
+                fec_ratio: 0.10,
+                missing_seqs: vec![102],
+                time_since_keyframe_s: 1,
+                // Wait for IDR suppression from the prior ForcedIdr step to expire.
+                delta_ms: 2000,
+            },
         ];
 
         let mut ctrl = LossRecoveryController::new();
@@ -1068,13 +1230,13 @@ mod tests {
             // Must not panic, regardless of input.
             let action = ctrl.on_feedback(&state, now);
             // Action must be a valid variant.
-            let _valid = matches!(
+            prop_assert!(matches!(
                 action,
                 RecoveryAction::None
                     | RecoveryAction::Nack(_)
                     | RecoveryAction::RelyOnFec
                     | RecoveryAction::ForcedIdr
-            );
+            ));
         }
 
         #[test]

@@ -1,3 +1,4 @@
+#![deny(missing_docs)]
 //! Streamhaul Protocol (SHP) wire format.
 //!
 //! This crate is pure, allocation-light, and does **no I/O**: it turns header structs into byte arrays
