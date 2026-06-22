@@ -54,6 +54,8 @@ let mode = clf.on_tick(&signals);
 | `GAME_EXIT_DWELL` | 30 | Ticks ≈ 2 s @60 fps (protects against alt-tab glitches) |
 | `SCROLL_ENTER_THRESHOLD` | 0.35 | Score must exceed this for 4 ticks to enter Scrolling |
 | `SCROLL_EXIT_THRESHOLD` | 0.25 | Score must be below this for 10 ticks to leave Scrolling |
+| `SCROLL_ENTER_DWELL` | 4 | Ticks ≈ 267 ms @60 fps; fast entry, low false-positive cost (same encode params as Game, lower fps) |
+| `SCROLL_EXIT_DWELL` | 10 | Ticks ≈ 667 ms @60 fps; prevents pause-mid-scroll flapping |
 
 ## SCReAM overview
 

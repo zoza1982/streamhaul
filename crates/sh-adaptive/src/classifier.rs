@@ -364,7 +364,11 @@ impl fmt::Display for Score {
 /// # Object safety
 ///
 /// This trait is object-safe and can be stored as `Box<dyn ScoreProvider>`. Implementations
-/// must be `Send` so the classifier can cross `.await` points in tokio tasks.
+/// must be `Send` so the classifier can cross `.await` points in tokio tasks. The `Sync` bound
+/// permits a future shared `Arc<dyn ScoreProvider>` across multiple [`ContentClassifier`]
+/// instances (e.g. a single ONNX model serving several concurrent encode sessions); an
+/// implementor with interior-mutable inference state must protect it with a lock. (`Sync` can
+/// only be added later as a breaking change, so it is required up front.)
 ///
 /// # Contract
 ///
@@ -1105,6 +1109,44 @@ mod tests {
         );
     }
 
+    /// In Scrolling, a single stable-band tick resets the accumulating `game_counter` (the
+    /// Scrolling-mode parallel of `brief_alt_tab_stays_in_game`): a transient burst toward Game
+    /// that doesn't reach the 8-tick dwell must not "bank" progress across a calm tick.
+    #[test]
+    fn scrolling_game_counter_reset_on_stable_band_tick() {
+        let mut clf = heuristic();
+        // Enter Scrolling.
+        let scroll_score = make_signals_for_score(0.50); // stable band [0.35, 0.65)
+        run_ticks(&mut clf, &scroll_score, SCROLL_ENTER_DWELL);
+        assert_eq!(clf.current_mode(), ContentMode::Scrolling);
+
+        // Build game_counter to one short of the Game dwell with high-score ticks.
+        let game_score = make_signals_for_score(0.80); // > GAME_ENTER_THRESHOLD (0.65)
+        let mode = run_ticks(&mut clf, &game_score, GAME_ENTER_DWELL - 1);
+        assert_eq!(
+            mode,
+            ContentMode::Scrolling,
+            "still Scrolling after {} high ticks (one short of Game dwell)",
+            GAME_ENTER_DWELL - 1
+        );
+
+        // One stable-band tick must reset game_counter to 0.
+        let mode = clf.on_tick(&scroll_score);
+        assert_eq!(mode, ContentMode::Scrolling);
+
+        // Now a fresh GAME_ENTER_DWELL-1 high ticks must STILL be Scrolling — proving the counter
+        // restarted from 0 (without the reset, 7 + 7 = 14 >= 8 would already be Game).
+        let mode = run_ticks(&mut clf, &game_score, GAME_ENTER_DWELL - 1);
+        assert_eq!(
+            mode,
+            ContentMode::Scrolling,
+            "counter must restart from 0 after the stable tick — not yet Game"
+        );
+        // The 8th consecutive high tick since the reset finally enters Game.
+        let mode = clf.on_tick(&game_score);
+        assert_eq!(mode, ContentMode::Game, "Game after a fresh full dwell");
+    }
+
     /// Oscillating score around Scrolling entry threshold must not cause rapid Scrolling↔Work flaps.
     #[test]
     fn oscillating_around_scroll_entry_no_flap() {
@@ -1378,6 +1420,38 @@ mod tests {
                 "D={} out of [0,1] for velocity {}",
                 s.d, velocity_px_s
             );
+        }
+
+        /// Non-finite raw inputs (NaN, ±Inf) and an explicit NaN score must be clamped to finite
+        /// [0,1] values — a NaN must never reach the FSM's comparisons (a NaN comparison is always
+        /// false and could wedge a dwell counter). Hardens the v2-ML seam where an ONNX runtime
+        /// could emit NaN. `weird` draws from a small fixed set so all branches are exercised.
+        #[test]
+        fn prop_non_finite_inputs_clamped_finite(idx in 0usize..5) {
+            let weird = match idx {
+                0 => f64::NAN,
+                1 => f64::INFINITY,
+                2 => f64::NEG_INFINITY,
+                3 => 1e300,
+                _ => -1e300,
+            };
+
+            // Every Signals field clamps a non-finite raw value to finite [0,1].
+            let s = Signals::new(weird, weird, weird, weird);
+            for v in [s.a, s.b, s.c, s.d] {
+                prop_assert!(v.is_finite() && (0.0..=1.0).contains(&v), "signal {v} not finite-in-range");
+            }
+            // from_raw (dirty-rect, mb-diff, cursor velocity) clamps non-finite raw inputs too.
+            let sr = Signals::from_raw(weird, weird, AppClass::Game, false, weird);
+            for v in [sr.a, sr.b, sr.c, sr.d] {
+                prop_assert!(v.is_finite() && (0.0..=1.0).contains(&v), "from_raw signal {v} not finite-in-range");
+            }
+            // An explicit NaN/extreme Score is clamped, and the FSM tick stays in a valid mode.
+            let score = Score::new(weird).as_f64();
+            prop_assert!(score.is_finite() && (0.0..=1.0).contains(&score), "score {score} not finite-in-range");
+            let mut clf = ContentClassifier::new(Box::new(FixedScoreProvider(weird)));
+            let mode = clf.on_tick(&s);
+            prop_assert!(matches!(mode, ContentMode::Work | ContentMode::Scrolling | ContentMode::Game));
         }
     }
 }
