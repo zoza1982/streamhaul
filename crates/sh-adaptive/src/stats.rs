@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-/// Per-feedback statistics delivered from the transport layer to a [`CongestionController`].
+/// Per-feedback statistics delivered from the transport layer to a `CongestionController`.
 ///
 /// A feedback report is generated periodically (typically every 5–50 ms) by the transport layer
 /// based on receiver reports, ACKs, or RTCP packets. The controller uses these measurements to
