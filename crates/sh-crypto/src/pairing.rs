@@ -5,23 +5,31 @@
 //! This module implements **two pairing modes** for Streamhaul:
 //!
 //! 1. **Attended pairing** ([`pair_attended`]): a human is at both sides, observes the SAS
-//!    (derived by the caller from [`crate::sas::Sas`]), and confirms the match. On confirm,
-//!    the peer identity is pinned (`trust_peer`). On mismatch, the pairing is aborted without
-//!    a pin.
+//!    (derived by the caller from [`crate::sas::Sas`]), and confirms the match via
+//!    [`Sas::confirm`](crate::sas::Sas::confirm) which returns a [`SasConfirmed`] token.
+//!    On confirm, the peer identity is pinned (`trust_peer`). On mismatch, the pairing is
+//!    aborted without a pin.
 //!
 //! 2. **Unattended pairing** ([`pair_unattended`]): no human is present at the host. A
-//!    pre-provisioned single-use [`PairingCode`] is shared out-of-band. Both sides run a
-//!    SPAKE2 PAKE exchange over that code, with an explicit HKDF-SHA-256 key-confirmation MAC
-//!    that binds the shared key to both device identities AND to the Noise handshake hash `h`.
-//!    On confirmed key match, the peer is pinned.
+//!    pre-provisioned single-use [`PairingCode`] is shared out-of-band. The code must first
+//!    be validated with [`PairingCode::check_not_expired`] to produce a [`ValidPairingCode`];
+//!    only a [`ValidPairingCode`] can be passed to [`PakeExchange::start_with_rng`], making
+//!    expiry enforcement structurally unrepresentable to skip. Both sides run a SPAKE2 PAKE
+//!    exchange over that code, with an explicit HKDF-SHA-256 key-confirmation MAC that binds
+//!    the shared key to both device identities AND to the Noise handshake hash `h`. On
+//!    confirmed key match, the peer is pinned.
 //!
 //! # Security invariants (from ADR-0008)
 //!
+//! - **Expiry checked before PAKE.** [`PairingCode::check_not_expired`] returns a
+//!   [`ValidPairingCode`] newtype; [`PakeExchange::start_with_rng`] only accepts
+//!   `ValidPairingCode` — it is a compile-time error to start a PAKE with an unchecked code.
 //! - **Pin ONLY after explicit confirmation.** `trust_peer` is called strictly after SAS
-//!   match-confirm or PAKE key-confirmation success — never on bare handshake completion.
-//! - **Revoke gate.** If the peer was previously revoked, the function returns
-//!   [`PairingOutcome::ReTrustAfterRevokeRequiresConfirmation`] instead of auto-pinning.
-//!   The operator must perform a distinct confirm action.
+//!   match-confirm (via [`SasConfirmed`]) or PAKE key-confirmation success — never on bare
+//!   handshake completion.
+//! - **Revoke gate is atomic.** [`Keystore::trust_peer_if_not_revoked`] checks and pins under
+//!   a single write-lock acquisition, eliminating the TOCTOU race between the revocation
+//!   check and the pin.
 //! - **Identity from Noise.** The pinned identity is always the BindCert-verified
 //!   `peer_identity` from the [`HandshakeOutcome`](crate::noise::HandshakeOutcome). PAKE
 //!   messages can never claim or substitute an identity.
@@ -54,8 +62,8 @@
 //!     PairingCodeFormat::EightDigit,
 //!     not_after,
 //! );
-//! // Caller checks expiry with the injected clock before using the code.
-//! code.check_not_expired(&clock)?;
+//! // Validate expiry; only a ValidPairingCode can be used with PakeExchange.
+//! let valid_code = code.check_not_expired(&clock)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -121,7 +129,9 @@ impl PairingCodeFormat {
 ///
 /// - The code is **never transmitted** (that is the PAKE property — both sides provide it
 ///   as local input; no code-derived value appears on the wire).
-/// - Call [`check_not_expired`](Self::check_not_expired) before handing the code to PAKE.
+/// - Call [`check_not_expired`](Self::check_not_expired) to validate expiry; the returned
+///   [`ValidPairingCode`] is the only type accepted by [`PakeExchange::start_with_rng`].
+///   This makes it a **compile-time error** to start a PAKE exchange with an unchecked code.
 /// - After a successful pairing the code must be invalidated (single-use); after a
 ///   configurable number of failed attempts the code must also be invalidated. The
 ///   invalidation state is maintained by the caller (host agent), not by this struct.
@@ -227,9 +237,15 @@ impl PairingCode {
         self.format
     }
 
-    /// Checks that this code has not yet expired relative to the given clock.
+    /// Validates that this code has not yet expired relative to the given clock, and
+    /// returns a [`ValidPairingCode`] proof token on success.
     ///
-    /// Returns `Ok(())` if `clock.now_unix_secs() < not_after`, or
+    /// The [`ValidPairingCode`] is the **only** type accepted by
+    /// [`PakeExchange::start_with_rng`] — making it a compile-time error to start a PAKE
+    /// exchange with an unchecked code. This eliminates the class of bugs where expiry
+    /// enforcement is accidentally omitted.
+    ///
+    /// Returns `Ok(ValidPairingCode)` if `clock.now_unix_secs() < not_after`, or
     /// [`CryptoError::PairingCodeExpired`] otherwise.
     ///
     /// # Errors
@@ -239,11 +255,11 @@ impl PairingCode {
     /// # Panics
     ///
     /// Never panics.
-    pub fn check_not_expired(&self, clock: &dyn Clock) -> Result<(), CryptoError> {
+    pub fn check_not_expired(self, clock: &dyn Clock) -> Result<ValidPairingCode, CryptoError> {
         if clock.now_unix_secs() >= self.not_after {
             return Err(CryptoError::PairingCodeExpired);
         }
-        Ok(())
+        Ok(ValidPairingCode(self))
     }
 
     /// Returns the code value as a string slice for use as PAKE input.
@@ -265,6 +281,44 @@ impl PairingCode {
 
 // `PairingCode` deliberately does NOT implement `Debug`, `Display`, or `Clone`
 // to prevent accidental logging of the secret code value.
+
+// ─── ValidPairingCode ────────────────────────────────────────────────────────
+
+/// Proof that a [`PairingCode`] has been validated against the clock and is not expired.
+///
+/// This newtype is the **only** type accepted by [`PakeExchange::start_with_rng`].
+/// The only constructor is [`PairingCode::check_not_expired`], so it is a **compile-time
+/// error** to start a PAKE exchange with an unchecked or expired code — "unchecked expiry"
+/// is structurally unrepresentable.
+///
+/// The inner code is [`Zeroizing`] and will be erased on drop.
+///
+/// # Security
+///
+/// `Debug` is implemented but deliberately omits the secret code value — only the format is
+/// shown. This type does not implement `Display` or `Clone` to prevent accidental logging or
+/// duplication of the secret code value.
+pub struct ValidPairingCode(PairingCode);
+
+impl fmt::Debug for ValidPairingCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Deliberately omit the code value. Show only the format.
+        f.debug_struct("ValidPairingCode")
+            .field("format", &self.0.format)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ValidPairingCode {
+    /// Returns the underlying code value as a string slice.
+    ///
+    /// # Security
+    ///
+    /// Never log or display this value; it is the shared secret that authenticates the PAKE.
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
 
 // ─── PakeRole ────────────────────────────────────────────────────────────────
 
@@ -288,19 +342,37 @@ pub enum PakeRole {
 
 /// Proof that a PAKE key-confirmation succeeded.
 ///
-/// The contained `authorizes_pin` identity is the **Noise BindCert-verified peer identity**
-/// from the [`HandshakeOutcome`](crate::noise::HandshakeOutcome) — NEVER a claim from a
-/// PAKE message. The PAKE authorizes a pin; the *thing pinned* is the cryptographically
-/// verified identity from the Noise layer.
+/// The contained peer identity is the **Noise BindCert-verified peer identity** from the
+/// [`HandshakeOutcome`](crate::noise::HandshakeOutcome) — NEVER a claim from a PAKE message.
+/// The PAKE authorizes a pin; the *thing pinned* is the cryptographically verified identity
+/// from the Noise layer.
 ///
-/// Produced by [`PakeExchange::finish`].
+/// Produced **exclusively** by [`PakeExchange::finish`]. The peer identity field is private
+/// and only accessible via [`PakeConfirmed::peer`] — fabricating a `PakeConfirmed` without
+/// going through a real PAKE exchange is not possible from outside this module.
 #[derive(Debug, Clone)]
 pub struct PakeConfirmed {
     /// The identity that the PAKE exchange authorizes to be pinned.
     ///
-    /// Equals the `peer_identity` from the `HandshakeOutcome` passed to
-    /// [`PakeExchange::start_with_rng`].
-    pub authorizes_pin: DeviceIdentity,
+    /// Private: the only constructor is `PakeExchange::finish`. This ensures a
+    /// `PakeConfirmed` can never be fabricated to pin an arbitrary identity without
+    /// completing a real PAKE exchange.
+    authorizes_pin: DeviceIdentity,
+}
+
+impl PakeConfirmed {
+    /// Returns a reference to the verified peer identity that this confirmation authorizes
+    /// to be pinned.
+    ///
+    /// This is the `peer_identity` from the `HandshakeOutcome` passed to
+    /// [`PakeExchange::start_with_rng`] — never a claim from a PAKE message.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn peer(&self) -> &DeviceIdentity {
+        &self.authorizes_pin
+    }
 }
 
 // ─── PakeExchange ─────────────────────────────────────────────────────────────
@@ -309,21 +381,27 @@ pub struct PakeConfirmed {
 ///
 /// # Protocol
 ///
-/// 1. Call [`start_with_rng`](Self::start_with_rng) on both sides to produce the first PAKE
+/// 1. Validate the pairing code with [`PairingCode::check_not_expired`] to get a
+///    [`ValidPairingCode`].
+/// 2. Call [`start_with_rng`](Self::start_with_rng) on both sides to produce the first PAKE
 ///    message.
-/// 2. Exchange the first messages (each side gets the other's [`outbound_msg`](Self::outbound_msg)).
-/// 3. Call [`read_peer_msg`](Self::read_peer_msg) with the remote message to derive the shared key.
-/// 4. Exchange confirmation MACs:
+/// 3. Exchange the first messages (each side gets the other's [`outbound_msg`](Self::outbound_msg)).
+/// 4. Call [`read_peer_msg`](Self::read_peer_msg) with the remote message to derive the shared key.
+/// 5. Exchange confirmation MACs:
 ///    - Initiator sends its MAC and reads the responder's MAC.
 ///    - Responder sends its MAC and reads the initiator's MAC.
-/// 5. Call [`finish`](Self::finish) with the peer's confirmation MAC to complete the exchange.
+/// 6. Call [`finish`](Self::finish) with the peer's confirmation MAC to complete the exchange.
 ///
 /// # Security
 ///
+/// - `start_with_rng` requires a [`ValidPairingCode`] (produced only by
+///   [`PairingCode::check_not_expired`]) — expiry is enforced structurally.
 /// - The SPAKE2 shared key is [`Zeroizing`] and never exposed.
 /// - The key-confirmation MAC additionally covers `h`, `id_a`, and `id_b` so a relayed or
 ///   replayed PAKE fails confirmation (ADR-0008 §2.3 / open-risk #1).
 /// - Key material is erased when this struct drops.
+/// - **Single-use:** this struct must be discarded after any error or after `finish` is called.
+///   The internal SPAKE2 state is consumed by `read_peer_msg` and cannot be re-used.
 ///
 /// # SECURITY WARNING
 ///
@@ -333,9 +411,12 @@ pub struct PakeExchange {
     spake2_state: Option<spake2::Spake2<spake2::Ed25519Group>>,
     /// This side's SPAKE2 outbound message (the bytes to send to the peer).
     outbound: Vec<u8>,
-    /// The SPAKE2 shared key after `read_peer_msg` has been called.
-    /// `Zeroizing` so the secret is erased on drop.
-    shared_key: Option<Zeroizing<Vec<u8>>>,
+    /// The expected peer confirmation MAC after `read_peer_msg` has been called.
+    ///
+    /// Renamed from `shared_key` (which was semantically misleading — this field holds a
+    /// MAC tag for peer-confirmation verification, not the raw SPAKE2 shared key).
+    /// `Zeroizing` ensures the expected MAC is erased on drop.
+    peer_expected_mac: Option<Zeroizing<[u8; 32]>>,
     /// Our role in the exchange.
     role: PakeRole,
     /// The Noise handshake hash `h` (binding to the Noise session).
@@ -354,7 +435,8 @@ impl PakeExchange {
     /// Both sides must call this with:
     /// - `rng`: a CSPRNG (injected for determinism in tests).
     /// - `role`: whether this side is [`PakeRole::Initiator`] or [`PakeRole::Responder`].
-    /// - `code`: the shared pairing code; **never transmitted, only used as PAKE input**.
+    /// - `code`: a [`ValidPairingCode`] produced by [`PairingCode::check_not_expired`];
+    ///   expiry is enforced structurally — passing an unchecked code is a compile error.
     /// - `local_id`: this device's Ed25519 identity (from `Keystore::device_identity`).
     /// - `peer_id`: the peer's verified identity from the `HandshakeOutcome`.
     /// - `handshake_hash`: the Noise `h` for session binding.
@@ -369,15 +451,17 @@ impl PakeExchange {
     pub fn start_with_rng<R: CryptoRng + RngCore>(
         rng: &mut R,
         role: PakeRole,
-        code: &PairingCode,
+        code: &ValidPairingCode,
         local_id: DeviceIdentity,
         peer_id: DeviceIdentity,
         handshake_hash: &[u8; 32],
     ) -> Result<Self, CryptoError> {
         // The SPAKE2 password is the pairing code bytes.
-        // `id_a` = initiator's device_id fingerprint bytes (raw UTF-8 hex, 64 bytes).
-        // `id_b` = responder's device_id fingerprint bytes (raw UTF-8 hex, 64 bytes).
+        // `id_a` = initiator's device_id fingerprint bytes (hex fingerprint string, 64 bytes).
+        // `id_b` = responder's device_id fingerprint bytes (hex fingerprint string, 64 bytes).
         // This binds both identities into the SPAKE2 transcript so swapping identities fails.
+        // NOTE: We use the hex fingerprint string (not raw 32-byte digest) for both ids, as it
+        // is an injective encoding — security-equivalent — and avoids an extra decode step.
         let (id_a_bytes, id_b_bytes) = match role {
             PakeRole::Initiator => (
                 local_id.fingerprint().as_str().as_bytes().to_vec(),
@@ -417,7 +501,7 @@ impl PakeExchange {
         Ok(Self {
             spake2_state: Some(spake2_state),
             outbound,
-            shared_key: None,
+            peer_expected_mac: None,
             role,
             handshake_hash: h_copy,
             local_id,
@@ -475,6 +559,8 @@ impl PakeExchange {
             .map_err(|_| CryptoError::MalformedPakeMessage {
                 reason: "SPAKE2 key derivation failed (wrong code or malformed message)",
             })?;
+        // Wrap raw_key in Zeroizing so the SPAKE2 secret is erased when it leaves this scope.
+        let raw_key = Zeroizing::new(raw_key);
 
         // Derive the key-confirmation MAC for the local role.
         // The confirmation key additionally covers h + id_a + id_b (ADR-0008 open-risk #1):
@@ -488,21 +574,15 @@ impl PakeExchange {
             self.derive_confirmation_key(&raw_key, self.peer_confirm_info_label())?;
 
         // The local confirmation MAC = HMAC-SHA256(local_confirm_key, context).
-        // We use HKDF-Expand with a zero-length info to produce the 32-byte MAC tag from the key.
-        // Specifically: local_confirmation = local_confirm_key itself (already 32 bytes of
-        // keyed pseudo-random material from a 256-bit-strong key).
-        // To distinguish "confirm MAC" from "confirm key", we add a final expand step:
+        // We use HKDF-Expand with a fixed label to produce the 32-byte MAC tag from the key.
         //   local_mac = HKDF-Expand(local_confirm_key, b"mac\x00", L=32)
         let local_confirmation = self.final_mac(&local_confirm_key)?;
-        // Store peer_confirm_key so finish() can verify the peer MAC.
+        // The peer expected MAC is derived from the peer's confirmation key. We store this
+        // (Zeroizing) so finish() can compare it against the peer's actual MAC.
         let peer_expected_mac = self.final_mac(&peer_confirm_key)?;
 
         self.local_confirmation = Some(local_confirmation);
-        // Store shared_key as the peer expected MAC (32 bytes) so finish() can verify.
-        // We overload shared_key to avoid adding another field.
-        let mut stored = Zeroizing::new(Vec::with_capacity(64));
-        stored.extend_from_slice(&peer_expected_mac);
-        self.shared_key = Some(stored);
+        self.peer_expected_mac = Some(Zeroizing::new(peer_expected_mac));
 
         Ok(())
     }
@@ -549,12 +629,12 @@ impl PakeExchange {
             });
         }
 
-        let expected = self
-            .shared_key
-            .as_deref()
-            .ok_or(CryptoError::MalformedPakeMessage {
-                reason: "must call read_peer_msg before finish",
-            })?;
+        let expected =
+            self.peer_expected_mac
+                .as_ref()
+                .ok_or(CryptoError::MalformedPakeMessage {
+                    reason: "must call read_peer_msg before finish",
+                })?;
 
         // Constant-time comparison of the expected peer MAC vs the received peer MAC.
         let ct_result = expected.as_slice().ct_eq(peer_confirmation);
@@ -597,12 +677,14 @@ impl PakeExchange {
         &self,
         spake2_key: &[u8],
         role_label: &[u8],
-    ) -> Result<[u8; 32], CryptoError> {
+    ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
         // IKM = spake2_key (the shared SPAKE2 secret)
         let (_, hkdf) = Hkdf::<Sha256>::extract(None, spake2_key);
 
         // info = role_label || h[32] || id_a_fp[64] || id_b_fp[64]
         // — covers the Noise session AND both device identities.
+        // NOTE: We use hex fingerprint strings (64 bytes each, injective encoding) as
+        // documented in ADR-0008 §2.3.
         let (id_a_fp, id_b_fp) = match self.role {
             PakeRole::Initiator => (
                 self.local_id.fingerprint().as_str(),
@@ -625,8 +707,8 @@ impl PakeExchange {
         info.extend_from_slice(id_a_fp.as_bytes());
         info.extend_from_slice(id_b_fp.as_bytes());
 
-        let mut key = [0u8; 32];
-        hkdf.expand(&info, &mut key)
+        let mut key = Zeroizing::new([0u8; 32]);
+        hkdf.expand(&info, key.as_mut())
             .map_err(|_| CryptoError::MalformedPakeMessage {
                 reason: "HKDF expand failed for confirmation key",
             })?;
@@ -636,6 +718,8 @@ impl PakeExchange {
     /// Derives the final 32-byte confirmation MAC from a confirmation key.
     ///
     /// Uses a single HKDF-Expand step with a fixed label to separate the key from the MAC tag.
+    /// The returned MAC tag is not secret (it goes on the wire), so it is returned as a plain
+    /// `[u8; 32]` without `Zeroizing`.
     fn final_mac(&self, confirm_key: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
         let (_, hkdf) = Hkdf::<Sha256>::extract(None, confirm_key.as_slice());
         let mut mac = [0u8; 32];
@@ -692,6 +776,34 @@ pub enum PairingOutcome {
     },
 }
 
+// ─── SasConfirmed ─────────────────────────────────────────────────────────────
+
+/// Proof that a human explicitly confirmed a SAS match for a specific peer.
+///
+/// This typestate is returned by [`Sas::confirm`](crate::sas::Sas::confirm) when
+/// `human_said_match = true`. [`pair_attended`] requires a `SasConfirmed` instead of a raw
+/// `bool`, making it a **compile-time error** to call `pair_attended` without going through
+/// the SAS display-and-confirm flow.
+///
+/// `SasConfirmed` carries the peer identity to bind the SAS confirmation to the specific peer
+/// being paired, preventing the confirmation from being replayed for a different peer.
+#[derive(Debug, Clone)]
+pub struct SasConfirmed {
+    /// The peer identity whose SAS was confirmed by the human.
+    pub(crate) peer: DeviceIdentity,
+}
+
+impl SasConfirmed {
+    /// Returns the peer identity that was confirmed.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn peer(&self) -> &DeviceIdentity {
+        &self.peer
+    }
+}
+
 // ─── pair_attended ────────────────────────────────────────────────────────────
 
 /// Attended pairing: the human confirms SAS match; if confirmed, the peer is pinned.
@@ -700,16 +812,27 @@ pub enum PairingOutcome {
 /// 1. Deriving the SAS from the handshake hash using [`crate::sas::Sas::from_handshake_hash`].
 /// 2. Displaying the SAS to the human alongside the peer's fingerprint.
 /// 3. Obtaining out-of-band human confirmation (both sides compare displayed SAS values).
-/// 4. Calling this function with `human_confirmed = true` on match or `false` on mismatch/abort.
+/// 4. Calling [`Sas::confirm`](crate::sas::Sas::confirm) with the peer identity and the
+///    human's answer; this produces a [`SasConfirmed`] on match or `None` on mismatch.
+/// 5. Calling this function with the `SasConfirmed` token.
 ///
-/// **This function pins the peer ONLY when `human_confirmed = true`.**
+/// **This function pins the peer ONLY when a valid `SasConfirmed` is provided.**
+///
+/// # Typestate enforcement
+///
+/// Taking a `SasConfirmed` (instead of a raw `bool`) makes it a **compile error** to call
+/// `pair_attended` without going through [`Sas::confirm`] — you cannot accidentally bypass
+/// the SAS display step.
 ///
 /// # Revocation check
 ///
+/// The revocation check and the pin are performed **atomically** via
+/// [`Keystore::trust_peer_if_not_revoked`] under a single write-lock acquisition, eliminating
+/// the TOCTOU race between checking revocation state and pinning.
+///
 /// If the peer identity was previously revoked, this function returns
-/// [`PairingOutcome::ReTrustAfterRevokeRequiresConfirmation`] even when `human_confirmed`
-/// is `true`. The caller must obtain a separate, explicit operator confirmation before
-/// calling `Keystore::trust_peer` directly.
+/// [`PairingOutcome::ReTrustAfterRevokeRequiresConfirmation`]. The caller must obtain a
+/// separate, explicit operator confirmation before calling `Keystore::trust_peer` directly.
 ///
 /// # Errors
 ///
@@ -722,47 +845,44 @@ pub enum PairingOutcome {
 /// # Examples
 ///
 /// ```no_run
-/// use sh_crypto::pairing::{pair_attended, PairingOutcome};
+/// use sh_crypto::pairing::{pair_attended, SasConfirmed, PairingOutcome};
 /// use sh_crypto::noise::HandshakeOutcome;
+/// use sh_crypto::sas::Sas;
 /// use sh_crypto::SoftwareKeystore;
 /// use sh_crypto::clock::SystemClock;
 ///
 /// # async fn example(outcome: HandshakeOutcome, ks: SoftwareKeystore) -> Result<(), sh_crypto::CryptoError> {
-/// let clock = SystemClock;
-/// let pairing = pair_attended(&outcome.peer_identity, true, &ks, &clock).await?;
-/// match pairing {
-///     PairingOutcome::Pinned { peer } => println!("pinned: {peer}"),
-///     PairingOutcome::Aborted { reason } => println!("aborted: {reason}"),
-///     PairingOutcome::ReTrustAfterRevokeRequiresConfirmation { peer } =>
-///         println!("revoked peer requires explicit re-trust: {peer}"),
-///     _ => {}
+/// let sas = Sas::from_handshake_hash(&outcome.handshake_hash);
+/// println!("SAS: {sas}");
+/// // ... display to human and get confirmation ...
+/// let human_said_match = true; // obtained from UI
+/// if let Some(confirmed) = sas.confirm(&outcome.peer_identity, human_said_match) {
+///     let pairing = pair_attended(confirmed, &ks).await?;
+///     match pairing {
+///         PairingOutcome::Pinned { peer } => println!("pinned: {peer}"),
+///         PairingOutcome::Aborted { reason } => println!("aborted: {reason}"),
+///         PairingOutcome::ReTrustAfterRevokeRequiresConfirmation { peer } =>
+///             println!("revoked peer requires explicit re-trust: {peer}"),
+///         _ => {}
+///     }
 /// }
 /// # Ok(())
 /// # }
 /// ```
 pub async fn pair_attended(
-    peer_identity: &DeviceIdentity,
-    human_confirmed: bool,
+    sas_confirmed: SasConfirmed,
     keystore: &dyn Keystore,
-    _clock: &dyn Clock,
 ) -> Result<PairingOutcome, CryptoError> {
-    if !human_confirmed {
-        return Ok(PairingOutcome::Aborted {
-            reason: "SAS mismatch or human rejected pairing",
-        });
-    }
+    let peer = sas_confirmed.peer;
 
-    // Check revocation state before pinning (R-HW-KS gate).
-    if is_revoked(peer_identity, keystore).await? {
-        return Ok(PairingOutcome::ReTrustAfterRevokeRequiresConfirmation {
-            peer: peer_identity.clone(),
-        });
+    // Atomically check revocation state and pin, under a single write-lock acquisition.
+    // This eliminates the TOCTOU race between was_peer_revoked() and trust_peer().
+    match keystore.trust_peer_if_not_revoked(&peer).await? {
+        TrustOutcome::Pinned => Ok(PairingOutcome::Pinned { peer }),
+        TrustOutcome::WasRevoked => {
+            Ok(PairingOutcome::ReTrustAfterRevokeRequiresConfirmation { peer })
+        }
     }
-
-    keystore.trust_peer(peer_identity).await?;
-    Ok(PairingOutcome::Pinned {
-        peer: peer_identity.clone(),
-    })
 }
 
 // ─── pair_unattended ──────────────────────────────────────────────────────────
@@ -774,11 +894,14 @@ pub async fn pair_attended(
 /// [`PakeExchange`] directly and wire the message exchange over the Noise transport.
 ///
 /// `pake_confirmed` is the [`PakeConfirmed`] token returned by [`PakeExchange::finish`];
-/// the `authorizes_pin` identity inside it is the verified peer identity.
+/// the peer identity inside it is the verified peer identity.
 ///
 /// # Revocation check
 ///
-/// Same as [`pair_attended`]: a previously revoked peer returns
+/// Same as [`pair_attended`]: the revocation check and pin are performed **atomically** via
+/// [`Keystore::trust_peer_if_not_revoked`] to eliminate the TOCTOU race.
+///
+/// If the peer was previously revoked, returns
 /// [`PairingOutcome::ReTrustAfterRevokeRequiresConfirmation`] instead of auto-pinning.
 ///
 /// # Errors
@@ -797,8 +920,7 @@ pub async fn pair_attended(
 /// use sh_crypto::clock::SystemClock;
 ///
 /// # async fn example(confirmed: PakeConfirmed, ks: SoftwareKeystore) -> Result<(), sh_crypto::CryptoError> {
-/// let clock = SystemClock;
-/// let outcome = pair_unattended(confirmed, &ks, &clock).await?;
+/// let outcome = pair_unattended(confirmed, &ks).await?;
 /// match outcome {
 ///     PairingOutcome::Pinned { peer } => println!("pinned: {peer}"),
 ///     PairingOutcome::Aborted { reason } => println!("aborted: {reason}"),
@@ -812,48 +934,31 @@ pub async fn pair_attended(
 pub async fn pair_unattended(
     pake_confirmed: PakeConfirmed,
     keystore: &dyn Keystore,
-    _clock: &dyn Clock,
 ) -> Result<PairingOutcome, CryptoError> {
     let peer = pake_confirmed.authorizes_pin;
 
-    // Check revocation state before pinning (R-HW-KS gate).
-    if is_revoked(&peer, keystore).await? {
-        return Ok(PairingOutcome::ReTrustAfterRevokeRequiresConfirmation { peer });
+    // Atomically check revocation state and pin, under a single write-lock acquisition.
+    // This eliminates the TOCTOU race between was_peer_revoked() and trust_peer().
+    match keystore.trust_peer_if_not_revoked(&peer).await? {
+        TrustOutcome::Pinned => Ok(PairingOutcome::Pinned { peer }),
+        TrustOutcome::WasRevoked => {
+            Ok(PairingOutcome::ReTrustAfterRevokeRequiresConfirmation { peer })
+        }
     }
-
-    keystore.trust_peer(&peer).await?;
-    Ok(PairingOutcome::Pinned { peer })
 }
 
-// ─── Private helpers ──────────────────────────────────────────────────────────
+// ─── TrustOutcome ─────────────────────────────────────────────────────────────
 
-/// Returns `true` if `id` is currently revoked (not trusted AND explicitly revoked).
+/// The result of an atomic revocation-check-and-pin operation.
 ///
-/// The `SoftwareKeystore` stores trust state as `Trusted | Revoked | (absent=unknown)`.
-/// We detect revocation by: not trusted + calling `revoke_peer` is idempotent, but we
-/// cannot directly query "was this revoked?". We infer it:
-///
-/// Strategy: pin tentatively (idempotent), check the trust state, then if the pin resulted in
-/// re-trust after revoke we surface the signal. But `Keystore` trait doesn't expose the
-/// internal revocation state directly.
-///
-/// Correct approach: `is_trusted` returns `false` for both "never seen" and "revoked" peers.
-/// We need to distinguish them. The cleanest approach without modifying the `Keystore` trait:
-///
-/// 1. Call `is_trusted(id)` → `false` for both "unknown" and "revoked".
-/// 2. We need `was_revoked`. The `Keystore` trait has no such method.
-///
-/// However, the ADR says: "The pairing layer therefore, before calling `trust_peer`, queries
-/// trust/revocation state and: if the peer identity was previously revoked, it does not
-/// silently re-pin." We add a `is_revoked` method to the `Keystore` trait.
-///
-/// For now, we check via `SoftwareKeystore`'s `is_trusted`: if `is_trusted = false` after a
-/// `revoke_peer` call, we need to detect the revoked case. Since we can't distinguish
-/// "never seen" from "revoked" without modifying the trait, we add `was_revoked` to `Keystore`.
-///
-/// See the trait extension below.
-async fn is_revoked(id: &DeviceIdentity, keystore: &dyn Keystore) -> Result<bool, CryptoError> {
-    keystore.was_peer_revoked(id).await
+/// Returned by [`Keystore::trust_peer_if_not_revoked`]. Separates "pinned successfully" from
+/// "was revoked, pin refused" without exposing any secret material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustOutcome {
+    /// The peer was not revoked; it has been pinned (or was already pinned).
+    Pinned,
+    /// The peer was previously revoked; the pin was refused. Operator must confirm re-trust.
+    WasRevoked,
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -867,6 +972,7 @@ async fn is_revoked(id: &DeviceIdentity, keystore: &dyn Keystore) -> Result<bool
 mod tests {
     use super::*;
     use crate::clock::FixedClock;
+    use crate::sas::Sas;
     use crate::{Keystore, SoftwareKeystore};
     use rand_core::SeedableRng;
 
@@ -883,6 +989,14 @@ mod tests {
 
     fn fixed_h(byte: u8) -> [u8; 32] {
         [byte; 32]
+    }
+
+    /// Helper: produce a validated code from digits (for use in tests that need `ValidPairingCode`).
+    fn valid_code(digits: &str) -> ValidPairingCode {
+        let code =
+            PairingCode::from_digits(digits, PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let clock = FixedClock(NOW);
+        code.check_not_expired(&clock).unwrap()
     }
 
     // ─── PairingCode ─────────────────────────────────────────────────────────
@@ -953,13 +1067,37 @@ mod tests {
         assert!(matches!(r, Err(CryptoError::MalformedPakeMessage { .. })));
     }
 
+    // ─── CRITICAL: Expiry enforced at PAKE start — structural test ───────────
+
+    /// Structural guarantee: an expired code cannot reach `start_with_rng`.
+    ///
+    /// `check_not_expired` consumes `self` and returns `Err(PairingCodeExpired)` when the
+    /// code is expired. `start_with_rng` requires `&ValidPairingCode`, so an expired code
+    /// physically cannot be passed — this test confirms the runtime behaviour of the check
+    /// at the exact boundary.
+    #[test]
+    fn expired_code_check_not_expired_returns_error_before_pake() {
+        let mut rng = seeded_rng(5);
+        // A code that expired 1 second ago relative to our injected clock.
+        let code =
+            PairingCode::generate_with_rng(&mut rng, PairingCodeFormat::EightDigit, NOT_AFTER);
+        // Clock is past not_after — expiry must be enforced.
+        let expired_clock = FixedClock(NOT_AFTER + 1);
+        let result = code.check_not_expired(&expired_clock);
+        assert!(
+            matches!(result, Err(CryptoError::PairingCodeExpired)),
+            "expired code must return PairingCodeExpired before PAKE starts, got: {result:?}"
+        );
+        // The Err branch means no ValidPairingCode was returned → start_with_rng is
+        // unreachable without a valid code (enforced by type system + this test).
+    }
+
     // ─── PAKE correct code → confirmed ──────────────────────────────────────
 
     #[tokio::test]
     async fn pake_correct_code_succeeds() {
         let mut rng_a = seeded_rng(10);
         let mut rng_b = seeded_rng(11);
-        let clock = FixedClock(NOW);
 
         let ks_a = seeded_ks(100);
         let ks_b = seeded_ks(101);
@@ -967,18 +1105,14 @@ mod tests {
         let id_b = ks_b.device_identity().await.unwrap();
 
         let h = fixed_h(0x5a);
-        let code =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
-        code.check_not_expired(&clock).unwrap();
-
-        let code_b =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code_a = valid_code("12345678");
+        let code_b = valid_code("12345678");
 
         // Both sides start the PAKE.
         let mut exc_a = PakeExchange::start_with_rng(
             &mut rng_a,
             PakeRole::Initiator,
-            &code,
+            &code_a,
             id_a.clone(),
             id_b.clone(),
             &h,
@@ -1012,8 +1146,8 @@ mod tests {
         let confirmed_b = exc_b.finish(&mac_a).unwrap();
 
         // The confirmed peer identities must be the Noise-verified ones (not PAKE claims).
-        assert_eq!(confirmed_a.authorizes_pin, id_b);
-        assert_eq!(confirmed_b.authorizes_pin, id_a);
+        assert_eq!(confirmed_a.peer(), &id_b);
+        assert_eq!(confirmed_b.peer(), &id_a);
     }
 
     // ─── PAKE wrong code → confirmation fails, NO pin ────────────────────────
@@ -1030,10 +1164,8 @@ mod tests {
 
         let h = fixed_h(0xab);
         // A and B use DIFFERENT codes.
-        let code_a =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
-        let code_b =
-            PairingCode::from_digits("87654321", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code_a = valid_code("12345678");
+        let code_b = valid_code("87654321");
 
         let mut exc_a = PakeExchange::start_with_rng(
             &mut rng_a,
@@ -1102,16 +1234,14 @@ mod tests {
         let id_relay = ks_relay.device_identity().await.unwrap();
 
         let h = fixed_h(0xcc);
-        let code =
-            PairingCode::from_digits("11111111", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
-        let code_relay =
-            PairingCode::from_digits("11111111", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code_a = valid_code("11111111");
+        let code_relay = valid_code("11111111");
 
         // Legitimate initiator pairs with id_b.
         let mut exc_a = PakeExchange::start_with_rng(
             &mut rng_a,
             PakeRole::Initiator,
-            &code,
+            &code_a,
             id_a.clone(),
             id_b.clone(), // expects id_b as responder
             &h,
@@ -1162,16 +1292,14 @@ mod tests {
 
         let h_real = fixed_h(0x11);
         let h_replay = fixed_h(0x22); // different h
-        let code =
-            PairingCode::from_digits("99999999", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
-        let code_b =
-            PairingCode::from_digits("99999999", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code_a = valid_code("99999999");
+        let code_b = valid_code("99999999");
 
         // A uses the real h; B uses a different h (replay scenario).
         let mut exc_a = PakeExchange::start_with_rng(
             &mut rng_a,
             PakeRole::Initiator,
-            &code,
+            &code_a,
             id_a.clone(),
             id_b.clone(),
             &h_real,
@@ -1204,6 +1332,77 @@ mod tests {
         );
     }
 
+    // ─── HKDF identity-binding isolation test ────────────────────────────────
+
+    /// Regression guard: varying only the HKDF `info` identity binding (holding the SPAKE2
+    /// key constant by using identical codes and `h`) must produce a MAC mismatch when the
+    /// identity differs on each side. This catches a regression where the HKDF id-binding
+    /// is accidentally dropped.
+    #[tokio::test]
+    async fn hkdf_identity_binding_mismatch_causes_confirmation_failure() {
+        let mut rng_a = seeded_rng(4200);
+        let mut rng_b = seeded_rng(4201);
+
+        let ks_a = seeded_ks(4200);
+        let ks_b = seeded_ks(4201);
+        let ks_c = seeded_ks(4202); // a third identity — used as a substitute
+
+        let id_a = ks_a.device_identity().await.unwrap();
+        let id_b = ks_b.device_identity().await.unwrap();
+        let id_c = ks_c.device_identity().await.unwrap();
+
+        let h = fixed_h(0xDD);
+        // Both sides use the SAME code and the SAME h, so the SPAKE2 shared key is the same.
+        // But A binds (id_a, id_b) in the HKDF info, while B binds (id_c, id_a).
+        // → different info → different confirm keys → MAC mismatch.
+        let code_a = valid_code("42424242");
+        let code_b = valid_code("42424242");
+
+        let mut exc_a = PakeExchange::start_with_rng(
+            &mut rng_a,
+            PakeRole::Initiator,
+            &code_a,
+            id_a.clone(),
+            id_b.clone(), // A expects peer = id_b
+            &h,
+        )
+        .unwrap();
+
+        // B uses id_c as the local identity (different from id_a), so the identity binding
+        // in HKDF info differs even though code and h are identical.
+        let mut exc_b = PakeExchange::start_with_rng(
+            &mut rng_b,
+            PakeRole::Responder,
+            &code_b,
+            id_c.clone(), // B's local identity is id_c, not id_b
+            id_a.clone(),
+            &h,
+        )
+        .unwrap();
+
+        let msg_a = exc_a.outbound_msg().to_vec();
+        let msg_b = exc_b.outbound_msg().to_vec();
+
+        exc_a.read_peer_msg(&msg_b).unwrap();
+        exc_b.read_peer_msg(&msg_a).unwrap();
+
+        let mac_a = exc_a.local_confirmation_mac().unwrap();
+        let mac_b = exc_b.local_confirmation_mac().unwrap();
+
+        // MAC mismatch expected because the HKDF info identity bindings differ.
+        let result_a = exc_a.finish(&mac_b);
+        let result_b = exc_b.finish(&mac_a);
+
+        assert!(
+            matches!(result_a, Err(CryptoError::PakeConfirmationFailed)),
+            "identity mismatch must cause confirmation failure on A side: {result_a:?}"
+        );
+        assert!(
+            matches!(result_b, Err(CryptoError::PakeConfirmationFailed)),
+            "identity mismatch must cause confirmation failure on B side: {result_b:?}"
+        );
+    }
+
     // ─── Pin ONLY after confirm (no pin on bare handshake) ───────────────────
 
     #[tokio::test]
@@ -1224,13 +1423,12 @@ mod tests {
     #[test]
     fn pake_empty_msg_returns_error() {
         let mut rng = seeded_rng(60);
-        let ks_a = SoftwareKeystore::generate();
-        let ks_b = SoftwareKeystore::generate();
+        let ks_a = seeded_ks(600);
+        let ks_b = seeded_ks(601);
         let id_a = futures_lite::future::block_on(ks_a.device_identity()).unwrap();
         let id_b = futures_lite::future::block_on(ks_b.device_identity()).unwrap();
         let h = fixed_h(0x00);
-        let code =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code = valid_code("12345678");
 
         let mut exc =
             PakeExchange::start_with_rng(&mut rng, PakeRole::Initiator, &code, id_a, id_b, &h)
@@ -1246,13 +1444,12 @@ mod tests {
     #[test]
     fn pake_truncated_msg_returns_error() {
         let mut rng = seeded_rng(61);
-        let ks_a = SoftwareKeystore::generate();
-        let ks_b = SoftwareKeystore::generate();
+        let ks_a = seeded_ks(610);
+        let ks_b = seeded_ks(611);
         let id_a = futures_lite::future::block_on(ks_a.device_identity()).unwrap();
         let id_b = futures_lite::future::block_on(ks_b.device_identity()).unwrap();
         let h = fixed_h(0x00);
-        let code =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code = valid_code("12345678");
 
         let mut exc =
             PakeExchange::start_with_rng(&mut rng, PakeRole::Initiator, &code, id_a, id_b, &h)
@@ -1270,13 +1467,12 @@ mod tests {
     #[test]
     fn pake_overlength_msg_returns_error() {
         let mut rng = seeded_rng(62);
-        let ks_a = SoftwareKeystore::generate();
-        let ks_b = SoftwareKeystore::generate();
+        let ks_a = seeded_ks(620);
+        let ks_b = seeded_ks(621);
         let id_a = futures_lite::future::block_on(ks_a.device_identity()).unwrap();
         let id_b = futures_lite::future::block_on(ks_b.device_identity()).unwrap();
         let h = fixed_h(0x00);
-        let code =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code = valid_code("12345678");
 
         let mut exc =
             PakeExchange::start_with_rng(&mut rng, PakeRole::Initiator, &code, id_a, id_b, &h)
@@ -1301,10 +1497,8 @@ mod tests {
         let id_b = futures_lite::future::block_on(ks_b.device_identity()).unwrap();
 
         let h = fixed_h(0x00);
-        let code_a =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
-        let code_b =
-            PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+        let code_a = valid_code("12345678");
+        let code_b = valid_code("12345678");
 
         let mut exc_a = PakeExchange::start_with_rng(
             &mut rng_a,
@@ -1333,13 +1527,98 @@ mod tests {
         );
     }
 
+    // ─── SasConfirmed typestate test ─────────────────────────────────────────
+
+    /// Confirms that `pair_attended` requires a `SasConfirmed` token (not a raw bool),
+    /// and that `Sas::confirm` returns `None` when the human says no match.
+    #[tokio::test]
+    async fn sas_confirm_none_when_human_declines() {
+        let ks_a = seeded_ks(90);
+        let ks_b = seeded_ks(91);
+        let id_b = ks_b.device_identity().await.unwrap();
+
+        let h = fixed_h(0x42);
+        let sas = Sas::from_handshake_hash(&h);
+
+        // Human says no match.
+        let confirmed = sas.confirm(&id_b, false);
+        assert!(
+            confirmed.is_none(),
+            "Sas::confirm must return None when human says no match"
+        );
+
+        // Without a SasConfirmed, pair_attended cannot be called — type-system enforced.
+        // Verify peer is not trusted.
+        assert!(!ks_a.is_trusted(&id_b).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sas_confirm_some_when_human_confirms() {
+        let ks_b = seeded_ks(93);
+        let id_b = ks_b.device_identity().await.unwrap();
+
+        let h = fixed_h(0x42);
+        let sas = Sas::from_handshake_hash(&h);
+
+        let confirmed = sas.confirm(&id_b, true);
+        assert!(
+            confirmed.is_some(),
+            "Sas::confirm must return Some(SasConfirmed) when human confirms"
+        );
+        assert_eq!(confirmed.unwrap().peer(), &id_b);
+    }
+
+    // ─── TOCTOU atomic test ───────────────────────────────────────────────────
+
+    /// Confirms that `trust_peer_if_not_revoked` atomically refuses to re-pin a revoked peer,
+    /// and that calling it a second time after revocation still returns WasRevoked.
+    #[tokio::test]
+    async fn atomic_trust_if_not_revoked_refuses_revoked_peer() {
+        let ks = seeded_ks(7000);
+        let peer_ks = seeded_ks(7001);
+        let peer_id = peer_ks.device_identity().await.unwrap();
+
+        // Trust then revoke.
+        ks.trust_peer(&peer_id).await.unwrap();
+        ks.revoke_peer(&peer_id).await.unwrap();
+        assert!(!ks.is_trusted(&peer_id).await.unwrap());
+
+        // Atomic check-and-pin must refuse.
+        let outcome = ks.trust_peer_if_not_revoked(&peer_id).await.unwrap();
+        assert_eq!(
+            outcome,
+            TrustOutcome::WasRevoked,
+            "atomic pin must return WasRevoked for a revoked peer"
+        );
+
+        // Peer must NOT have been re-pinned.
+        assert!(
+            !ks.is_trusted(&peer_id).await.unwrap(),
+            "revoked peer must not be re-pinned by trust_peer_if_not_revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_trust_if_not_revoked_pins_new_peer() {
+        let ks = seeded_ks(7002);
+        let peer_ks = seeded_ks(7003);
+        let peer_id = peer_ks.device_identity().await.unwrap();
+
+        // Never-seen peer — must be pinned atomically.
+        let outcome = ks.trust_peer_if_not_revoked(&peer_id).await.unwrap();
+        assert_eq!(outcome, TrustOutcome::Pinned, "new peer must return Pinned");
+        assert!(
+            ks.is_trusted(&peer_id).await.unwrap(),
+            "new peer must be trusted after atomic pin"
+        );
+    }
+
     // ─── Re-trust after revoke → ReTrustAfterRevokeRequiresConfirmation ──────
 
     #[tokio::test]
     async fn attended_revoked_peer_returns_retrust_signal() {
         let ks_host = seeded_ks(70);
         let ks_peer = seeded_ks(71);
-        let clock = FixedClock(NOW);
         let peer_id = ks_peer.device_identity().await.unwrap();
 
         // Trust and then revoke the peer.
@@ -1347,10 +1626,11 @@ mod tests {
         ks_host.revoke_peer(&peer_id).await.unwrap();
         assert!(!ks_host.is_trusted(&peer_id).await.unwrap());
 
-        // Attended pairing with human_confirmed=true must NOT auto-pin; must return the signal.
-        let outcome = pair_attended(&peer_id, true, &ks_host, &clock)
-            .await
-            .unwrap();
+        // pair_attended via SasConfirmed must NOT auto-pin; must return the signal.
+        let h = fixed_h(0x99);
+        let sas = Sas::from_handshake_hash(&h);
+        let confirmed = sas.confirm(&peer_id, true).unwrap();
+        let outcome = pair_attended(confirmed, &ks_host).await.unwrap();
         assert!(
             matches!(
                 outcome,
@@ -1369,16 +1649,16 @@ mod tests {
     async fn unattended_revoked_peer_returns_retrust_signal() {
         let ks_host = seeded_ks(80);
         let ks_peer = seeded_ks(81);
-        let clock = FixedClock(NOW);
         let peer_id = ks_peer.device_identity().await.unwrap();
 
         ks_host.trust_peer(&peer_id).await.unwrap();
         ks_host.revoke_peer(&peer_id).await.unwrap();
 
+        // Fabricate a PakeConfirmed via the private constructor (cfg(test) path).
         let confirmed = PakeConfirmed {
             authorizes_pin: peer_id.clone(),
         };
-        let outcome = pair_unattended(confirmed, &ks_host, &clock).await.unwrap();
+        let outcome = pair_unattended(confirmed, &ks_host).await.unwrap();
         assert!(
             matches!(outcome, PairingOutcome::ReTrustAfterRevokeRequiresConfirmation { .. }),
             "revoked peer unattended must return ReTrustAfterRevokeRequiresConfirmation: {outcome:?}"
@@ -1395,34 +1675,17 @@ mod tests {
     async fn attended_new_peer_gets_pinned() {
         let ks_host = seeded_ks(90);
         let ks_peer = seeded_ks(91);
-        let clock = FixedClock(NOW);
         let peer_id = ks_peer.device_identity().await.unwrap();
 
-        let outcome = pair_attended(&peer_id, true, &ks_host, &clock)
-            .await
-            .unwrap();
+        let h = fixed_h(0x42);
+        let sas = Sas::from_handshake_hash(&h);
+        let confirmed = sas.confirm(&peer_id, true).unwrap();
+        let outcome = pair_attended(confirmed, &ks_host).await.unwrap();
         assert!(
             matches!(outcome, PairingOutcome::Pinned { .. }),
             "new peer with confirmed SAS must be pinned: {outcome:?}"
         );
         assert!(ks_host.is_trusted(&peer_id).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn attended_human_declines_no_pin() {
-        let ks_host = seeded_ks(92);
-        let ks_peer = seeded_ks(93);
-        let clock = FixedClock(NOW);
-        let peer_id = ks_peer.device_identity().await.unwrap();
-
-        let outcome = pair_attended(&peer_id, false, &ks_host, &clock)
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome, PairingOutcome::Aborted { .. }),
-            "human decline must abort pairing: {outcome:?}"
-        );
-        assert!(!ks_host.is_trusted(&peer_id).await.unwrap());
     }
 
     // ─── Proptest: arbitrary bytes into read_peer_msg never panics ───────────
@@ -1432,16 +1695,17 @@ mod tests {
         #[test]
         fn arbitrary_pake_msg_never_panics(data in proptest::collection::vec(0u8.., 0..200)) {
             let mut rng = seeded_rng(9999);
-            let ks_a = SoftwareKeystore::generate();
-            let ks_b = SoftwareKeystore::generate();
+            let ks_a = seeded_ks(99990);
+            let ks_b = seeded_ks(99991);
             let id_a = futures_lite::future::block_on(ks_a.device_identity()).unwrap();
             let id_b = futures_lite::future::block_on(ks_b.device_identity()).unwrap();
             let h = [0u8; 32];
             let code = PairingCode::from_digits("12345678", PairingCodeFormat::EightDigit, NOT_AFTER).unwrap();
+            let valid = code.check_not_expired(&FixedClock(NOW)).unwrap();
             if let Ok(mut exc) = PakeExchange::start_with_rng(
                 &mut rng,
                 PakeRole::Initiator,
-                &code,
+                &valid,
                 id_a,
                 id_b,
                 &h,

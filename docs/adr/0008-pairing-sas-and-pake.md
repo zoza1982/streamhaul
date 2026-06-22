@@ -159,10 +159,12 @@ PAKE between the legitimate enroller and a *different* attacker device. We bind 
 and session three ways:
 
 1. **Identity-bound associated data.** The SPAKE2 run uses an `id_a` / `id_b` that are the two
-   devices' **Ed25519 `device_id` fingerprints** (raw 32-byte digests, ADR-0006). SPAKE2 mixes these
-   identifiers into its transcript hash, so a confirmed shared key is produced **only** if both sides
-   agree on the *identities* as well as the code. A relay that swaps in its own identity produces a
-   key-confirmation mismatch → abort.
+   devices' **Ed25519 `device_id` fingerprints encoded as 64-character hex strings** (ADR-0006).
+   Hex encoding is an injective (length-doubling, one-to-one) encoding of the underlying 32-byte
+   SHA-256 digest; it is security-equivalent to using the raw digest while avoiding an extra
+   decode step. SPAKE2 mixes these identifiers into its transcript hash, so a confirmed shared key
+   is produced **only** if both sides agree on the *identities* as well as the code. A relay that
+   swaps in its own identity produces a key-confirmation mismatch → abort.
 2. **Channel-binding to the Noise run.** The PAKE is executed **inside the established Noise tunnel**
    (after `Noise_XK` completes), and the PAKE's final **key-confirmation MAC additionally covers the
    Noise `handshake_hash` `h`** (via the confirmation `info`). This binds "knows the code" to "is the

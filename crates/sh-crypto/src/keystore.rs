@@ -21,7 +21,7 @@
 
 use async_trait::async_trait;
 
-use crate::{CryptoError, DeviceIdentity, Signature};
+use crate::{pairing::TrustOutcome, CryptoError, DeviceIdentity, Signature};
 
 /// Async interface for Ed25519 device identity and TOFU trust management.
 ///
@@ -148,4 +148,39 @@ pub trait Keystore: Send + Sync + 'static {
     ///
     /// - [`CryptoError::Backend`] if the trust store cannot be read.
     async fn was_peer_revoked(&self, id: &DeviceIdentity) -> Result<bool, CryptoError>;
+
+    /// Atomically checks whether `id` is revoked and, if not, pins it as trusted.
+    ///
+    /// This operation performs both the revocation check **and** the pin under a single
+    /// write-lock acquisition, eliminating the TOCTOU race that would exist between a
+    /// separate `was_peer_revoked` read and a `trust_peer` write.
+    ///
+    /// # Returns
+    ///
+    /// - [`TrustOutcome::Pinned`] if the peer was not revoked and has been pinned (or was
+    ///   already pinned). The peer is trusted after this call.
+    /// - [`TrustOutcome::WasRevoked`] if the peer was previously revoked. The pin is
+    ///   **refused**; `is_trusted` still returns `false`. The caller must surface
+    ///   [`PairingOutcome::ReTrustAfterRevokeRequiresConfirmation`](crate::pairing::PairingOutcome::ReTrustAfterRevokeRequiresConfirmation)
+    ///   to the operator and require an explicit separate confirmation before calling
+    ///   [`trust_peer`](Self::trust_peer) directly.
+    ///
+    /// # Atomicity requirement
+    ///
+    /// Implementations MUST perform the revocation check and the pin under the same
+    /// exclusive lock (or an equivalent single critical section). A two-step
+    /// read-then-write is NOT acceptable — a concurrent `revoke_peer` between the check
+    /// and the pin would silently re-trust the revoked peer.
+    ///
+    /// # Errors
+    ///
+    /// - [`CryptoError::Backend`] if the trust store cannot be read or written.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    async fn trust_peer_if_not_revoked(
+        &self,
+        id: &DeviceIdentity,
+    ) -> Result<TrustOutcome, CryptoError>;
 }
