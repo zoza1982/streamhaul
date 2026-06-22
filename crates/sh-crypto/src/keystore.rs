@@ -135,4 +135,17 @@ pub trait Keystore: Send + Sync + 'static {
     ///
     /// - [`CryptoError::Backend`] if the revocation state cannot be persisted.
     async fn revoke_peer(&self, id: &DeviceIdentity) -> Result<(), CryptoError>;
+
+    /// Returns `true` if `id` was explicitly revoked (and has not been re-trusted since).
+    ///
+    /// This distinguishes "never seen" from "revoked" peers — both return `false` from
+    /// [`is_trusted`](Self::is_trusted), but the pairing layer needs to know if a peer was
+    /// revoked in order to gate re-trust behind an explicit operator confirmation (R-HW-KS,
+    /// ADR-0008 §3). A "never seen" peer may be silently pinned on first pairing; a revoked
+    /// peer requires a distinct explicit confirmation before re-pinning.
+    ///
+    /// # Errors
+    ///
+    /// - [`CryptoError::Backend`] if the trust store cannot be read.
+    async fn was_peer_revoked(&self, id: &DeviceIdentity) -> Result<bool, CryptoError>;
 }

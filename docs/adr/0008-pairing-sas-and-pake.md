@@ -1,6 +1,6 @@
 # ADR 0008: Pairing — SAS from the Noise handshake hash, TOFU pinning, and SPAKE2 PAKE codes
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 - **Deciders:** security-engineer, rust-staff-engineer, code-reviewer
 - **Builds on:** ADR-0005 (SHA-256 Noise hash), ADR-0006 (Ed25519 trust root, `Keystore`

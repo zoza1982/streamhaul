@@ -57,6 +57,34 @@ handshakes. It has not been independently audited as of P3-2. Mitigations:
 
 A full third-party audit of `snow` is a **blocking requirement before production GA**.
 
+### `spake2` (PAKE for unattended pairing, P3-3)
+
+| Property | Status |
+|----------|--------|
+| Version pinned | Yes — `spake2 = "=0.4.0"` (exact-pinned per CLAUDE.md §7) |
+| Known advisory | None in RustSec database as of P3-3 (`cargo audit` clean) |
+| Independent audit | **NOT YET** — pre-GA item (Risk Register: `R-SPAKE2-AUDIT`) |
+| Wrapper isolation | Yes — all `spake2` types are wrapped behind `PakeExchange`; raw `spake2` types never appear in the public API |
+| Fuzzing | Yes — `crates/sh-crypto/fuzz/fuzz_targets/pake_msg_parse.rs` and `pairing_code_parse.rs` |
+| curve25519-dalek | Unified with existing workspace `curve25519-dalek v4.1.3`; `cargo tree -i curve25519-dalek` confirms a **single version** |
+
+`spake2` provides the SPAKE2 balanced PAKE (Abdalla–Pointcheval) over `Ed25519Group`
+(Curve25519). It carries the disclaimer "USE AT YOUR OWN RISK" and has not been independently
+audited. Mitigations:
+
+- All `spake2` types are wrapped behind `PakeExchange`; no raw `spake2` API surface is public.
+- An **explicit HKDF-SHA-256 key-confirmation MAC** is layered over the SPAKE2 output, binding
+  the shared key to both device identities AND the Noise handshake hash `h` (ADR-0008 §2.3,
+  open-risk #1). Even if `spake2`'s internal MAC has a bug, this explicit confirmation catches it.
+- The two fuzz targets guard against panics in `spake2`'s wire parser and in our pairing-code
+  parser for all possible byte inputs.
+- Any `spake2` version upgrade requires a security review before merge.
+- The `curve25519-dalek` dependency of `spake2` is the **same v4.1.3** already present via
+  `ed25519-dalek` and `x25519-dalek` — no duplicate or conflicting curve library.
+
+A full third-party audit of `spake2` is a **blocking requirement before production GA** for
+the unattended pairing path. This is tracked as Risk Register item `R-SPAKE2-AUDIT`.
+
 ### `ed25519-dalek` and `x25519-dalek`
 
 Both have been reviewed by the Dalek developers and are widely deployed. `verify_strict` is

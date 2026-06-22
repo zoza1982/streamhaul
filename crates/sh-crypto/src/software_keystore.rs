@@ -256,6 +256,17 @@ impl Keystore for SoftwareKeystore {
         inner.peers.insert(fp, TrustState::Revoked);
         Ok(())
     }
+
+    async fn was_peer_revoked(&self, id: &DeviceIdentity) -> Result<bool, CryptoError> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| CryptoError::Backend("trust store lock poisoned".into()))?;
+        Ok(matches!(
+            inner.peers.get(Self::fp(id)),
+            Some(TrustState::Revoked)
+        ))
+    }
 }
 
 #[cfg(test)]
