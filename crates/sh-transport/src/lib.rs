@@ -26,6 +26,7 @@ mod error;
 mod insecure;
 
 pub mod channel;
+pub mod quic_binding;
 
 pub use channel::{Channel, ChannelSpec, QuicTransport, Reliability, Transport, MAX_FRAME_LEN};
 pub use connection::Connection;

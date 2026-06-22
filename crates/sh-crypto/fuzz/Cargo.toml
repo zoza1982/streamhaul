@@ -13,6 +13,9 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+tokio = { version = "1", features = ["rt"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
 
 [dependencies.sh-crypto]
 path = ".."
@@ -27,6 +30,20 @@ bench = false
 [[bin]]
 name = "identity_decode"
 path = "fuzz_targets/identity_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bindcert_decode"
+path = "fuzz_targets/bindcert_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "noise_handshake_read"
+path = "fuzz_targets/noise_handshake_read.rs"
 test = false
 doc = false
 bench = false

@@ -28,6 +28,12 @@ tracing.workspace = true
 
 # Typed error construction.
 thiserror.workspace = true
+snow.workspace = true
+x25519-dalek.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # Property-based testing: arbitrary messages must sign+verify; arbitrary bytes

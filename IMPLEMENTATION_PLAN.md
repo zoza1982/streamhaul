@@ -126,12 +126,12 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | ID | Task | Crates | Depends | Agent | Tests | Status | PR |
 |----|------|--------|---------|-------|-------|:------:|----|
 | P3-1 | `sh-crypto`: Ed25519 device identity + `Keystore` trait + platform keystores (TPM/Keychain/DPAPI) | sh-crypto | P0 | security-engineer, rust-staff-engineer | unit + keystore mocks | 🟡 | #28 |
-| P3-2 | Noise tunnel (`snow`, `Noise_XK` pair / `Noise_IK` connect) + identity-bound `BindCert` | sh-crypto, sh-transport | P3-1 | security-engineer | handshake unit + **fuzz** | ☐ | |
+| P3-2 | Noise tunnel (`snow`, `Noise_XK` pair / `Noise_IK` connect) + identity-bound `BindCert` | sh-crypto, sh-transport | P3-1 | security-engineer | handshake unit + **fuzz** | ✅ | #29 |
 | P3-3 | TOFU pinning + SAS (from Noise hash) + PAKE pairing codes (SPAKE2/OPAQUE) | sh-crypto | P3-2 | security-engineer | MITM-rejection test | ☐ | |
 | P3-4 | Channel encryption + key hierarchy + rotation (PFS ephemerals, rekey, channel subkeys) | sh-crypto, sh-transport | P3-2 | security-engineer | rotation test; negative tests | ☐ | |
 | P3-5 | Authorization (capability mask, host-enforced, non-escalatable) + kill-switch (RAM key zeroize) | sh-core | P3-4 | security-engineer | cap-guard + kill-switch test | ☐ | |
 
-**Gate P3:** 🟡 TOFU pins on first pair (P3-1: software-backed, hardware deferred) · ☐ unpinned-key MITM rejected · ☐ all channels E2E · ☐ rotation + kill-switch verified. **Progress: 1/5 tasks (P3-1 🟡 — identity + trait + SW keystore delivered; TPM/Keychain/DPAPI/StrongBox deferred as R-HW-KS).**
+**Gate P3:** 🟡 TOFU pins on first pair (P3-1: software-backed, hardware deferred) · ✅ unpinned-key MITM rejected (P3-2) · ☐ all channels E2E · ☐ rotation + kill-switch verified. **Progress: 2/5 tasks (P3-1 🟡 — identity + trait + SW keystore delivered; TPM/Keychain/DPAPI/StrongBox deferred as R-HW-KS. P3-2 ✅ — Noise handshake + BindCert + 6-check verification + fuzz).**
 
 ---
 
