@@ -29,8 +29,12 @@
 //!
 //! ## Backpressure policy
 //!
-//! The [`BackpressurePolicy`] controls what happens when the encoder is busy (e.g. its internal
-//! queue is full or the pipeline is momentarily saturated):
+//! [`BackpressurePolicy`] is a **pure advisory selector**: it tells the pipeline which queue
+//! discipline to apply for the current [`ContentMode`].  The actual bounded-queue enforcement
+//! (drop-oldest or skip-current) lives in the pipeline stage described in LLD §5.4.
+//! [`DoubleBufferedEncoder::encode`] does not perform backpressure itself; it submits frames
+//! unconditionally.  The pipeline reads [`DoubleBufferedEncoder::backpressure_policy`] and applies
+//! the correct drop logic before calling `encode`.
 //!
 //! | [`ContentMode`] | Policy | Rationale |
 //! |----------------|--------|-----------|
@@ -41,11 +45,11 @@
 //! ## NVENC session limit (R6)
 //!
 //! Consumer NVENC drivers limit concurrent encoder sessions to **3–5** (GeForce/consumer GPUs).
-//! [`SessionLimiter`] tracks the live count with an `Arc<AtomicU32>`.  During the double-buffer
-//! overlap both the old and new encoder hold a slot, so the limit must be ≥ 2 for glitch-free
-//! swap.  If `max_sessions` is 1 (e.g. an extremely constrained environment), the swap returns
-//! [`ModeSwitchError::NoSessionAvailable`] and the old encoder is retained intact — the caller can
-//! retry after freeing capacity.
+//! [`SessionLimiter`] wraps a [`tokio::sync::Semaphore`] with a fixed number of permits.  During
+//! the double-buffer overlap both the old and new encoder hold a slot, so the limit must be ≥ 2
+//! for glitch-free swap.  If `max_sessions` is 1 (e.g. an extremely constrained environment), the
+//! swap returns [`ModeSwitchError::NoSessionAvailable`] and the old encoder is retained intact —
+//! the caller can retry after freeing capacity.
 //!
 //! ## Deferred
 //!
@@ -54,11 +58,11 @@
 //! the crate root.  The orchestration logic here is fully portable and is exercised against the
 //! [`RawEncoder`] test backend.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use sh_adaptive::classifier::ContentMode;
-use sh_media::{EncoderConfig, MediaError, VideoEncoder};
+use sh_media::{EncodedPacket, EncoderConfig, MediaError, VideoEncoder};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::RawEncoder;
 
@@ -75,7 +79,7 @@ pub enum ModeSwitchError {
     NoSessionAvailable {
         /// Maximum concurrent sessions this limiter permits.
         limit: u32,
-        /// Number of sessions currently in use.
+        /// Number of sessions currently in use at the moment of the failed acquire.
         active: u32,
     },
 
@@ -86,17 +90,57 @@ pub enum ModeSwitchError {
     FactoryError(#[from] MediaError),
 }
 
+// ── SwitchOutcome ─────────────────────────────────────────────────────────────
+
+/// The outcome of a successful [`DoubleBufferedEncoder::switch_to`] call.
+///
+/// A `SwitchOutcome` is returned when the swap itself succeeded (new encoder is live).
+/// It carries the tail packets drained from the old encoder and — separately — whether
+/// the old encoder's drain itself succeeded.  This distinction matters because the swap
+/// is a two-phase operation:
+///
+/// * Phase 1 (the swap): could fail with [`ModeSwitchError`].  If it does, `switch_to`
+///   returns `Err` and the old encoder is retained untouched.
+/// * Phase 2 (the drain): can only run after a successful swap.  If the drain fails the
+///   new encoder is already live and cannot be rolled back.  We surface the failure via
+///   `flush_error` so callers can log/metric it without conflating it with a swap failure.
+///
+/// ## What to do with each field
+///
+/// * `tail_packets` — forward to the viewer *before* the new IDR arrives so the stream
+///   has no gap.  May be empty for encoders that buffer nothing internally (e.g. [`RawEncoder`]).
+/// * `flush_error` — log or increment a metric.  There is nothing the caller can do to
+///   recover lost tail frames; this field is informational.
+#[derive(Debug)]
+pub struct SwitchOutcome {
+    /// Packets drained from the old encoder after the swap.
+    ///
+    /// These are valid packets from *before* the switch point; the caller should forward
+    /// them to the viewer before the new IDR packet.  Empty when the drain failed
+    /// (see [`flush_error`](Self::flush_error)) or when the old encoder had no buffered frames.
+    pub tail_packets: Vec<EncodedPacket>,
+
+    /// Error from the old encoder's `flush`, if any.
+    ///
+    /// `None` when the drain succeeded (even if it produced zero packets).
+    /// `Some(e)` when `flush()` returned an error and tail frames may be lost.
+    ///
+    /// The new encoder is live regardless of this field.
+    pub flush_error: Option<MediaError>,
+}
+
 // ── SessionLimiter ────────────────────────────────────────────────────────────
 
 /// Tracks the number of concurrent hardware encoder sessions.
 ///
 /// On consumer NVENC GPUs the driver enforces a limit of **3–5** simultaneous encode sessions
-/// per process.  This limiter tracks the live count with an [`AtomicU32`]; a new session is only
-/// allocated when the count is below `max_sessions`.  During a double-buffer swap both the old
-/// and new encoder hold a slot, so the max should be ≥ 2 for glitch-free operation (the default
-/// of 4 is a safe choice for NVENC consumer SKUs where the limit is typically 5).
+/// per process.  This limiter wraps a [`tokio::sync::Semaphore`] — a vetted, sound primitive —
+/// so hand-rolled atomic CAS loops and the associated `loom` testing burden are unnecessary.
 ///
-/// [`SessionGuard`] is the RAII handle that holds a slot; it releases it on drop.
+/// `try_acquire` is non-blocking: it either returns an [`OwnedSemaphorePermit`]-backed
+/// [`SessionGuard`] immediately or returns `None` without parking.  No async runtime is required.
+///
+/// [`SessionGuard`] is the RAII handle that holds one permit; it releases it on drop.
 ///
 /// # Examples
 ///
@@ -111,7 +155,7 @@ pub enum ModeSwitchError {
 /// ```
 #[derive(Debug, Clone)]
 pub struct SessionLimiter {
-    counter: Arc<AtomicU32>,
+    semaphore: Arc<Semaphore>,
     max_sessions: u32,
 }
 
@@ -129,7 +173,7 @@ impl SessionLimiter {
     #[must_use]
     pub fn new(max_sessions: u32) -> Self {
         Self {
-            counter: Arc::new(AtomicU32::new(0)),
+            semaphore: Arc::new(Semaphore::new(max_sessions as usize)),
             max_sessions,
         }
     }
@@ -137,10 +181,8 @@ impl SessionLimiter {
     /// Attempt to acquire one session slot, returning a [`SessionGuard`] on success.
     ///
     /// Returns `None` when the current active count equals `max_sessions`.  The operation is
-    /// lock-free: it uses a compare-and-swap loop to increment the counter only if it is below the
-    /// limit.  The CAS loop is wait-free under non-contention (the common case — encoder session
-    /// creation is serialized by the pipeline) and terminates in bounded iterations under
-    /// contention (at most `max_sessions` iterations before all slots are observed full).
+    /// non-blocking: it calls `try_acquire_owned` on the underlying [`Semaphore`] and returns
+    /// immediately.  No async runtime or thread parking occurs.
     ///
     /// # Examples
     ///
@@ -155,38 +197,27 @@ impl SessionLimiter {
     /// ```
     #[must_use]
     pub fn try_acquire(&self) -> Option<SessionGuard> {
-        // CAS loop: increment only if counter < max_sessions.
-        loop {
-            let current = self.counter.load(Ordering::Acquire);
-            if current >= self.max_sessions {
-                return None;
-            }
-            // Attempt to go from `current` → `current + 1`.
-            // Use `current.saturating_add(1)` to avoid any arithmetic overflow (the value is
-            // bounded by `max_sessions` so overflow is not reachable in practice, but
-            // saturating_add removes any doubt and satisfies the arithmetic_side_effects lint).
-            let next = current.saturating_add(1);
-            match self
-                .counter
-                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => {
-                    return Some(SessionGuard {
-                        counter: Arc::clone(&self.counter),
-                    })
-                }
-                Err(_) => {
-                    // Another thread raced; retry.
-                    continue;
-                }
-            }
-        }
+        // Semaphore::try_acquire_owned is non-blocking: returns Ok(permit) if a permit is
+        // available, or Err(TryAcquireError::NoPermits) if the semaphore is exhausted.
+        // We use try_acquire_owned (rather than try_acquire) so the OwnedSemaphorePermit is
+        // 'static / Send — it holds an Arc<Semaphore> internally and can be stored in structs
+        // and moved across threads without lifetime annotations.
+        Arc::clone(&self.semaphore)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| SessionGuard { _permit: permit })
     }
 
     /// Current number of active sessions.  Useful for tests and diagnostics.
+    ///
+    /// Computed as `max_sessions - available_permits()`.
     #[must_use]
     pub fn active_sessions(&self) -> u32 {
-        self.counter.load(Ordering::Acquire)
+        // available_permits() is the number of permits *not* currently held.
+        // We cast via u32: max_sessions <= usize::MAX on all supported platforms.
+        #[allow(clippy::cast_possible_truncation)]
+        let available = self.semaphore.available_permits() as u32;
+        self.max_sessions.saturating_sub(available)
     }
 
     /// Maximum sessions this limiter permits.
@@ -200,33 +231,27 @@ impl SessionLimiter {
 
 /// RAII guard that holds one encoder session slot in a [`SessionLimiter`].
 ///
-/// Decrements the counter on drop.  Dropping a `SessionGuard` is always safe and does not panic.
+/// Releases the slot back to the semaphore on drop.  Dropping a `SessionGuard` is always safe
+/// and does not panic — the [`OwnedSemaphorePermit`] handles the release atomically.
 #[derive(Debug)]
 pub struct SessionGuard {
-    counter: Arc<AtomicU32>,
-}
-
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        // Saturating sub: should never underflow (we only create guards by incrementing), but
-        // saturating avoids any theoretical panic if a guard is somehow double-dropped in tests.
-        let prev = self
-            .counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
-                Some(v.saturating_sub(1))
-            });
-        // fetch_update with an infallible closure (always returns Some) never returns Err.
-        let _ = prev;
-    }
+    // The OwnedSemaphorePermit releases exactly one permit on drop — sound, no manual bookkeeping.
+    _permit: OwnedSemaphorePermit,
 }
 
 // ── BackpressurePolicy ────────────────────────────────────────────────────────
 
-/// What to do when the encoder pipeline is saturated and a new frame arrives.
+/// Advisory selector for the backpressure discipline to apply at a given [`ContentMode`].
 ///
-/// This is a pure descriptor — the *mechanism* (bounded queue, frame drop) lives in the
-/// transport/pipeline layer.  `DoubleBufferedEncoder` exposes the policy so the caller can
-/// implement the correct queue discipline.
+/// This type is a **pure selector** — it carries no queue or enforcement mechanism itself.
+/// The actual bounded-queue enforcement (drop-oldest or skip-current) is the pipeline's
+/// responsibility (LLD §5.4 pipeline stages).  The pipeline calls
+/// [`DoubleBufferedEncoder::backpressure_policy`] to discover the current policy and applies
+/// the correct drop logic *before* submitting a frame to
+/// [`DoubleBufferedEncoder::encode`].
+///
+/// `DoubleBufferedEncoder::encode` never blocks and never drops frames by itself — if the
+/// pipeline skips calling `encode` based on this policy, that is the enforcement.
 ///
 /// # Selection by mode
 ///
@@ -291,8 +316,9 @@ impl BackpressurePolicy {
 
 /// A factory function that constructs a new [`VideoEncoder`] from an [`EncoderConfig`].
 ///
-/// Using a `FnMut` closure (rather than a trait object) keeps the seam simple and avoids an
-/// extra heap allocation for the factory itself.  The tests pass a closure that returns a
+/// Using a `FnMut` closure offers ergonomic capture of backend state (e.g. device handles)
+/// compared with a named trait object.  The trade-off: closures are harder to name in
+/// signatures and do not implement `Debug`.  The tests pass a closure that returns a
 /// [`RawEncoder`]; the production NVENC backend slots in a closure that calls
 /// `NvencEncoder::new(config)`.
 ///
@@ -345,13 +371,13 @@ pub fn raw_encoder_factory() -> EncoderFactory {
 /// DoubleBufferedEncoder::new(config, mode, factory, limiter)
 ///   │
 ///   ├─ encode(&frame)  ─────────────────────────────────▶ Option<EncodedPacket>
-///   │                                                     (backpressure via policy)
+///   │                  Pipeline applies backpressure_policy() before calling encode.
 ///   │
 ///   └─ switch_to(new_config, new_mode)
 ///        │
-///        ├─ 1. try_acquire() new slot  ── fail ──▶ NoSessionAvailable (old retained)
+///        ├─ 1. try_acquire() new slot  ── fail ──▶ Err(NoSessionAvailable) (old retained)
 ///        │
-///        ├─ 2. factory(new_config)     ── fail ──▶ FactoryError (slot released, old retained)
+///        ├─ 2. factory(new_config)     ── fail ──▶ Err(FactoryError) (slot released, old retained)
 ///        │
 ///        ├─ 3. request_keyframe() + [prime on next encode call]
 ///        │      The new encoder's first packet MUST be IDR so the stream is decodable from
@@ -360,7 +386,9 @@ pub fn raw_encoder_factory() -> EncoderFactory {
 ///        │
 ///        ├─ 4. swap active encoder (old ← new)
 ///        │
-///        └─ 5. flush() old encoder (drain tail frames) then drop (releases old slot)
+///        └─ 5. flush() old encoder (drain tail frames) → Ok(SwitchOutcome)
+///               SwitchOutcome.tail_packets = drained frames (forward to viewer)
+///               SwitchOutcome.flush_error  = Some(e) if drain itself failed
 /// ```
 ///
 /// ## Slot ordering invariant
@@ -457,6 +485,9 @@ impl DoubleBufferedEncoder {
     }
 
     /// Return the current [`BackpressurePolicy`] for this mode.
+    ///
+    /// The pipeline calls this method to determine the correct frame-drop discipline before
+    /// submitting frames to [`encode`](Self::encode).  `encode` itself is unconditional.
     #[must_use]
     pub fn backpressure_policy(&self) -> BackpressurePolicy {
         BackpressurePolicy::for_mode(self.current_mode)
@@ -464,10 +495,14 @@ impl DoubleBufferedEncoder {
 
     /// Encode one frame, routing it through the active encoder.
     ///
-    /// The caller is responsible for implementing the [`BackpressurePolicy`] returned by
-    /// [`Self::backpressure_policy`].  `encode` itself never blocks — it submits the frame to
-    /// the active encoder and returns whatever the encoder produces (which may be `None` for
-    /// pipelined hardware encoders that buffer frames internally).
+    /// This method is **unconditional** — it always submits the frame to the encoder.  The
+    /// caller is responsible for implementing the [`BackpressurePolicy`] returned by
+    /// [`Self::backpressure_policy`] *before* calling this method: if the policy is
+    /// [`BackpressurePolicy::SkipCurrent`] and the encoder is busy, the caller should skip the
+    /// `encode` call entirely.  If the policy is [`BackpressurePolicy::DropOldest`], the caller
+    /// should drop the oldest queued frame and then call `encode` with the new one.
+    ///
+    /// `encode` may return `None` for pipelined hardware encoders that buffer frames internally.
     ///
     /// # Errors
     ///
@@ -510,7 +545,7 @@ impl DoubleBufferedEncoder {
     pub fn encode(
         &mut self,
         frame: &sh_media::VideoFrame,
-    ) -> Result<Option<sh_media::EncodedPacket>, MediaError> {
+    ) -> Result<Option<EncodedPacket>, MediaError> {
         self.active.encode(frame)
     }
 
@@ -530,6 +565,13 @@ impl DoubleBufferedEncoder {
     }
 
     /// Perform a glitch-free double-buffered encoder swap to a new config and mode.
+    ///
+    /// Returns `Ok(`[`SwitchOutcome`]`)` when the swap completes (new encoder is live).
+    /// Returns `Err(`[`ModeSwitchError`]`)` when the swap could not be initiated, in which case
+    /// the old encoder is retained completely untouched and the pipeline continues without
+    /// interruption.
+    ///
+    /// See [`SwitchOutcome`] for how to handle `tail_packets` and `flush_error`.
     ///
     /// ## Swap ordering (both correctness and the *why*)
     ///
@@ -553,10 +595,9 @@ impl DoubleBufferedEncoder {
     ///    frames go to the new encoder.  The old encoder is held temporarily while we drain it.
     ///
     /// 5. **Drain old encoder** (`flush`):  Hardware encoders buffer frames internally.  Flushing
-    ///    emits any tail packets so they are not silently lost.  These tail packets are returned
-    ///    to the caller as [`flush_packets`] alongside `Ok(())`.  They were encoded by the old
-    ///    encoder and are valid packets from *before* the switch point; the caller may forward
-    ///    them to the viewer before the new IDR arrives (or discard them if the viewer has reset).
+    ///    emits any tail packets so they are not silently lost.  On success, these tail packets
+    ///    appear in [`SwitchOutcome::tail_packets`].  On failure, `SwitchOutcome::flush_error`
+    ///    is set and `tail_packets` is empty.
     ///
     /// 6. **Destroy old encoder** (drop): releasing the old guard decrements `active_sessions`.
     ///
@@ -603,16 +644,17 @@ impl DoubleBufferedEncoder {
     ///     target_fps: 60,
     ///     target_bitrate_kbps: Some(4000),
     /// };
-    /// let (tail_packets, _result) = enc.switch_to(new_config, ContentMode::Game);
+    /// let outcome = enc.switch_to(new_config, ContentMode::Game).unwrap();
     /// // tail_packets contains drained frames from the old encoder (may be empty for RawEncoder).
+    /// assert!(outcome.flush_error.is_none());
     /// assert_eq!(enc.current_mode(), ContentMode::Game);
     /// ```
     pub fn switch_to(
         &mut self,
         new_config: EncoderConfig,
         new_mode: ContentMode,
-    ) -> (Vec<sh_media::EncodedPacket>, Result<(), ModeSwitchError>) {
-        tracing_log("acquiring new session slot for double-buffer swap");
+    ) -> Result<SwitchOutcome, ModeSwitchError> {
+        tracing::debug!("acquiring new session slot for double-buffer swap");
 
         // Step 1: acquire new slot BEFORE destroying the old encoder.
         let new_guard = match self.limiter.try_acquire() {
@@ -620,65 +662,65 @@ impl DoubleBufferedEncoder {
             None => {
                 let active = self.limiter.active_sessions();
                 let limit = self.limiter.max_sessions();
-                tracing_log("no session slot available — retaining old encoder");
-                return (
-                    Vec::new(),
-                    Err(ModeSwitchError::NoSessionAvailable { limit, active }),
+                tracing::warn!(
+                    limit,
+                    active,
+                    "no session slot available — retaining old encoder"
                 );
+                return Err(ModeSwitchError::NoSessionAvailable { limit, active });
             }
         };
 
         // Step 2: build the new encoder via the factory.
-        let new_encoder = match (self.factory)(&new_config) {
+        let mut new_encoder = match (self.factory)(&new_config) {
             Ok(e) => e,
             Err(err) => {
                 // Drop new_guard here → releases the slot we just acquired.
                 drop(new_guard);
-                tracing_log("factory error — retaining old encoder, releasing new slot");
-                return (Vec::new(), Err(ModeSwitchError::FactoryError(err)));
+                tracing::warn!(%err, "factory error — retaining old encoder, releasing new slot");
+                return Err(ModeSwitchError::FactoryError(err));
             }
         };
 
         // Step 3: prime the new encoder with a forced IDR.
         // Calling request_keyframe BEFORE the swap guarantees the new encoder's very first
         // encode() call emits an IDR packet, making the stream decodable from the switch point.
-        let mut new_encoder = new_encoder;
         new_encoder.request_keyframe();
-        tracing_log("new encoder primed with IDR request");
+        tracing::debug!("new encoder primed with IDR request");
 
         // Step 4: atomically swap the active encoder and its guard.
         // From this point new frames route to new_encoder.
-        let old_encoder = std::mem::replace(&mut self.active, new_encoder);
-        // We need to update the guard — build a wrapper that holds both temporarily, then drop old.
-        // Take the old guard out by replacing with new_guard.
+        let mut old_encoder = std::mem::replace(&mut self.active, new_encoder);
         let old_guard = std::mem::replace(&mut self._guard, new_guard);
 
         self.current_config = new_config;
         self.current_mode = new_mode;
-        tracing_log("routing swapped to new encoder");
+        tracing::debug!("routing swapped to new encoder");
 
         // Step 5: drain the old encoder so tail frames are not silently lost.
         // The old encoder is still alive here; its session is still counted by old_guard.
-        let mut old_encoder = old_encoder;
-        let flush_packets = match old_encoder.flush() {
+        let (tail_packets, flush_error) = match old_encoder.flush() {
             Ok(pkts) => {
-                tracing_log("old encoder flushed");
-                pkts
+                tracing::debug!(count = pkts.len(), "old encoder flushed");
+                (pkts, None)
             }
-            Err(_) => {
-                // Flush failure is non-fatal: we've already committed to the new encoder.
-                // Drop the old encoder and its guard below; return empty tail.
-                tracing_log("old encoder flush error — discarding tail");
-                Vec::new()
+            Err(err) => {
+                // Flush failure is non-fatal: the swap has already committed to the new encoder.
+                // Surface the error in SwitchOutcome so the caller can log/metric it.
+                tracing::warn!(%err, "old encoder flush error — tail frames may be lost");
+                (Vec::new(), Some(err))
             }
         };
 
         // Step 6: drop old encoder and its guard → decrements active_sessions.
         drop(old_encoder);
         drop(old_guard);
-        tracing_log("old encoder destroyed, session slot released");
+        tracing::debug!("old encoder destroyed, session slot released");
 
-        (flush_packets, Ok(()))
+        Ok(SwitchOutcome {
+            tail_packets,
+            flush_error,
+        })
     }
 }
 
@@ -690,19 +732,6 @@ impl std::fmt::Debug for DoubleBufferedEncoder {
             .field("active_sessions", &self.limiter.active_sessions())
             .finish()
     }
-}
-
-/// Minimal tracing shim that writes to stderr in tests (zero-dep, no async).
-///
-/// In production this would route through `tracing`; for now it provides the
-/// "swap trace" output required by the Definition of Done without adding a
-/// dependency on the full `tracing` crate.
-fn tracing_log(msg: &str) {
-    // Only emit output when running under `cargo test` so production builds are silent.
-    #[cfg(test)]
-    eprintln!("[mode_switch] {msg}");
-    #[cfg(not(test))]
-    let _ = msg;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -717,9 +746,10 @@ fn tracing_log(msg: &str) {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use sh_media::{EncoderConfig, PixelFormat, Resolution, VideoFrame};
+    use sh_media::{EncoderCaps, EncoderConfig, PixelFormat, Resolution, VideoFrame};
     use sh_protocol::{Codec, FrameType};
     use sh_types::{FrameId, TimestampUs};
+    use std::sync::{Arc, Mutex};
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -764,6 +794,87 @@ mod tests {
         .unwrap()
     }
 
+    // ── KeyframeTrackingEncoder mock ──────────────────────────────────────────
+    //
+    // This mock is essential for testing the IDR-priming invariant and tail-drain correctness.
+    // Unlike RawEncoder (which returns IDR for every frame and ignores request_keyframe), this
+    // mock:
+    //   - emits FrameType::Predicted by default
+    //   - emits FrameType::Idr on the FIRST encode call after request_keyframe() (then resets)
+    //   - buffers one tail packet in its internal queue, returned by flush()
+    //
+    // This means:
+    //   (a) Deleting the request_keyframe() call in switch_to() causes
+    //       first_packet_after_switch_is_idr_via_priming to FAIL.
+    //   (b) The tail packet buffered before the swap appears in SwitchOutcome.tail_packets,
+    //       proving the drain is real (not vacuous).
+
+    #[derive(Debug)]
+    struct KeyframeTrackingEncoder {
+        /// True when the next encode call should emit IDR.
+        keyframe_pending: bool,
+        /// Buffered tail packet — returned by flush(), simulating a pipelined encoder.
+        tail_buffer: Vec<sh_media::EncodedPacket>,
+        /// Shared log: records ("encode"|"keyframe_request"|"flush") for assertions.
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl KeyframeTrackingEncoder {
+        fn new(log: Arc<Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                keyframe_pending: false,
+                tail_buffer: Vec::new(),
+                log,
+            }
+        }
+
+        /// Pre-load a tail packet that flush() will return.
+        fn push_tail_packet(&mut self, pkt: sh_media::EncodedPacket) {
+            self.tail_buffer.push(pkt);
+        }
+    }
+
+    impl VideoEncoder for KeyframeTrackingEncoder {
+        fn encode(
+            &mut self,
+            frame: &VideoFrame,
+        ) -> Result<Option<sh_media::EncodedPacket>, MediaError> {
+            self.log.lock().unwrap().push("encode");
+            let frame_type = if self.keyframe_pending {
+                self.keyframe_pending = false;
+                FrameType::Idr
+            } else {
+                FrameType::Predicted
+            };
+            Ok(Some(sh_media::EncodedPacket {
+                data: frame.data.clone(),
+                codec: Codec::Raw,
+                frame_id: frame.frame_id,
+                capture_ts_us: frame.capture_ts_us,
+                frame_type,
+            }))
+        }
+
+        fn request_keyframe(&mut self) {
+            self.log.lock().unwrap().push("keyframe_request");
+            self.keyframe_pending = true;
+        }
+
+        fn flush(&mut self) -> Result<Vec<sh_media::EncodedPacket>, MediaError> {
+            self.log.lock().unwrap().push("flush");
+            Ok(std::mem::take(&mut self.tail_buffer))
+        }
+
+        fn caps(&self) -> EncoderCaps {
+            EncoderCaps {
+                codec: Codec::Raw,
+                hardware: false,
+                max_resolution: Resolution::new(u32::MAX, u32::MAX),
+                accepted_input_formats: &[],
+            }
+        }
+    }
+
     // ── SessionLimiter ────────────────────────────────────────────────────────
 
     #[test]
@@ -798,11 +909,12 @@ mod tests {
     }
 
     #[test]
-    fn session_guard_drop_does_not_underflow() {
+    fn session_guard_drop_releases_permit() {
         let lim = SessionLimiter::new(4);
         let g = lim.try_acquire().unwrap();
+        assert_eq!(lim.active_sessions(), 1);
         drop(g);
-        // Counter must be 0, not u32::MAX (underflow guard).
+        // Permit must be returned to the semaphore — active count back to zero.
         assert_eq!(lim.active_sessions(), 0);
     }
 
@@ -819,8 +931,8 @@ mod tests {
         assert_eq!(lim.active_sessions(), 1);
 
         for _ in 0..10 {
-            let (_, result) = enc.switch_to(game_config(), ContentMode::Game);
-            result.unwrap();
+            let outcome = enc.switch_to(game_config(), ContentMode::Game).unwrap();
+            assert!(outcome.flush_error.is_none());
             assert_eq!(
                 lim.active_sessions(),
                 1,
@@ -829,7 +941,127 @@ mod tests {
         }
     }
 
-    // ── Glitch-free swap: first packet is IDR ─────────────────────────────────
+    // ── IDR priming: KeyframeTrackingEncoder tests ────────────────────────────
+
+    /// Verifies that the new encoder's first post-swap packet is IDR *because* of the priming
+    /// call in switch_to.  If the request_keyframe() call is removed from switch_to, this test
+    /// fails because KeyframeTrackingEncoder emits Predicted by default.
+    #[test]
+    fn first_packet_after_switch_is_idr_via_priming() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+
+        let factory: EncoderFactory = Box::new(move |_| {
+            Ok(
+                Box::new(KeyframeTrackingEncoder::new(Arc::clone(&log_clone)))
+                    as Box<dyn VideoEncoder>,
+            )
+        });
+
+        let lim = SessionLimiter::new(4);
+        let mut enc =
+            DoubleBufferedEncoder::new(base_config(), ContentMode::Work, factory, lim).unwrap();
+
+        // Encode a few frames on the old encoder (these will be Predicted by default).
+        for i in 0..3u64 {
+            let pkt = enc.encode(&make_frame(i)).unwrap().unwrap();
+            assert_eq!(
+                pkt.frame_type,
+                FrameType::Predicted,
+                "pre-switch frames must be Predicted (no prime yet)"
+            );
+        }
+
+        // Switch — switch_to must call request_keyframe() on the new encoder before the swap.
+        let outcome = enc.switch_to(game_config(), ContentMode::Game).unwrap();
+        assert!(outcome.flush_error.is_none());
+
+        // The FIRST packet from the new encoder must be IDR because of the priming.
+        let first_pkt = enc.encode(&make_frame(100)).unwrap().unwrap();
+        assert_eq!(
+            first_pkt.frame_type,
+            FrameType::Idr,
+            "first packet after switch must be IDR — IDR priming is working"
+        );
+
+        // The second packet must revert to Predicted (keyframe_pending resets after one IDR).
+        let second_pkt = enc.encode(&make_frame(101)).unwrap().unwrap();
+        assert_eq!(
+            second_pkt.frame_type,
+            FrameType::Predicted,
+            "second packet after switch must be Predicted"
+        );
+
+        // Verify the call log contains a keyframe_request between construction and encode(100).
+        let calls = log.lock().unwrap();
+        // log contains: encode×3 (pre-switch) | keyframe_request (priming) | flush (drain) |
+        //               encode×2 (post-switch)
+        assert!(
+            calls.contains(&"keyframe_request"),
+            "request_keyframe must appear in call log: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"flush"),
+            "flush must appear in call log (drain): {calls:?}"
+        );
+    }
+
+    /// Verifies that a tail packet pre-loaded into the old encoder's buffer appears in
+    /// SwitchOutcome.tail_packets — proving the drain path is real, not vacuous.
+    #[test]
+    fn tail_drain_returns_old_encoder_buffered_packets() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_clone = Arc::clone(&log);
+        let mut call_count = 0u32;
+
+        let factory: EncoderFactory = Box::new(move |_| {
+            let enc = if call_count == 0 {
+                // First call: build the initial old encoder and pre-load it with a tail packet.
+                let mut e = KeyframeTrackingEncoder::new(Arc::clone(&log_clone));
+                // Simulate a pipelined encoder that has one buffered frame.
+                let tail_pkt = sh_media::EncodedPacket {
+                    data: Bytes::from_static(b"tail"),
+                    codec: Codec::Raw,
+                    frame_id: FrameId(999),
+                    capture_ts_us: sh_types::TimestampUs(999),
+                    frame_type: FrameType::Predicted,
+                };
+                e.push_tail_packet(tail_pkt);
+                e
+            } else {
+                KeyframeTrackingEncoder::new(Arc::clone(&log_clone))
+            };
+            call_count = call_count.saturating_add(1);
+            Ok(Box::new(enc) as Box<dyn VideoEncoder>)
+        });
+
+        let lim = SessionLimiter::new(4);
+        let mut enc =
+            DoubleBufferedEncoder::new(base_config(), ContentMode::Work, factory, lim).unwrap();
+
+        let outcome = enc.switch_to(game_config(), ContentMode::Game).unwrap();
+
+        assert!(
+            outcome.flush_error.is_none(),
+            "flush must succeed for KeyframeTrackingEncoder"
+        );
+        assert_eq!(
+            outcome.tail_packets.len(),
+            1,
+            "the old encoder's buffered tail packet must appear in SwitchOutcome"
+        );
+        let first_tail = outcome
+            .tail_packets
+            .first()
+            .expect("tail_packets is non-empty, asserted above");
+        assert_eq!(
+            first_tail.frame_id,
+            FrameId(999),
+            "tail packet must be the one pre-loaded into the old encoder"
+        );
+    }
+
+    // ── Glitch-free swap: first packet is IDR (RawEncoder path) ──────────────
 
     #[test]
     fn first_packet_after_switch_is_idr() {
@@ -848,14 +1080,12 @@ mod tests {
         }
 
         // Switch to Game mode.
-        let (tail_pkts, result) = enc.switch_to(game_config(), ContentMode::Game);
-        result.unwrap();
+        let outcome = enc.switch_to(game_config(), ContentMode::Game).unwrap();
+        assert!(outcome.flush_error.is_none());
 
-        // The old encoder's tail must have been drained (RawEncoder has no internal buffer,
-        // so tail_pkts is empty — but the flush call must have been made).
         eprintln!(
             "[test] switch produced {} tail packets from old encoder",
-            tail_pkts.len()
+            outcome.tail_packets.len()
         );
 
         // The FIRST packet from the new encoder must be an IDR.
@@ -888,12 +1118,11 @@ mod tests {
 
         assert_eq!(lim.active_sessions(), 1);
 
-        let (tail, result) = enc.switch_to(game_config(), ContentMode::Game);
+        let result = enc.switch_to(game_config(), ContentMode::Game);
         assert!(
             matches!(result, Err(ModeSwitchError::NoSessionAvailable { .. })),
             "switch must fail when max_sessions=1"
         );
-        assert!(tail.is_empty(), "no tail packets when switch failed");
 
         // Old encoder must still work.
         let pkt = enc.encode(&make_frame(0)).unwrap().unwrap();
@@ -924,8 +1153,8 @@ mod tests {
 
         assert_eq!(lim.active_sessions(), 1);
 
-        let (_, result) = enc.switch_to(game_config(), ContentMode::Game);
-        result.unwrap();
+        let outcome = enc.switch_to(game_config(), ContentMode::Game).unwrap();
+        assert!(outcome.flush_error.is_none());
 
         assert_eq!(
             lim.active_sessions(),
@@ -941,10 +1170,10 @@ mod tests {
         // Use a call-count factory: call 0 (constructor) succeeds, call 1+ (switch) fails.
         // This tests that when the factory fails during a switch the old encoder is retained,
         // the newly acquired session slot is released, and the session count does not leak.
-        let call_count = Arc::new(AtomicU32::new(0));
-        let call_count_clone = Arc::clone(&call_count);
+        let mut call_count = 0u32;
         let mixed_factory: EncoderFactory = Box::new(move |_| {
-            let n = call_count_clone.fetch_add(1, Ordering::SeqCst);
+            let n = call_count;
+            call_count = call_count.saturating_add(1);
             if n == 0 {
                 // First call (constructor): succeed.
                 Ok(Box::new(RawEncoder::new()) as Box<dyn VideoEncoder>)
@@ -966,12 +1195,11 @@ mod tests {
         .unwrap();
 
         // Switch must fail (factory returns Err on the 2nd call).
-        let (tail, result) = enc.switch_to(game_config(), ContentMode::Game);
+        let result = enc.switch_to(game_config(), ContentMode::Game);
         assert!(
             matches!(result, Err(ModeSwitchError::FactoryError(_))),
             "switch must fail on factory error"
         );
-        assert!(tail.is_empty());
 
         // Old encoder must still work.
         let pkt = enc.encode(&make_frame(0)).unwrap().unwrap();
@@ -985,6 +1213,73 @@ mod tests {
         assert_eq!(lim.active_sessions(), 1);
         drop(enc);
         assert_eq!(lim.active_sessions(), 0);
+    }
+
+    // ── Flush error surface ───────────────────────────────────────────────────
+
+    /// Verify that a flush error is surfaced in SwitchOutcome.flush_error, not silently swallowed.
+    #[test]
+    fn flush_error_surfaced_in_switch_outcome() {
+        /// An encoder whose flush always fails.
+        struct FailFlushEncoder(RawEncoder);
+
+        impl VideoEncoder for FailFlushEncoder {
+            fn encode(
+                &mut self,
+                frame: &VideoFrame,
+            ) -> Result<Option<sh_media::EncodedPacket>, MediaError> {
+                self.0.encode(frame)
+            }
+
+            fn request_keyframe(&mut self) {
+                self.0.request_keyframe();
+            }
+
+            fn flush(&mut self) -> Result<Vec<sh_media::EncodedPacket>, MediaError> {
+                Err(MediaError::Encode("simulated flush failure".to_owned()))
+            }
+
+            fn caps(&self) -> EncoderCaps {
+                self.0.caps()
+            }
+        }
+
+        let mut call_count = 0u32;
+        let factory: EncoderFactory = Box::new(move |_| {
+            let n = call_count;
+            call_count = call_count.saturating_add(1);
+            if n == 0 {
+                // Initial encoder: fails on flush.
+                Ok(Box::new(FailFlushEncoder(RawEncoder::new())) as Box<dyn VideoEncoder>)
+            } else {
+                // Replacement encoder: normal.
+                Ok(Box::new(RawEncoder::new()) as Box<dyn VideoEncoder>)
+            }
+        });
+
+        let lim = SessionLimiter::new(4);
+        let mut enc =
+            DoubleBufferedEncoder::new(base_config(), ContentMode::Work, factory, lim.clone())
+                .unwrap();
+
+        // The swap itself succeeds; the old encoder's flush fails.
+        let outcome = enc.switch_to(game_config(), ContentMode::Game).unwrap();
+
+        assert!(
+            outcome.flush_error.is_some(),
+            "flush_error must be Some when old encoder flush fails"
+        );
+        assert!(
+            outcome.tail_packets.is_empty(),
+            "no tail packets when flush fails"
+        );
+
+        // New encoder must be live and usable despite the old encoder's flush error.
+        let pkt = enc.encode(&make_frame(0)).unwrap().unwrap();
+        assert_eq!(pkt.frame_type, FrameType::Idr);
+
+        // Session count must be 1 (no leak even when flush fails).
+        assert_eq!(lim.active_sessions(), 1);
     }
 
     // ── Backpressure policy ───────────────────────────────────────────────────
@@ -1039,9 +1334,10 @@ mod tests {
     // ── Switch trace ──────────────────────────────────────────────────────────
 
     #[test]
-    fn switch_trace_printed_to_stderr() {
-        // This test primarily exercises the full swap path so the "swap trace" prints to stderr
-        // during `cargo test -p sh-codec-hw -- --nocapture`.
+    fn switch_trace_exercises_full_swap_path() {
+        // This test exercises the full swap path and validates correctness.
+        // Run with `cargo test -p sh-codec-hw -- --nocapture` to see tracing output
+        // if a tracing subscriber is installed (tracing emits nothing without one by default).
         let lim = SessionLimiter::new(4);
         let mut enc = DoubleBufferedEncoder::new(
             base_config(),
@@ -1062,9 +1358,12 @@ mod tests {
         enc.encode(&make_frame(2)).unwrap();
 
         eprintln!("switching Work → Game …");
-        let (tail, result) = enc.switch_to(game_config(), ContentMode::Game);
-        result.unwrap();
-        eprintln!("old encoder drained: {} tail packet(s)", tail.len());
+        let outcome = enc.switch_to(game_config(), ContentMode::Game).unwrap();
+        eprintln!(
+            "old encoder drained: {} tail packet(s), flush_error={:?}",
+            outcome.tail_packets.len(),
+            outcome.flush_error
+        );
         eprintln!("new session active (sessions={})", lim.active_sessions());
 
         let first_new = enc.encode(&make_frame(3)).unwrap().unwrap();
@@ -1074,6 +1373,7 @@ mod tests {
         );
         eprintln!("=== Swap trace end ===\n");
 
+        assert!(outcome.flush_error.is_none());
         assert_eq!(first_new.frame_type, FrameType::Idr);
         assert_eq!(lim.active_sessions(), 1);
     }
