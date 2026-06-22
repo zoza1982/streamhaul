@@ -241,32 +241,35 @@ mod tests {
     /// with R = identity and S = 0 trivially satisfies the non-strict batch equation
     /// `[8][S]B = [8]R + [8][H]A` when A is also small-order, but `verify_strict` rejects it.
     ///
-    /// This test MUST fail if someone reverts to `verify()`. The all-zeros 64-byte signature
-    /// used by `garbage_signature_fails_verify` does NOT cover this because dalek parses it
-    /// as R = compressed identity (valid small-order point) and S = 0, which the non-strict
-    /// verifier may accept under a small-order public key.
+    /// Guards the `verify_strict` decision. The ONLY configuration where `verify()` (cofactored)
+    /// and `verify_strict()` diverge is a **small-order public key**: `verify()` ACCEPTS a forged
+    /// `(R = identity, S = 0)` signature under it, while `verify_strict()` REJECTS it. A prime-order
+    /// key makes BOTH reject (the hash equation simply isn't satisfied), so a non-weak key cannot
+    /// catch a `verify_strict → verify` regression. This test therefore builds a small-order key
+    /// directly via the crate-internal `from_verifying_key` (the public `from_public_key_bytes`
+    /// correctly refuses to pin a weak key — defense in depth), so reverting line ~130 to `verify()`
+    /// makes this assertion FAIL.
     #[test]
-    fn small_order_r_signature_rejected_by_verify_strict() {
-        // Use a normal (non-small-order) verifying key — verify_strict must reject this
-        // signature because its R component encodes a small-order point.
-        use rand_core::SeedableRng;
-        let rng = rand_chacha::ChaCha8Rng::seed_from_u64(99);
-        let ks = SoftwareKeystore::generate_with_rng(rng);
-        // Build the identity synchronously using block_on since Keystore is async.
-        let id = tokio_test::block_on(ks.device_identity()).unwrap();
+    fn small_order_pubkey_forgery_rejected_by_verify_strict() {
+        use ed25519_dalek::VerifyingKey;
+        // Ed25519 identity/neutral element: y = 1 (0x01 in byte 0, rest zero) — a small-order point.
+        let mut weak_pub = [0u8; 32];
+        weak_pub[0] = 0x01;
+        let vk = VerifyingKey::from_bytes(&weak_pub).expect("identity point decompresses");
+        assert!(vk.is_weak(), "test vector must be a small-order key");
+        let id = DeviceIdentity::from_verifying_key(vk);
 
-        // A signature whose R component is the compressed identity point on Ed25519:
-        // RFC 8032 encodes the neutral element as y = 1 (bit pattern: 0x01 in byte 0,
-        // rest zero). S = 0.  `verify_strict` rejects signatures where R is small-order.
-        let mut small_order_sig_bytes = [0u8; 64];
-        small_order_sig_bytes[0] = 0x01; // y-coordinate = 1 → identity/neutral point
+        // Forged signature: R = identity (0x01, 0, …), S = 0.
+        let mut forged = [0u8; 64];
+        forged[0] = 0x01;
+        let sig = Signature::decode(&forged).unwrap();
 
-        let sig = Signature::decode(&small_order_sig_bytes).unwrap();
-        let result = sig.verify(&id, b"any data");
+        // verify_strict REJECTS this forgery; plain verify() would ACCEPT it under the small-order
+        // key — so this assertion fails if verify_strict is downgraded to verify().
         assert!(
-            result.is_err(),
-            "verify_strict must reject a signature with a small-order R point; \
-             if this assertion fails, verify() was used instead of verify_strict()"
+            sig.verify(&id, b"any data").is_err(),
+            "verify_strict must reject a forgery under a small-order public key; \
+             if this fails, verify() was used instead of verify_strict()"
         );
     }
 
