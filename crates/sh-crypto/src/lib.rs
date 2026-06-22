@@ -50,6 +50,7 @@
 #![deny(missing_docs)]
 
 pub mod bind_cert;
+pub mod channel_crypto;
 pub mod clock;
 mod error;
 mod identity;
@@ -61,6 +62,9 @@ mod signature;
 mod software_keystore;
 
 pub use bind_cert::{BindCert, BindCertBuilder};
+pub use channel_crypto::{
+    ChannelFrameHeader, Direction, SessionKeys, CHANNEL_HEADER_LEN, CHANNEL_MAGIC,
+};
 pub use error::CryptoError;
 pub use identity::{DeviceIdentity, Fingerprint};
 pub use keystore::Keystore;
