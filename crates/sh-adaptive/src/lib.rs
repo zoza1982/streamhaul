@@ -40,8 +40,8 @@
 //! // controller.on_feedback(&feedback, Instant::now());
 //! let allocation = allocator.allocate(controller.target_bitrate());
 //! // Hand allocations to the encoder / pacer:
-//! // encoder.set_bitrate(allocation.video);
-//! // audio_encoder.set_bitrate(allocation.audio);
+//! // encoder.set_bitrate(allocation.video());
+//! // audio_encoder.set_bitrate(allocation.audio());
 //! ```
 //!
 //! [RFC 8298]: https://www.rfc-editor.org/rfc/rfc8298
