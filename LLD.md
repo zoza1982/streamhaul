@@ -257,6 +257,75 @@ signaling server, which exits the path after `END_OF_CANDIDATES`. Rough budget: 
 QUIC handshake done ~110ms (0-RTT on resume), first frame ~115ms; symmetric-NAT relay fallback ~210–220ms.
 Failures: STUN miss → host+relay only; ICE timeout 5s → ICE restart; path RTT >2× baseline 3s → re-probe.
 
+### 3.5 Codec capability handshake — `CodecCapsPayload` wire layout (P2-5)
+
+Capability negotiation uses a **4-byte binary payload** (`CODEC_CAPS_LEN = 4`) carried inside a
+`ControlFrame` (`KIND_CODEC_CAPS_OFFER = 0x10` / `KIND_CODEC_CAPS_ANSWER = 0x11`).  The initiator
+sends an **offer**; the responder sends an **answer** with `SELECTED_CODEC` filled in.
+
+```
+BYTE 0:  HW_ENCODE_MASK   bits 0–2 = codec discriminants this endpoint can HW-encode
+                           bit 0 = H264 (disc 0)
+                           bit 1 = H265 / HEVC (disc 1) — commercial builds only; see below
+                           bit 2 = AV1  (disc 2)
+                           bits 3–7 = RESERVED, must be 0; rejected on decode
+
+BYTE 1:  HW_DECODE_MASK   same bit layout as HW_ENCODE_MASK; same reserved-bit rules
+
+BYTE 2:  FLAGS             bit 0 = sw_h264_encode_available
+                           bit 1 = is_apple   (VideoToolbox host — no AV1 HW encode)
+                           bit 2 = is_browser (implicit H.264 decode always available)
+                           bits 3–7 = RESERVED, must be 0; rejected on decode
+
+BYTE 3:  SELECTED_CODEC   0x00 = H264 selected
+                           0x01 = H265 / HEVC selected (commercial build required to encode)
+                           0x02 = AV1  selected
+                           0xFF = sentinel / offer (not yet selected; None in Rust)
+                           all other values rejected on decode
+```
+
+**Codec discriminants** are the same in HW masks and `SELECTED_CODEC`.  Discriminant `3` (Raw) is
+not a negotiable codec; bits 3–7 in masks are reserved.  Values 4–254 in `SELECTED_CODEC` are
+rejected.  `encode_caps` and `decode_caps` enforce **symmetric acceptance** — the function pair
+rejects exactly the same value sets.
+
+#### BuildFlavor → `hevc` feature mapping (ADR-0004)
+
+| Cargo feature | `BuildFlavor` value | HEVC rung in ladder | H265 bit in mask |
+|---------------|--------------------|--------------------|-----------------|
+| `hevc` OFF (default OSS) | `BuildFlavor::Oss` only — `Commercial` does not compile | Never emitted | Never set locally |
+| `hevc` ON (commercial) | `BuildFlavor::Commercial` available | First rung (HEVC HW → AV1 HW → H264 HW) | Set when HW available |
+
+`BuildFlavor::Commercial` is gated with `#[cfg(feature = "hevc")]` at the enum level; an OSS build
+cannot name the variant and therefore cannot construct it.  The `candidate_rungs` function also
+`#[cfg(feature = "hevc")]`-guards the `Codec::H265` push within the `Commercial` arm as a
+belt-and-suspenders backstop.
+
+An OSS peer **can** parse a commercial peer's answer that selects H265 (so that
+`CODEC_DISC_H265 = 1` as a `selected_codec` is not rejected by `decode_caps`), but a session
+handler MUST check `BuildFlavor::from_compile_time() == Oss` and refuse to start a non-existent
+H265 encoder.  The `shp_decode` cargo-fuzz target exercises `decode_caps` on arbitrary bytes.
+
+#### OSS degradation ladders (BuildFlavor::Oss)
+
+| Mode | Ladder |
+|------|--------|
+| Game / Scrolling | AV1 HW → H264 HW → H264 SW (rate-limited, last resort) |
+| Work | AV1 HW → H264 HW (no SW rung; Work never software-encodes) |
+
+#### Commercial degradation ladders (BuildFlavor::Commercial, `hevc` feature ON)
+
+| Mode | Ladder |
+|------|--------|
+| Game / Scrolling / Work | HEVC HW → AV1 HW → H264 HW (no SW rung in any mode) |
+
+**Apple exception:** VideoToolbox has no AV1 HW encode; AV1 is removed from the encode ladder when
+`is_apple = true` (data-driven predicate, not `#[cfg]`).
+**Browser exception:** `is_browser = true` guarantees H264 is reachable regardless of
+`hw_decode_mask` (browsers always support H264 decode via WebRTC).
+
+Cross-reference: ADR-0004 (`docs/adr/0004-oss-codec-and-licensing.md`), §5.1 Q2.
+
 ---
 
 ## 4. Networking Details

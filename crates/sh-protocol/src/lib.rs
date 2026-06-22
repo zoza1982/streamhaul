@@ -7,11 +7,13 @@
 //! malformed input returns [`ProtocolError`]. See `LLD.md` §3.1 for the field layouts.
 //!
 //! Covers the [`CommonHeader`], [`VideoHeader`], the [`InputEvent`] (P1-2), control-channel
-//! framing ([`encode_control`]/[`decode_control`], P1-2), and the 25-byte [`NackFeedback`]
-//! message (P2-6). Audio and remaining feedback types land with their phases. Each message type
+//! framing ([`encode_control`]/[`decode_control`], P1-2), the 25-byte [`NackFeedback`]
+//! message (P2-6), and the 4-byte [`capability`] codec-capability offer/answer frame (P2-5).
+//! Audio and remaining feedback types land with their phases. Each message type
 //! lives in its own module; the public surface is re-exported here.
 
 mod bits;
+pub mod capability;
 mod common;
 mod control;
 mod error;

@@ -15,6 +15,15 @@
 //! - [`mode_switch::EncoderFactory`] — `FnMut` seam so NVENC slots in without changing any
 //!   switcher code
 //!
+//! Phase 2 (P2-5) adds the **codec negotiation and degradation ladder** ([`negotiation`]):
+//! - [`negotiation::CodecCapabilities`] — per-endpoint encode/decode capability descriptor
+//! - [`negotiation::BuildFlavor`] — OSS vs Commercial build (gates HEVC; derive via
+//!   [`negotiation::BuildFlavor::from_compile_time`] from the `hevc` Cargo feature)
+//! - [`negotiation::CodecNegotiator`] — pure ladder builder ([`negotiation::CodecNegotiator::ladder`]),
+//!   selector ([`negotiation::CodecNegotiator::select`]), and step-down
+//!   ([`negotiation::CodecNegotiator::degrade`])
+//! - HEVC is gated behind the **`hevc`** Cargo feature (default OFF = OSS build; see ADR-0004).
+//!
 //! The hardware backends (NVENC / AMD AMF / Intel QSV / Apple VideoToolbox / VA-API for video;
 //! WASAPI / Core Audio / PipeWire for audio, see `LLD.md` §5–§6) implement the same `sh_media`
 //! traits and land during the on-hardware session.
@@ -25,8 +34,13 @@
 //! - Real NVENC 4:2:0 ↔ 4:4:4 hardware reconfigure: the double-buffer orchestration is portable and
 //!   fully tested against [`RawEncoder`]; the real NVENC pixel-format switch lands in the on-hardware
 //!   session (see Risk Register R6 in `IMPLEMENTATION_PLAN.md`).
+//! - Real AV1 / HEVC hardware encoders: the negotiation ladder, capability model, and feature flag
+//!   are fully implemented; the actual `VideoEncoder` backends (NVENC AV1, VideoToolbox HEVC,
+//!   VA-API AV1) land during the on-hardware session (see Risk Register R-CODEC in
+//!   `IMPLEMENTATION_PLAN.md`).
 
 pub mod mode_switch;
+pub mod negotiation;
 mod raw;
 mod raw_audio;
 
