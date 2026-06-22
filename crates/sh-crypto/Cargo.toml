@@ -43,14 +43,15 @@ zeroize.workspace = true
 # into Signature::decode must never panic.
 proptest.workspace = true
 
-# Async test executor for Keystore tests.
-tokio = { version = "1", features = ["rt", "macros"] }
+# Async test executor for Keystore tests. Pinned to the exact version resolved by
+# Cargo.lock (CLAUDE.md §7 supply-chain policy: production-dep `=x.y.z` style pinning).
+tokio = { version = "=1.52.3", features = ["rt", "macros"] }
 
 # Seedable CSPRNG for deterministic, reproducible tests (rand_core 0.6 compat).
-rand_chacha = "0.3"
+rand_chacha = "=0.3.1"
 
 # `block_on` helper for async doc-tests.
-tokio-test = "0.4"
+tokio-test = "=0.4.5"
 
 [lints]
 workspace = true

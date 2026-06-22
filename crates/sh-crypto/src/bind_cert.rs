@@ -350,6 +350,8 @@ impl BindCert {
         }
 
         // Extract PLATFORM_ATTEST blob.
+        // `pa_end` is reused as `not_after_off` below — keep a single binding to avoid
+        // future off-by-one divergence between the two offsets.
         let pa_end = OFF_PLATFORM_ATTEST_DATA.saturating_add(pa_len);
         let platform_attest = tbs_bytes
             .get(OFF_PLATFORM_ATTEST_DATA..pa_end)
@@ -359,7 +361,7 @@ impl BindCert {
             .to_vec();
 
         // Extract NOT_AFTER (i64 BE at 113+L).
-        let not_after_off = OFF_PLATFORM_ATTEST_DATA.saturating_add(pa_len);
+        let not_after_off = pa_end;
         let not_after_arr: [u8; 8] = tbs_bytes
             .get(not_after_off..not_after_off.saturating_add(8))
             .ok_or(CryptoError::MalformedBindCert {
@@ -668,6 +670,14 @@ impl<'a, K: Keystore> BindCertBuilder<'a, K> {
         let valid_for_secs = self.valid_for_secs.ok_or(CryptoError::MalformedBindCert {
             reason: "valid_for_secs not set on BindCertBuilder",
         })?;
+        // Enforce the validity window: must be positive and must not exceed the 24-hour maximum.
+        // `saturating_add(i64::MAX)` would otherwise bypass the not_after > issued_at guard,
+        // signing a cert valid until year 292-billion.
+        if valid_for_secs <= 0 || valid_for_secs > BIND_CERT_VALIDITY_SECS {
+            return Err(CryptoError::MalformedBindCert {
+                reason: "valid_for_secs out of range (must be 1..=BIND_CERT_VALIDITY_SECS)",
+            });
+        }
         if self.platform_attest.len() > MAX_PLATFORM_ATTEST_LEN {
             return Err(CryptoError::MalformedBindCert {
                 reason: "platform_attest blob exceeds 4096 bytes",
@@ -1181,6 +1191,72 @@ mod tests {
         assert!(
             matches!(result, Err(CryptoError::MalformedBindCert { reason }) if reason.contains("DTLS_FPR_COMMIT must be zero")),
             "builder must reject ALG=0x00 with non-zero commit; got: {result:?}"
+        );
+    }
+
+    // ─── valid_for_secs range enforcement ────────────────────────────────
+
+    /// `valid_for_secs = i64::MAX` must be rejected (would produce not_after ≈ year 292-billion).
+    #[tokio::test]
+    async fn valid_for_secs_i64_max_rejected() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let result = BindCertBuilder::new(&ks)
+            .noise_static([0u8; 32])
+            .valid_for_secs(i64::MAX)
+            .build(&clock)
+            .await;
+        assert!(
+            matches!(result, Err(CryptoError::MalformedBindCert { reason }) if reason.contains("valid_for_secs out of range")),
+            "i64::MAX valid_for_secs must be rejected; got: {result:?}"
+        );
+    }
+
+    /// `valid_for_secs = BIND_CERT_VALIDITY_SECS + 1` must be rejected (one second over cap).
+    #[tokio::test]
+    async fn valid_for_secs_over_cap_rejected() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let result = BindCertBuilder::new(&ks)
+            .noise_static([0u8; 32])
+            .valid_for_secs(BIND_CERT_VALIDITY_SECS + 1)
+            .build(&clock)
+            .await;
+        assert!(
+            matches!(result, Err(CryptoError::MalformedBindCert { reason }) if reason.contains("valid_for_secs out of range")),
+            "BIND_CERT_VALIDITY_SECS+1 must be rejected; got: {result:?}"
+        );
+    }
+
+    /// `valid_for_secs = BIND_CERT_VALIDITY_SECS` (exactly 24 h) must succeed.
+    #[tokio::test]
+    async fn valid_for_secs_at_cap_accepted() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let result = BindCertBuilder::new(&ks)
+            .noise_static([0u8; 32])
+            .valid_for_secs(BIND_CERT_VALIDITY_SECS)
+            .build(&clock)
+            .await;
+        assert!(
+            result.is_ok(),
+            "BIND_CERT_VALIDITY_SECS must be accepted; got: {result:?}"
+        );
+    }
+
+    /// `valid_for_secs = 0` must be rejected (zero or negative window is non-sensical).
+    #[tokio::test]
+    async fn valid_for_secs_zero_rejected() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let result = BindCertBuilder::new(&ks)
+            .noise_static([0u8; 32])
+            .valid_for_secs(0)
+            .build(&clock)
+            .await;
+        assert!(
+            matches!(result, Err(CryptoError::MalformedBindCert { .. })),
+            "valid_for_secs=0 must be rejected; got: {result:?}"
         );
     }
 

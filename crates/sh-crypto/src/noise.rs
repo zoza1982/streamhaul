@@ -181,12 +181,14 @@ impl NoiseSession {
         transport: snow::TransportState,
         handshake_hash: &[u8; 32],
     ) -> Result<Self, CryptoError> {
-        let hkdf = Hkdf::<Sha256>::new(None, handshake_hash.as_slice());
+        // RFC 5869 §2: Extract once from the handshake hash as IKM (no salt → HMAC-SHA256 with
+        // an all-zeros salt, which is the RFC default). The result is a true PRK — the output of
+        // the Extract step, distinct from any Expand output. Subsequent `export_keying_material`
+        // calls each perform a single Expand from this PRK, giving the standard
+        // `Expand(Extract(h), info)` construction. This is the P3-4 channel-subkey KDF root.
+        let (prk_arr, _hkdf) = Hkdf::<Sha256>::extract(None, handshake_hash.as_slice());
         let mut prk_buf = Zeroizing::new([0u8; 32]);
-        hkdf.expand(b"shp-noise-prk", prk_buf.as_mut())
-            .map_err(|_| CryptoError::HandshakeFailed {
-                reason: "HKDF expand failed for session PRK",
-            })?;
+        prk_buf.copy_from_slice(prk_arr.as_slice());
         Ok(Self {
             transport,
             prk: prk_buf,
@@ -343,6 +345,21 @@ impl std::fmt::Debug for HandshakeOutcome {
 ///
 /// The BindCert (prepended with the 32-byte Ed25519 public key) is automatically injected
 /// into / extracted from the handshake payload at the correct message per ADR-0007 §2.5.
+///
+/// # State machine
+///
+/// ```text
+/// Active  ──(write_message / read_message returns Err)──►  Poisoned  (terminal)
+/// Active  ──(complete() called and consumed)─────────────►  Completed (terminal)
+/// ```
+///
+/// - **Active**: initial state; `write_message` and `read_message` are callable.
+/// - **Poisoned**: set on any error returned after snow's internal state has been advanced.
+///   Every subsequent call to `write_message`, `read_message`, or `complete()` returns
+///   `HandshakeFailed { reason: "handshake already aborted" }`. `is_finished()` returns
+///   `false` even if the underlying snow state considers itself finished.
+/// - **Completed**: `complete()` consumes `self` and returns a [`HandshakeOutcome`]; the
+///   `NoiseHandshake` value ceases to exist.
 ///
 /// # Construction
 ///
@@ -871,9 +888,13 @@ impl NoiseHandshake {
         })
     }
 
-    /// Returns `true` if the underlying snow handshake is finished.
+    /// Returns `true` if the underlying snow handshake is finished AND the handshake has not
+    /// been poisoned by a prior error.
+    ///
+    /// A snow-finished-but-BindCert-failed handshake (failed == true) reports `false` here so
+    /// callers cannot proceed to `complete()` on a desynced state machine.
     pub fn is_finished(&self) -> bool {
-        self.state.is_handshake_finished()
+        !self.failed && self.state.is_handshake_finished()
     }
 
     // ─── Private helpers ─────────────────────────────────────────────────
@@ -1580,6 +1601,51 @@ mod tests {
                 Err(CryptoError::HandshakeFailed { reason }) if reason == "handshake already aborted"
             ),
             "complete() after poisoning must return 'handshake already aborted'; got: {complete_err:?}"
+        );
+    }
+
+    /// After a poisoning failure on the final handshake message, `is_finished()` must return
+    /// `false` even though snow internally considers the handshake complete. This ensures callers
+    /// cannot inadvertently treat a broken handshake as finished.
+    #[tokio::test]
+    async fn is_finished_false_after_poison_on_final_message() {
+        let clock = FixedClock(NOW);
+        let init_ks = SoftwareKeystore::generate();
+        let resp_ks = SoftwareKeystore::generate();
+
+        let resp_static = StaticSecret::random_from_rng(OsRng);
+        let resp_pub = x25519_dalek::PublicKey::from(&resp_static);
+        let init_static = StaticSecret::random_from_rng(OsRng);
+
+        let resp_id = resp_ks.device_identity().await.unwrap();
+        let init_id = init_ks.device_identity().await.unwrap();
+        init_ks.trust_peer(&resp_id).await.unwrap();
+        resp_ks.trust_peer(&init_id).await.unwrap();
+
+        let mut init =
+            NoiseHandshake::initiator_xk(&init_ks, init_static, resp_pub.to_bytes(), &[], &clock)
+                .await
+                .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static, &[], &clock)
+            .await
+            .unwrap();
+
+        // Drive XK to the final message (msg 2, which carries the initiator's BindCert).
+        let msg0 = init.write_message().unwrap();
+        resp.read_message(&msg0, &clock).unwrap();
+        let msg1 = resp.write_message().unwrap();
+        init.read_message(&msg1, &clock).unwrap();
+        let msg2 = init.write_message().unwrap();
+
+        // Feed the final message truncated — snow will process the Noise envelope but fail
+        // the MAC / length check, poisoning the responder after it advances state.
+        let result = resp.read_message(&msg2[..8], &clock);
+        assert!(result.is_err(), "truncated final message must be rejected");
+
+        // After poisoning, is_finished() must be false even though snow may think it's done.
+        assert!(
+            !resp.is_finished(),
+            "is_finished() must return false on a poisoned handshake"
         );
     }
 }
