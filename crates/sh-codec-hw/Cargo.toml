@@ -14,6 +14,15 @@ sh-types = { path = "../sh-types" }
 sh-adaptive = { path = "../sh-adaptive" }
 bytes.workspace = true
 thiserror.workspace = true
+# sh-codec-hw only uses tokio::sync::Semaphore.  Ideally we would specify
+# `default-features = false, features = ["sync"]` here, but Cargo workspace
+# resolver-2 ignores `default-features` on a member when the workspace
+# declaration does not itself set `default-features = false`.  The workspace
+# entry (`Cargo.toml` root) enables `["net", "rt", "sync"]`, so those three
+# features are unified into every workspace member regardless.  Restricting
+# the feature set here would require changing the workspace entry, which is
+# out of scope for this PR (it would need auditing every other consumer).
+# Tracked as a follow-up cleanup task.
 tokio.workspace = true
 tracing.workspace = true
 

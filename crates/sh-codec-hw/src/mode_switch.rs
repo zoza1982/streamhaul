@@ -80,6 +80,11 @@ pub enum ModeSwitchError {
         /// Maximum concurrent sessions this limiter permits.
         limit: u32,
         /// Number of sessions currently in use at the moment of the failed acquire.
+        ///
+        /// **Advisory only.** This value is sampled immediately after the failed
+        /// `try_acquire_owned` call.  Under concurrent release it may be stale by the time
+        /// the caller reads it — it is suitable for logging and metrics but must not be used
+        /// to make correctness decisions.
         active: u32,
     },
 
@@ -111,6 +116,7 @@ pub enum ModeSwitchError {
 ///   has no gap.  May be empty for encoders that buffer nothing internally (e.g. [`RawEncoder`]).
 /// * `flush_error` — log or increment a metric.  There is nothing the caller can do to
 ///   recover lost tail frames; this field is informational.
+#[must_use = "tail_packets must be forwarded to the viewer before the new IDR; flush_error must be checked"]
 #[derive(Debug)]
 pub struct SwitchOutcome {
     /// Packets drained from the old encoder after the swap.
@@ -142,6 +148,15 @@ pub struct SwitchOutcome {
 ///
 /// [`SessionGuard`] is the RAII handle that holds one permit; it releases it on drop.
 ///
+/// ## Cloning
+///
+/// `SessionLimiter` implements `Clone`, but **all clones share the same underlying permit pool**.
+/// A clone is a second handle to the *same* [`Arc`]-wrapped [`Semaphore`]; it does **not** create
+/// an independent quota.  This is intentional: NVENC enforces its session limit per-process, so
+/// all `SessionLimiter` handles in the process must draw from one shared budget.  Callers that
+/// expect independent per-instance quotas should construct separate `SessionLimiter` instances
+/// (typically only useful in tests).
+///
 /// # Examples
 ///
 /// ```
@@ -166,12 +181,21 @@ impl SessionLimiter {
     /// slot for other components in the process).  Pass `1` to force single-buffer mode; pass a
     /// larger value for multi-stream or professional GPU scenarios.
     ///
+    /// `max_sessions = 0` is technically valid (all `try_acquire` calls fail immediately) but
+    /// useful only for testing.
+    ///
     /// # Panics
     ///
-    /// Does not panic.  `max_sessions = 0` is technically valid (all `try_acquire` calls fail
-    /// immediately) but useful only for testing.
+    /// Will not panic for any realistic `max_sessions` value.  `tokio::sync::Semaphore::new`
+    /// only panics when `permits > usize::MAX >> 3`; for NVENC the realistic ceiling is 5
+    /// (consumer SKU driver limit), far below that threshold.  A `debug_assert` below fires in
+    /// debug builds if the value is unusually large, catching accidental misuse early.
     #[must_use]
     pub fn new(max_sessions: u32) -> Self {
+        debug_assert!(
+            (max_sessions as usize) <= tokio::sync::Semaphore::MAX_PERMITS,
+            "max_sessions ({max_sessions}) exceeds Semaphore::MAX_PERMITS"
+        );
         Self {
             semaphore: Arc::new(Semaphore::new(max_sessions as usize)),
             max_sessions,
@@ -552,6 +576,31 @@ impl DoubleBufferedEncoder {
     /// Request that the next encoded frame from the active encoder be a keyframe.
     ///
     /// Useful after packet loss is detected (P2-6 triggers this path).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sh_adaptive::classifier::ContentMode;
+    /// use sh_codec_hw::mode_switch::{DoubleBufferedEncoder, SessionLimiter, raw_encoder_factory};
+    /// use sh_media::EncoderConfig;
+    /// use sh_protocol::Codec;
+    ///
+    /// let config = EncoderConfig {
+    ///     codec: Codec::Raw,
+    ///     resolution: sh_media::Resolution::new(1920, 1080),
+    ///     target_fps: 60,
+    ///     target_bitrate_kbps: None,
+    /// };
+    /// let mut enc = DoubleBufferedEncoder::new(
+    ///     config,
+    ///     ContentMode::Work,
+    ///     raw_encoder_factory(),
+    ///     SessionLimiter::new(4),
+    /// ).unwrap();
+    ///
+    /// // Force the next frame to be an IDR (e.g. after detected packet loss).
+    /// enc.request_keyframe();
+    /// ```
     pub fn request_keyframe(&mut self) {
         self.active.request_keyframe();
     }
@@ -559,7 +608,45 @@ impl DoubleBufferedEncoder {
     /// Update the mode without changing the encoder configuration.
     ///
     /// This changes only the active [`BackpressurePolicy`]; it does **not** trigger an encoder
-    /// swap.  Use [`switch_to`](Self::switch_to) when the [`EncoderConfig`] must also change.
+    /// swap and does **not** reconfigure the underlying encoder.  After this call,
+    /// [`current_mode`](Self::current_mode) returns `mode` and
+    /// [`backpressure_policy`](Self::backpressure_policy) reflects the new mode, but the encoder
+    /// continues running its original [`EncoderConfig`] (codec, resolution, bitrate, fps).
+    ///
+    /// **If the [`EncoderConfig`] must also change** (e.g. switching from Work-quality H.264 to
+    /// Game-quality H.265), call [`switch_to`](Self::switch_to) instead.  Calling `request_mode`
+    /// alone leaves `mode` and `config` inconsistent until a subsequent `switch_to` is issued.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sh_adaptive::classifier::ContentMode;
+    /// use sh_codec_hw::mode_switch::{
+    ///     BackpressurePolicy, DoubleBufferedEncoder, SessionLimiter, raw_encoder_factory,
+    /// };
+    /// use sh_media::EncoderConfig;
+    /// use sh_protocol::Codec;
+    ///
+    /// let config = EncoderConfig {
+    ///     codec: Codec::Raw,
+    ///     resolution: sh_media::Resolution::new(1920, 1080),
+    ///     target_fps: 60,
+    ///     target_bitrate_kbps: None,
+    /// };
+    /// let mut enc = DoubleBufferedEncoder::new(
+    ///     config,
+    ///     ContentMode::Work,
+    ///     raw_encoder_factory(),
+    ///     SessionLimiter::new(4),
+    /// ).unwrap();
+    ///
+    /// assert_eq!(enc.backpressure_policy(), BackpressurePolicy::SkipCurrent);
+    ///
+    /// // Switch backpressure policy to Game without swapping the encoder.
+    /// enc.request_mode(ContentMode::Game);
+    /// assert_eq!(enc.current_mode(), ContentMode::Game);
+    /// assert_eq!(enc.backpressure_policy(), BackpressurePolicy::DropOldest);
+    /// ```
     pub fn request_mode(&mut self, mode: ContentMode) {
         self.current_mode = mode;
     }
