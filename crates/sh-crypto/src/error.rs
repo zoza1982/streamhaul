@@ -150,7 +150,10 @@ pub enum CryptoError {
 
     /// The received frame's epoch is more than 1 ahead of the current epoch.
     ///
-    /// A well-behaved peer advances at most one epoch at a time.
+    /// A well-behaved peer advances at most one epoch at a time. Drop the frame and log at warn
+    /// level; no teardown is required. A single occurrence may indicate packet reordering during a
+    /// rekey; repeated occurrences from the same peer are a sign of a misbehaving or malicious
+    /// peer and should be rate-limited.
     #[error("epoch too far ahead")]
     EpochTooFarAhead,
 

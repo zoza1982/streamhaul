@@ -431,6 +431,12 @@ impl RatchetChain {
 
 // ─── ReplayWindow ──────────────────────────────────────────────────────────
 
+/// Number of `u64` words in the replay-window bitmap.
+///
+/// Derived from `REPLAY_WINDOW / 64`: a 1024-bit window needs exactly 16 words of 64 bits each.
+/// Expressed as a constant so a future change to `REPLAY_WINDOW` propagates automatically.
+const REPLAY_WINDOW_WORDS: usize = REPLAY_WINDOW / 64;
+
 /// O(1) sliding bitmap anti-replay window (1024 bits = 16 × u64 words).
 ///
 /// Bit position `i` (0-indexed from the high end) represents `seq = high - i`.
@@ -439,7 +445,7 @@ struct ReplayWindow {
     /// The highest seq accepted so far (or `0` if nothing accepted yet).
     high: u64,
     /// Bitmap. `bits[word][bit]` at linear index `i` represents `high - i`.
-    bits: Box<[u64; 16]>,
+    bits: Box<[u64; REPLAY_WINDOW_WORDS]>,
     /// Whether any seq has been accepted yet.
     initialized: bool,
 }
@@ -448,7 +454,7 @@ impl ReplayWindow {
     fn new() -> Self {
         Self {
             high: 0,
-            bits: Box::new([0u64; 16]),
+            bits: Box::new([0u64; REPLAY_WINDOW_WORDS]),
             initialized: false,
         }
     }
@@ -466,10 +472,8 @@ impl ReplayWindow {
         if !self.initialized {
             return Ok(());
         }
-        // REPLAY_WINDOW = 1024, so window_size - 1 = 1023, never wraps.
-        let floor = self
-            .high
-            .saturating_sub((REPLAY_WINDOW as u64).saturating_sub(1));
+        // REPLAY_WINDOW = 1024, so REPLAY_WINDOW - 1 = 1023, never wraps.
+        let floor = self.high.saturating_sub((REPLAY_WINDOW - 1) as u64);
         if seq < floor {
             return Err(CryptoError::ReplayedFrame);
         }
@@ -478,7 +482,7 @@ impl ReplayWindow {
             let offset = self.high.saturating_sub(seq);
             let word = (offset / 64) as usize;
             let bit = (offset % 64) as u32;
-            // word is at most 1023/64 = 15, so always < 16; use .get() for safety.
+            // word is at most (REPLAY_WINDOW-1)/64 = 15, so always < REPLAY_WINDOW_WORDS; use .get() for safety.
             if let Some(w) = self.bits.get(word) {
                 if (w >> bit) & 1 == 1 {
                     return Err(CryptoError::ReplayedFrame);
@@ -497,7 +501,7 @@ impl ReplayWindow {
         if !self.initialized {
             self.initialized = true;
             self.high = seq;
-            // Mark bit 0 — bits has 16 elements, index 0 is always valid.
+            // Mark bit 0 — bits has REPLAY_WINDOW_WORDS elements, index 0 is always valid.
             if let Some(w) = self.bits.get_mut(0) {
                 *w |= 1u64;
             }
@@ -562,9 +566,9 @@ impl ReplayWindow {
         let bit_shift = (n % 64) as u32;
 
         // Step 1: word-level slide towards higher indices.
-        // Process from index 15 down to 0 to avoid overwriting source values.
+        // Process from index REPLAY_WINDOW_WORDS-1 down to 0 to avoid overwriting source values.
         if word_shift > 0 {
-            for i in (0..16usize).rev() {
+            for i in (0..REPLAY_WINDOW_WORDS).rev() {
                 if i >= word_shift {
                     let src_val = self
                         .bits
@@ -597,7 +601,7 @@ impl ReplayWindow {
             // 64u32 - bit_shift: bit_shift in 1..=63 → result in 1..=63, no underflow.
             #[allow(clippy::arithmetic_side_effects)]
             let anti_shift = 64u32 - bit_shift;
-            for i in (0..16usize).rev() {
+            for i in (0..REPLAY_WINDOW_WORDS).rev() {
                 let shifted = self.bits.get(i).copied().unwrap_or(0) << bit_shift;
                 // carry comes from bits[i-1] (lower array index = lower offset = higher seq).
                 // For i=0 there is no lower word; carry is 0.
@@ -1233,11 +1237,46 @@ mod tests {
     #[tokio::test]
     async fn cross_channel_replay_rejected() {
         let (mut init_keys, mut resp_keys) = do_xk_handshake_keys(NOW).await;
-        // Seal for Video, try to open as Audio — AAD includes channel_id, so tag fails.
+        // Seal for Video, try to open as Audio. The public API returns
+        // `MalformedChannelFrame { reason: "channel id mismatch" }` because `open()` checks
+        // `header.channel != channel` before reaching AEAD. The channel-id early-return is the
+        // primary defence; the AAD channel-id binding is defense-in-depth (tested separately in
+        // `aad_binds_channel_id_cross_channel_open_fails`).
         let frame = init_keys.seal(ChannelId::Video, b"video data").unwrap();
         let result = resp_keys.open(ChannelId::Audio, &frame);
-        // Should fail: either MalformedChannelFrame (channel mismatch) or AeadFailure.
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Err(CryptoError::MalformedChannelFrame {
+                reason: "channel id mismatch"
+            })
+        ));
+    }
+
+    /// AAD channel-id binding: a frame sealed for Video must fail to open against Audio keys
+    /// even when the header claims Audio (bypassing the channel-id early-return check).
+    ///
+    /// This exercises the AEAD defence-in-depth layer: the 35-byte AAD includes the channel byte,
+    /// so swapping the channel byte in the header while keeping the original Video ciphertext
+    /// causes tag verification to fail with `AeadFailure`.
+    #[tokio::test]
+    async fn aad_binds_channel_id_cross_channel_open_fails() {
+        let (mut init_keys, mut resp_keys) = do_xk_handshake_keys(NOW).await;
+        // Seal a legitimate Video frame.
+        let mut frame = init_keys.seal(ChannelId::Video, b"video data").unwrap();
+
+        // Rewrite byte 2 (channel id in header) from Video to Audio.
+        // This changes the channel field in the header but NOT in the AEAD ciphertext/tag,
+        // so the AAD computed by the receiver will differ from the one used during sealing.
+        frame[2] = u8::from(ChannelId::Audio);
+
+        // Now attempt to open it as Audio. The channel-id early-return sees Audio==Audio so
+        // it passes; direction check passes; epoch check passes. AEAD decryption fails because
+        // the AAD includes the channel byte that was changed, causing a tag mismatch.
+        let result = resp_keys.open(ChannelId::Audio, &frame);
+        assert!(
+            matches!(result, Err(CryptoError::AeadFailure)),
+            "AAD must bind the channel id: cross-channel frame must fail with AeadFailure, got {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -1703,8 +1742,19 @@ mod tests {
 
     /// REGRESSION: A forged frame claiming a future generation (within GEN_AHEAD_LIMIT) with
     /// a garbage AEAD tag must NOT advance the ratchet's max_gen or evict live generation keys.
-    /// Before the fix, `get_or_advance_to` mutated the chain before AEAD verification, enabling
-    /// a one-packet DoS that permanently destroyed decryption keys for the current generation.
+    ///
+    /// **What this test actually guards (two-phase commit correctness):**
+    /// The ratchet's `derive_key_transient` path is read-only; `commit_advance_to` is only
+    /// called after AEAD succeeds. A forged header with an invalid tag must therefore leave
+    /// `max_gen` at 0, keeping the gen-0 key live. The subsequent open of the legitimate gen-0
+    /// frame proves that the two-phase commit works: the forged `gen=GEN_AHEAD_LIMIT` header
+    /// did NOT evict gen 0 from `live_keys`.
+    ///
+    /// Note: with `GEN_WINDOW == GEN_AHEAD_LIMIT == 2`, a single forged frame at `gen=2` cannot
+    /// evict gen 0 from the window floor anyway (floor = max_gen - GEN_WINDOW = 0 - 2 saturates
+    /// to 0). The core protection here is the two-phase commit preventing a *ratchet advance*,
+    /// not window-floor eviction. See `gen_eviction_forged_frame_does_not_raise_floor` for the
+    /// non-vacuous floor-eviction test.
     #[tokio::test]
     async fn forged_future_generation_with_invalid_tag_does_not_advance_ratchet() {
         let (mut init_keys, mut resp_keys) = do_xk_handshake_keys(NOW).await;
@@ -1721,7 +1771,7 @@ mod tests {
             channel: ChannelId::Video,
             direction: Direction::I2R,
             epoch: 0,
-            generation: GEN_AHEAD_LIMIT, // = 2, within limit; triggers two-step advance
+            generation: GEN_AHEAD_LIMIT, // = 2, within limit; triggers two-step transient derive
             seq: 0,
         };
         let mut forged_frame = forged_header.encode().to_vec();
@@ -1738,6 +1788,116 @@ mod tests {
             .open(ChannelId::Video, &legit_frame)
             .expect("legit gen-0 frame must decrypt after forged gen+2 attack");
         assert_eq!(pt, b"real gen-0 data");
+    }
+
+    /// Non-vacuous generation-eviction test: advances both peers' ratchets to `max_gen > GEN_WINDOW`
+    /// by exchanging legitimate frames one generation at a time. Then sends a forged future-gen
+    /// frame with a bad tag and asserts that a legitimate in-window frame still decrypts —
+    /// proving the forged frame did NOT raise the floor or evict live keys.
+    ///
+    /// This supplements `forged_future_generation_with_invalid_tag_does_not_advance_ratchet` with
+    /// a scenario where the window floor is actually non-zero: after legitimately advancing
+    /// `max_gen` to `GEN_WINDOW + 2 = 4`, the floor on the receiver rises to `4 - 2 = 2`.
+    /// A forged frame at `max_gen + GEN_AHEAD_LIMIT = 6` must be rejected, and a subsequent
+    /// legitimate frame at gen 4 (still within the window) must still open.
+    #[tokio::test]
+    async fn gen_eviction_forged_frame_does_not_raise_floor() {
+        let (mut init_keys, mut resp_keys) = do_xk_handshake_keys(NOW).await;
+
+        // Target: advance both sides' ratchet to max_gen = GEN_WINDOW + 2 = 4.
+        // We do this by sealing exactly RATCHET_INTERVAL frames per generation and opening each
+        // generation's last frame on the responder before moving to the next, so the responder
+        // is always within GEN_AHEAD_LIMIT of the initiator.
+        let target_gen = GEN_WINDOW + 2; // = 4
+
+        for gen_step in 0..target_gen {
+            // Seal RATCHET_INTERVAL frames — the (RATCHET_INTERVAL)th triggers the ratchet
+            // advance to gen_step + 1 on the NEXT seal call. We need to seal RATCHET_INTERVAL
+            // frames while at gen_step to drive the counter up, then one more to advance.
+            // Simpler: seal RATCHET_INTERVAL + 1 frames; the last will be at gen_step + 1.
+            // Keep only the first (gen_step) and last frame of each generation:
+            //   - the first frame (at gen_step): to give to resp so it advances to gen_step.
+            //   - after advancing init to gen_step+1, keep a frame at gen_step+1 for resp.
+            // Actually: seal RATCHET_INTERVAL frames at gen_step, give first to resp.
+            let first_at_this_gen = init_keys.seal(ChannelId::Video, b"gen-step-first").unwrap();
+            let hdr0: [u8; 24] = first_at_this_gen[..24].try_into().unwrap();
+            let h0 = ChannelFrameHeader::parse(&hdr0).unwrap();
+            assert_eq!(
+                h0.generation, gen_step,
+                "expected gen {gen_step} on first frame"
+            );
+            // Open on resp to advance resp's ratchet to gen_step.
+            resp_keys
+                .open(ChannelId::Video, &first_at_this_gen)
+                .unwrap();
+
+            // Seal RATCHET_INTERVAL - 1 more frames (these push init's counter to RATCHET_INTERVAL,
+            // which triggers the ratchet advance on the NEXT seal).
+            for _ in 1..RATCHET_INTERVAL {
+                init_keys.seal(ChannelId::Video, b"filler").unwrap();
+            }
+            // This seal is at frame index RATCHET_INTERVAL (0-based): triggers ratchet advance
+            // to gen_step + 1.
+            let _advance_frame = init_keys
+                .seal(ChannelId::Video, b"ratchet-trigger")
+                .unwrap();
+            let hdr_adv: [u8; 24] = _advance_frame[..24].try_into().unwrap();
+            let h_adv = ChannelFrameHeader::parse(&hdr_adv).unwrap();
+            assert_eq!(
+                h_adv.generation,
+                gen_step + 1,
+                "expected ratchet advance to gen {}",
+                gen_step + 1
+            );
+        }
+
+        // Both sides are now at max_gen = target_gen = 4.
+        // Seal one more legitimate frame at gen=4 to give to resp.
+        let legit_frame = init_keys.seal(ChannelId::Video, b"legit at gen4").unwrap();
+        let hdr_l: [u8; 24] = legit_frame[..24].try_into().unwrap();
+        let h_l = ChannelFrameHeader::parse(&hdr_l).unwrap();
+        assert_eq!(
+            h_l.generation, target_gen,
+            "sender must be at gen {target_gen}"
+        );
+
+        // Verify resp can open it (advancing resp's ratchet to gen=4).
+        resp_keys.open(ChannelId::Video, &legit_frame).unwrap();
+
+        // Now resp's max_gen = 4, floor = 4 - GEN_WINDOW = 2.
+        // Send a forged frame at gen = target_gen + GEN_AHEAD_LIMIT = 6, bad tag.
+        let forged_header = ChannelFrameHeader {
+            channel: ChannelId::Video,
+            direction: Direction::I2R,
+            epoch: 0,
+            generation: target_gen + GEN_AHEAD_LIMIT, // = 6, within limit
+            seq: 1,                                   // fresh seq so replay window won't block
+        };
+        let mut forged_frame = forged_header.encode().to_vec();
+        forged_frame.extend_from_slice(&[0xCCu8; 16]); // garbage tag
+        let forge_result = resp_keys.open(ChannelId::Video, &forged_frame);
+        assert!(
+            forge_result.is_err(),
+            "forged future-gen frame must be rejected"
+        );
+
+        // Seal another legitimate frame at gen=4 (initiator is still at gen=4).
+        // If the forged frame raised max_gen, the floor would be at 4, evicting gen=4 key.
+        // The frame must still open, proving the two-phase commit held.
+        let post_forge_frame = init_keys
+            .seal(ChannelId::Video, b"post-forge legit")
+            .unwrap();
+        let hdr_pf: [u8; 24] = post_forge_frame[..24].try_into().unwrap();
+        let h_pf = ChannelFrameHeader::parse(&hdr_pf).unwrap();
+        assert_eq!(
+            h_pf.generation, target_gen,
+            "initiator must still be at gen {target_gen} — ratchet does not advance mid-generation"
+        );
+
+        let pt = resp_keys
+            .open(ChannelId::Video, &post_forge_frame)
+            .expect("legit in-window gen frame must still decrypt after forged future-gen attack");
+        assert_eq!(pt, b"post-forge legit");
     }
 
     /// REGRESSION: `zeroize_all()` must also zeroize the session root PRK so that
