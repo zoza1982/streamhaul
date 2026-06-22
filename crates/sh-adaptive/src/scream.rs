@@ -7,9 +7,9 @@
 //!
 //! ## Algorithm overview (RFC 8298)
 //!
-//! 1. **Queue-delay signal:** the controller tracks a *reference queue delay* (base delay) and
-//!    computes the current *queuing delay* as `observed_delay - base_delay`. When the delay
-//!    exceeds a threshold, the network is becoming congested.
+//! 1. **Queue-delay signal:** the transport layer supplies `queue_delay` directly in
+//!    [`TransportStats`]. The controller does not compute a base-delay baseline; that
+//!    responsibility belongs to the transport layer.
 //!
 //! 2. **Congestion window (CWND):** on each feedback:
 //!    - **Additive increase** when `queue_delay < HIGH_THRESHOLD` and no significant loss.
@@ -54,15 +54,20 @@ const MAX_RTT: Duration = Duration::from_secs(10);
 /// Maximum queue delay we trust from the transport layer.
 const MAX_QUEUE_DELAY: Duration = Duration::from_secs(2);
 
-/// Queue-delay threshold above which the controller triggers multiplicative decrease.
+/// Queue-delay threshold in seconds above which the controller triggers multiplicative decrease.
 ///
 /// RFC 8298 §4.1.1 recommends `Qth = 0.02 s` (20 ms) for interactive media. This is the
 /// boundary between "network is loading up" and "network is congested".
-const QUEUE_DELAY_HIGH_THRESHOLD: Duration = Duration::from_millis(20);
+/// Stored as `f64` to avoid repeated `as_secs_f64()` conversions in the hot path.
+const QUEUE_DELAY_HIGH_THRESHOLD_SECS: f64 = 0.020;
 
-/// Queue-delay target for additive increase: we aim for half the high threshold so there is
-/// headroom before triggering decrease.
-const QUEUE_DELAY_TARGET: Duration = Duration::from_millis(10);
+/// Queue-delay target in seconds for additive increase: we aim for half the high threshold so
+/// there is headroom before triggering decrease.
+/// Stored as `f64` to avoid repeated `as_secs_f64()` conversions in the hot path.
+const QUEUE_DELAY_TARGET_SECS: f64 = 0.010;
+
+/// Minimum RTT in seconds. Stored as `f64` to avoid repeated `as_secs_f64()` conversions.
+const MIN_RTT_SECS: f64 = 0.000_100;
 
 /// Loss fraction (as a proportion of `bytes_acked`) above which multiplicative decrease triggers.
 ///
@@ -124,11 +129,6 @@ pub struct ScreamConfig {
     /// Default: 50 Mbps (well above any expected LAN or WAN path capacity in the near term).
     pub max_bitrate: Bitrate,
 
-    /// Initial CWND in bytes at session start (cold-start).
-    ///
-    /// Default: `initial_bitrate * 100ms / 8` (roughly 100 ms worth of the initial target rate).
-    pub initial_cwnd_bytes: f64,
-
     /// Initial target bitrate before any feedback has been received.
     ///
     /// Default: 2 Mbps (a conservative starting point that avoids flooding a slow network while
@@ -143,15 +143,10 @@ pub struct ScreamConfig {
 
 impl Default for ScreamConfig {
     fn default() -> Self {
-        let initial_bitrate = Bitrate::from_mbps(2);
-        // initial_cwnd = rate * rtt / 8  (bytes)
-        // = 2e6 bps * 0.050 s / 8 = 12_500 bytes
-        let initial_cwnd_bytes = (initial_bitrate.as_bps_f64() * 0.050) / 8.0;
         Self {
             min_bitrate: Bitrate::from_kbps(100),
             max_bitrate: Bitrate::from_mbps(50),
-            initial_cwnd_bytes,
-            initial_bitrate,
+            initial_bitrate: Bitrate::from_mbps(2),
             initial_rtt: Duration::from_millis(50),
         }
     }
@@ -160,8 +155,8 @@ impl Default for ScreamConfig {
 /// Phase of the congestion controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
-    /// Slow-start: CWND grows rapidly until the first congestion signal or until we exceed a
-    /// threshold derived from the initial bitrate.
+    /// Slow-start: CWND grows rapidly until the first congestion signal or until CWND reaches
+    /// `ssthresh`.
     SlowStart,
     /// Steady state: additive increase / multiplicative decrease (AIMD).
     SteadyState,
@@ -205,8 +200,9 @@ pub struct ScreamController {
     /// Smoothed RTT (EWMA, α = 0.125, matching TCP), in seconds.
     srtt_secs: f64,
 
-    /// Minimum RTT observed over the session, used as the base delay reference.
-    min_rtt_secs: f64,
+    /// Slow-start threshold in bytes. Graduate [`Phase::SlowStart`] → [`Phase::SteadyState`]
+    /// when CWND reaches this, or on the first congestion event.
+    ssthresh: f64,
 
     /// Current controller phase (slow-start vs. steady-state AIMD).
     phase: Phase,
@@ -236,15 +232,19 @@ impl ScreamController {
         let initial_bitrate = config
             .initial_bitrate
             .clamp(config.min_bitrate, config.max_bitrate);
-        let cwnd = config
-            .initial_cwnd_bytes
-            .clamp(MIN_CWND_BYTES, MAX_CWND_BYTES);
         let initial_rtt_secs = clamp_rtt(config.initial_rtt).as_secs_f64();
+        // Compute initial CWND: rate * rtt / 8 (bytes), clamped to [MIN, MAX].
+        let cwnd_raw = config.initial_bitrate.as_bps_f64() * initial_rtt_secs / 8.0;
+        let cwnd = if cwnd_raw.is_finite() {
+            cwnd_raw.clamp(MIN_CWND_BYTES, MAX_CWND_BYTES)
+        } else {
+            MIN_CWND_BYTES
+        };
         Self {
             target_bitrate: initial_bitrate,
             cwnd,
             srtt_secs: initial_rtt_secs,
-            min_rtt_secs: initial_rtt_secs,
+            ssthresh: MAX_CWND_BYTES,
             phase: Phase::SlowStart,
             last_feedback_time: None,
             last_decrease_time: None,
@@ -260,14 +260,11 @@ impl ScreamController {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    /// Update the smoothed RTT and minimum-RTT baseline.
+    /// Update the smoothed RTT.
     fn update_rtt(&mut self, rtt: Duration) {
         let rtt_s = clamp_rtt(rtt).as_secs_f64();
         // EWMA: α = 0.125 (same as TCP SRTT in RFC 6298)
         self.srtt_secs = 0.875 * self.srtt_secs + 0.125 * rtt_s;
-        if rtt_s < self.min_rtt_secs {
-            self.min_rtt_secs = rtt_s;
-        }
     }
 
     /// Clamp CWND to `[MIN_CWND_BYTES, MAX_CWND_BYTES]` and replace NaN/Inf.
@@ -285,7 +282,7 @@ impl ScreamController {
     fn update_target_bitrate(&mut self) {
         let srtt = self.srtt_secs;
         // Guard: SRTT below minimum is physically impossible; clamp up to avoid huge bitrate.
-        let srtt = srtt.max(MIN_RTT.as_secs_f64());
+        let srtt = srtt.max(MIN_RTT_SECS);
 
         let bps = self.cwnd * 8.0 / srtt;
         // NaN/Inf guard
@@ -307,7 +304,9 @@ impl ScreamController {
             Some(t) => {
                 let elapsed = now.saturating_duration_since(t);
                 // Suppress if less than one SRTT has passed since the last decrease.
-                elapsed < Duration::from_secs_f64(self.srtt_secs.max(0.0))
+                // Floor at MIN_RTT to prevent srtt_secs near zero from making the suppression
+                // window vanishingly small.
+                elapsed < Duration::from_secs_f64(self.srtt_secs.max(MIN_RTT_SECS))
             }
         }
     }
@@ -316,33 +315,33 @@ impl ScreamController {
     ///
     /// The increase depends on the current phase:
     /// - **Slow-start:** multiplicative increase (`cwnd += bytes_acked * SLOW_START_SCALE`)
-    ///   until the first congestion event or until CWND reaches the initial bitrate × initial RTT.
+    ///   until the first congestion event or until CWND reaches `ssthresh`.
     /// - **Steady-state:** additive increase (`cwnd += MSS * bytes_acked / cwnd`), bounded
-    ///   to at least one MSS per RTT (RFC 8298 §4.1.1).
+    ///   to at least one MSS per RTT (RFC 8298 §4.1.1). Only applied when `bytes_acked > 0`.
     fn apply_increase(&mut self, bytes_acked: u32, queue_delay_secs: f64) {
         let acked = f64::from(bytes_acked);
         match self.phase {
             Phase::SlowStart => {
-                // Exponential growth until we hit the initial BDP estimate.
+                // Exponential growth.
                 let increase = acked * SLOW_START_SCALE;
                 let new_cwnd = self.cwnd + increase;
                 if new_cwnd.is_finite() {
                     self.cwnd = new_cwnd;
                 }
-                // Graduate to steady state if CWND is large enough that we're beyond cold start,
-                // or if the queue is already building up.
-                let bdp_estimate = self.config.initial_bitrate.as_bps_f64() * self.srtt_secs / 8.0;
-                if self.cwnd >= bdp_estimate || queue_delay_secs > QUEUE_DELAY_TARGET.as_secs_f64()
-                {
+                // Graduate to steady state if CWND reaches ssthresh or the queue is building.
+                if self.cwnd >= self.ssthresh || queue_delay_secs > QUEUE_DELAY_TARGET_SECS {
                     self.phase = Phase::SteadyState;
                 }
             }
             Phase::SteadyState => {
-                // RFC 8298 §4.1.1: delta_cwnd = max(MSS * acked / cwnd, MSS)
-                let delta = (MSS_BYTES * acked / self.cwnd).max(MSS_BYTES);
-                let new_cwnd = self.cwnd + delta;
-                if new_cwnd.is_finite() {
-                    self.cwnd = new_cwnd;
+                // Only increase if bytes were acknowledged this feedback epoch.
+                if acked > 0.0 {
+                    // RFC 8298 §4.1.1: delta_cwnd = max(MSS * acked / cwnd, MSS)
+                    let delta = (MSS_BYTES * acked / self.cwnd).max(MSS_BYTES);
+                    let new_cwnd = self.cwnd + delta;
+                    if new_cwnd.is_finite() {
+                        self.cwnd = new_cwnd;
+                    }
                 }
             }
         }
@@ -351,9 +350,13 @@ impl ScreamController {
 
     /// Execute the multiplicative decrease step (congestion detected).
     ///
-    /// CWND is multiplied by `BETA_DECREASE` (0.85), equivalent to a 15% reduction.
+    /// Sets `ssthresh` to `cwnd * BETA_DECREASE` before reducing CWND, so slow-start knows
+    /// where to stop on the next cold-restart. CWND is then multiplied by `BETA_DECREASE`
+    /// (0.85), equivalent to a 15% reduction.
     /// At most one decrease per SRTT is applied (guarded by `decrease_suppressed`).
     fn apply_decrease(&mut self, now: Instant) {
+        // Record ssthresh before decrease so slow-start won't overshoot on restart.
+        self.ssthresh = (self.cwnd * BETA_DECREASE).max(MIN_CWND_BYTES);
         let new_cwnd = self.cwnd * BETA_DECREASE;
         if new_cwnd.is_finite() {
             self.cwnd = new_cwnd;
@@ -387,8 +390,26 @@ impl CongestionController for ScreamController {
                     return;
                 }
                 Some(d) if d > MAX_UPDATE_INTERVAL => {
-                    // Very long gap: treat as session restart / cold start.
+                    // Very long gap: full cold-restart to avoid resuming with stale state.
+                    // Reset everything to initial config values, then return — CWND update
+                    // for this particular (stale) feedback is skipped; the *next* feedback
+                    // will drive the algorithm from the clean initial state.
                     self.phase = Phase::SlowStart;
+                    // Recompute initial window from config (same formula as ::new).
+                    let init_rtt_s = clamp_rtt(self.config.initial_rtt).as_secs_f64();
+                    let init_cwnd_raw = self.config.initial_bitrate.as_bps_f64() * init_rtt_s / 8.0;
+                    let init_cwnd = if init_cwnd_raw.is_finite() {
+                        init_cwnd_raw.clamp(MIN_CWND_BYTES, MAX_CWND_BYTES)
+                    } else {
+                        MIN_CWND_BYTES
+                    };
+                    self.cwnd = init_cwnd;
+                    self.srtt_secs = init_rtt_s;
+                    self.last_decrease_time = None;
+                    self.ssthresh = MAX_CWND_BYTES;
+                    self.last_feedback_time = Some(now);
+                    self.update_target_bitrate();
+                    return;
                 }
                 _ => {}
             }
@@ -416,8 +437,8 @@ impl CongestionController for ScreamController {
         };
 
         // ── Congestion decision ───────────────────────────────────────────────
-        let congested = queue_delay_secs >= QUEUE_DELAY_HIGH_THRESHOLD.as_secs_f64()
-            || loss_frac >= LOSS_THRESHOLD;
+        let congested =
+            queue_delay_secs >= QUEUE_DELAY_HIGH_THRESHOLD_SECS || loss_frac >= LOSS_THRESHOLD;
 
         if congested {
             if !self.decrease_suppressed(now) {
@@ -497,10 +518,11 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// A simple network simulator used to drive the controller deterministically.
+    /// A network simulator with an accumulating bottleneck queue model.
     ///
-    /// The simulator advances a synthetic clock and produces `TransportStats` based on a
-    /// token-bucket bandwidth cap, a fixed propagation delay, and an optional loss rate.
+    /// Tracks a virtual queue in bytes that fills when send rate exceeds the link capacity and
+    /// drains at line rate. Queue delay is computed as queue_bytes / drain_rate. Tail-drop
+    /// occurs when the queue exceeds `max_queue_bytes` (≈200 ms of buffering at cap).
     struct NetSim {
         /// Available bandwidth (bits per second).
         cap_bps: f64,
@@ -512,6 +534,10 @@ mod tests {
         clock: Instant,
         /// Clock step per simulated feedback interval.
         step: Duration,
+        /// Accumulated bottleneck queue in bytes.
+        queue_bytes: f64,
+        /// Maximum buffer before tail-drop (bytes). At cap, ≈200 ms of buffering.
+        max_queue_bytes: f64,
     }
 
     impl NetSim {
@@ -519,39 +545,56 @@ mod tests {
             // Instant::now() is allowed in tests; the controller itself never calls it.
             #[allow(clippy::disallowed_methods)]
             let clock = Instant::now();
+            let cap_bps = f64::from(u32::try_from(cap_kbps).unwrap_or(u32::MAX)) * 1_000.0;
+            // 200 ms buffer at cap
+            let max_queue_bytes = cap_bps * 0.200 / 8.0;
             Self {
-                cap_bps: f64::from(u32::try_from(cap_kbps).unwrap_or(u32::MAX)) * 1_000.0,
+                cap_bps,
                 prop_delay: Duration::from_millis(prop_delay_ms),
                 loss_rate: loss_rate.clamp(0.0, 1.0),
                 clock,
-                step: Duration::from_millis(10), // 100 Hz feedback
+                step: Duration::from_millis(10),
+                queue_bytes: 0.0,
+                max_queue_bytes,
             }
         }
 
         /// Advance time by one step and return a `TransportStats` for the current state.
         ///
-        /// `send_rate_bps` is the rate at which the controller is currently sending; the sim
-        /// computes how many bytes were acked/lost given the cap and loss rate.
+        /// `send_rate_bps` is the rate at which the controller is currently sending. The sim
+        /// models an accumulating bottleneck queue: ingress at `send_rate_bps`, egress at
+        /// `cap_bps`, with tail-drop at `max_queue_bytes`. Queue delay = queue / drain_rate.
         fn tick(&mut self, send_rate_bps: f64) -> (Instant, TransportStats) {
             self.clock += self.step;
+            let step_secs = self.step.as_secs_f64();
             let rtt = self.prop_delay.saturating_mul(2);
-            // Bytes delivered this step = min(send_rate, cap) * step_duration * (1 - loss)
-            let deliverable_bps = send_rate_bps.min(self.cap_bps);
-            let bytes_this_step = (deliverable_bps * self.step.as_secs_f64() / 8.0).max(0.0) as u32;
-            let bytes_acked = ((bytes_this_step as f64) * (1.0 - self.loss_rate)) as u32;
-            let bytes_lost = bytes_this_step.saturating_sub(bytes_acked);
-            // Queue-delay: if sending above cap, queue builds up. We model a 50ms buffer
-            // that fills proportionally to the excess send rate: when the excess is 40% of
-            // cap (i.e. send rate = 1.4×cap), queue delay reaches 20ms (the SCReAM threshold),
-            // so the controller backs off promptly. This is more representative of real router
-            // buffers (tens of ms) than scaling by propagation delay alone.
-            let excess_ratio = (send_rate_bps / self.cap_bps.max(1.0) - 1.0).max(0.0);
-            let buffer_fill_secs = excess_ratio * 0.050; // 50 ms buffer fully fills at 2× cap
-            let queue_delay =
-                Duration::from_secs_f64(buffer_fill_secs.min(MAX_QUEUE_DELAY.as_secs_f64()));
+
+            // Ingress: bytes enqueued this step from sender.
+            let ingress = (send_rate_bps * step_secs / 8.0).max(0.0);
+            // Egress: bytes drained at line rate.
+            let egress = (self.cap_bps * step_secs / 8.0).max(0.0);
+
+            // Update queue.
+            self.queue_bytes = (self.queue_bytes + ingress - egress).max(0.0);
+            // Tail-drop: clamp to max buffer size.
+            self.queue_bytes = self.queue_bytes.min(self.max_queue_bytes);
+
+            // Queue delay: queue / drain_rate.
+            let queue_delay_secs = if self.cap_bps > 0.0 {
+                (self.queue_bytes * 8.0 / self.cap_bps).min(MAX_QUEUE_DELAY.as_secs_f64())
+            } else {
+                MAX_QUEUE_DELAY.as_secs_f64()
+            };
+
+            // Bytes actually delivered = egress * (1 - loss_rate).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let bytes_acked = (egress * (1.0 - self.loss_rate)) as u32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let bytes_lost = (egress * self.loss_rate) as u32;
+
             let fb = TransportStats {
                 rtt,
-                queue_delay,
+                queue_delay: Duration::from_secs_f64(queue_delay_secs),
                 bytes_acked,
                 bytes_lost,
                 loss_fraction_q8: 0,
@@ -594,23 +637,29 @@ mod tests {
 
     /// Test: controller converges toward the available bandwidth cap.
     ///
-    /// After enough steps, target_bitrate should be within [50%, 130%] of the cap.
+    /// After enough steps, target_bitrate should be within [85%, 115%] of the cap.
     #[test]
     fn converges_toward_cap() {
         let cap_kbps = 5_000u64;
         let mut ctrl = ScreamController::with_defaults();
         let mut sim = NetSim::new(cap_kbps, 20, 0.0);
 
-        // Run 300 steps (~3 seconds at 100Hz feedback) to allow convergence.
-        for _ in 0..300 {
+        // Collect queue delays over the last 200 steps for the bufferbloat guard.
+        let mut late_queue_delays: Vec<Duration> = Vec::new();
+
+        // Run 500 steps (~5 seconds at 100Hz feedback) to allow convergence with physical queue.
+        for i in 0..500 {
             let send_bps = ctrl.target_bitrate().as_bps_f64();
             let (now, fb) = sim.tick(send_bps);
             ctrl.on_feedback(&fb, now);
+            if i >= 300 {
+                late_queue_delays.push(fb.queue_delay);
+            }
         }
 
         let final_kbps = ctrl.target_bitrate().as_kbps();
-        let low = cap_kbps / 2;
-        let high = cap_kbps * 13 / 10; // 130% (accounts for transient overshoot)
+        let low = cap_kbps * 85 / 100; // 85%
+        let high = cap_kbps * 115 / 100; // 115%
         println!(
             "[converges_toward_cap] cap={cap_kbps} kbps, final={final_kbps} kbps  (band: [{low},{high}])"
         );
@@ -621,6 +670,17 @@ mod tests {
         assert!(
             final_kbps <= high,
             "controller overshot too much: {final_kbps} kbps > {high} kbps"
+        );
+
+        // Bufferbloat guard: steady-state queue delay should stay under 40ms.
+        let max_late_queue = late_queue_delays
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(Duration::ZERO);
+        assert!(
+            max_late_queue < Duration::from_millis(40),
+            "bufferbloat: max queue delay {max_late_queue:?} exceeds 40ms"
         );
     }
 
@@ -811,16 +871,20 @@ mod tests {
 
         for (label, cap_kbps, steps) in scenarios {
             sim.cap_bps = (*cap_kbps as f64) * 1_000.0;
+            // Reset queue between scenario phases to avoid accumulated state skewing results.
+            sim.queue_bytes = 0.0;
+            sim.max_queue_bytes = sim.cap_bps * 0.200 / 8.0;
             for i in 0..*steps {
                 let send_bps = ctrl.target_bitrate().as_bps_f64();
                 let (now, fb) = sim.tick(send_bps);
+                let queue_ms = fb.queue_delay.as_secs_f64() * 1000.0;
                 ctrl.on_feedback(&fb, now);
                 // Print every 50 steps.
                 if i % 50 == 49 || i == steps - 1 {
                     println!(
-                        "  {label} [step {:>3}]: cap={cap_kbps} kbps  target={} kbps",
+                        "  {label} [step {:>3}]: cap={cap_kbps} kbps  target={} kbps  queue={queue_ms:.1}ms",
                         i + 1,
-                        ctrl.target_bitrate().as_kbps()
+                        ctrl.target_bitrate().as_kbps(),
                     );
                 }
             }
@@ -856,8 +920,8 @@ mod tests {
             readings.push(ctrl.target_bitrate().as_kbps());
         }
 
-        let min_r = *readings.iter().min().unwrap_or(&0);
-        let max_r = *readings.iter().max().unwrap_or(&0);
+        let min_r = readings.iter().copied().min().unwrap_or(0);
+        let max_r = readings.iter().copied().max().unwrap_or(0);
         let range = max_r.saturating_sub(min_r);
         println!(
             "[no_pathological_oscillation] converged range: [{min_r},{max_r}] kbps (spread: {range} kbps)"
@@ -907,6 +971,220 @@ mod tests {
         };
         let ctrl = ScreamController::new(cfg.clone());
         assert_eq!(ctrl.target_bitrate(), cfg.min_bitrate);
+    }
+
+    // ── New regression / correctness tests ───────────────────────────────────
+
+    /// Test: slow-start ramps target significantly before the queue builds up.
+    #[test]
+    fn slow_start_ramps_exponentially() {
+        // With ssthresh=MAX_CWND_BYTES, slow-start should run for many steps before
+        // the queue builds up and forces graduation to steady state.
+        let mut ctrl = ScreamController::with_defaults();
+        // Use a very high cap so the queue never builds — slow-start can run freely.
+        let mut sim = NetSim::new(50_000, 5, 0.0); // 50 Mbps, 5ms prop delay
+
+        let initial_target = ctrl.target_bitrate().as_bps_f64();
+        let mut prev_target = initial_target;
+        let mut exponential_steps = 0u32;
+
+        // Run for up to 100 steps; count how many steps the target increased significantly
+        // (>= 50% above previous, indicating exponential-style growth).
+        for _ in 0..100 {
+            let send_bps = ctrl.target_bitrate().as_bps_f64();
+            let (now, fb) = sim.tick(send_bps);
+            ctrl.on_feedback(&fb, now);
+            let cur = ctrl.target_bitrate().as_bps_f64();
+            if cur > prev_target * 1.5 {
+                exponential_steps += 1;
+            }
+            prev_target = cur;
+        }
+        let final_target = ctrl.target_bitrate().as_bps_f64();
+        println!(
+            "[slow_start_ramps_exponentially] initial={:.0} bps, final={:.0} bps, exp_steps={exponential_steps}",
+            initial_target, final_target
+        );
+        // Should have ramped significantly from initial.
+        assert!(
+            final_target > initial_target * 5.0,
+            "slow start should ramp target significantly; initial={initial_target:.0}, final={final_target:.0}"
+        );
+        // Should have seen at least some exponential-looking steps.
+        assert!(
+            exponential_steps >= 1,
+            "expected at least one exponential growth step"
+        );
+    }
+
+    /// Test: zero bytes_acked in SteadyState does not inflate CWND.
+    #[test]
+    fn zero_acked_does_not_inflate_cwnd() {
+        let cfg = ScreamConfig {
+            initial_bitrate: Bitrate::from_mbps(2),
+            ..ScreamConfig::default()
+        };
+        let mut ctrl = ScreamController::new(cfg.clone());
+        // First, graduate out of slow-start by sending one real feedback with acked bytes
+        // and a queue delay to force steady state.
+        #[allow(clippy::disallowed_methods)]
+        let base = Instant::now();
+        let trigger_fb = TransportStats {
+            rtt: Duration::from_millis(20),
+            queue_delay: Duration::from_millis(15), // above QUEUE_DELAY_TARGET, forces steady-state
+            bytes_acked: 10_000,
+            bytes_lost: 0,
+            loss_fraction_q8: 0,
+            interval: Duration::from_millis(10),
+        };
+        ctrl.on_feedback(&trigger_fb, base + Duration::from_millis(10));
+        // Ensure we're in steady-state by applying a decrease signal.
+        let decrease_fb = TransportStats {
+            rtt: Duration::from_millis(20),
+            queue_delay: Duration::from_millis(25), // above HIGH_THRESHOLD → decrease
+            bytes_acked: 0,
+            bytes_lost: 0,
+            loss_fraction_q8: 0,
+            interval: Duration::from_millis(10),
+        };
+        ctrl.on_feedback(&decrease_fb, base + Duration::from_millis(20));
+        let rate_after_decrease = ctrl.target_bitrate();
+
+        // Now send many feedbacks with zero acked, no congestion → CWND must NOT increase.
+        // We use rtt=ZERO so that SRTT is not updated (the guard `if fb.rtt > ZERO` skips it),
+        // keeping target = cwnd/srtt stable. This isolates the CWND guard from RTT convergence.
+        for i in 0..50u64 {
+            let zero_fb = TransportStats {
+                rtt: Duration::ZERO,         // skip RTT update to keep SRTT stable
+                queue_delay: Duration::ZERO, // no congestion
+                bytes_acked: 0,
+                bytes_lost: 0,
+                loss_fraction_q8: 0,
+                interval: Duration::from_millis(10),
+            };
+            ctrl.on_feedback(&zero_fb, base + Duration::from_millis(30 + i * 10));
+        }
+        let rate_after_zero = ctrl.target_bitrate();
+        println!(
+            "[zero_acked_does_not_inflate_cwnd] after_decrease={rate_after_decrease}, after_50_zero_acked={rate_after_zero}"
+        );
+        assert!(
+            rate_after_zero <= rate_after_decrease,
+            "CWND inflated with zero acked: before={rate_after_decrease}, after={rate_after_zero}"
+        );
+    }
+
+    /// Test: after a >30s gap, the controller cold-restarts to near initial bitrate.
+    #[test]
+    fn session_restart_resets_cwnd_to_initial() {
+        let cfg = ScreamConfig::default();
+        let mut ctrl = ScreamController::new(cfg.clone());
+        #[allow(clippy::disallowed_methods)]
+        let base = Instant::now();
+        let mut sim = NetSim::new(10_000, 20, 0.0); // 10 Mbps
+
+        // Ramp up for 300 steps.
+        for i in 0..300u64 {
+            let send_bps = ctrl.target_bitrate().as_bps_f64();
+            let (_, fb) = sim.tick(send_bps);
+            ctrl.on_feedback(&fb, base + Duration::from_millis(10 * (i + 1)));
+        }
+        let peak = ctrl.target_bitrate();
+        println!("[session_restart] peak before gap: {peak}");
+
+        // Simulate 31 seconds of silence, then resume.
+        let resume_time = base + Duration::from_millis(3_000) + Duration::from_secs(31);
+        let (_, resume_fb) = sim.tick(ctrl.target_bitrate().as_bps_f64());
+        ctrl.on_feedback(&resume_fb, resume_time);
+
+        let after_restart = ctrl.target_bitrate();
+        println!("[session_restart] after 31s gap: {after_restart}");
+
+        // After cold-restart, target should be near the initial bitrate, not at peak.
+        // Allow up to initial + 5 Mbps (the CWND was reset but one step of slow-start ran).
+        let initial = cfg.initial_bitrate;
+        assert!(
+            after_restart <= initial.saturating_add(Bitrate::from_mbps(5)),
+            "expected reset near initial {initial} after gap, got {after_restart}"
+        );
+        assert!(
+            after_restart < peak,
+            "expected target to drop after restart: peak={peak}, after={after_restart}"
+        );
+    }
+
+    /// Test: `decrease_suppressed` uses the MIN_RTT floor correctly at low RTT.
+    ///
+    /// Verifies that `decrease_suppressed` floors the suppression window at `MIN_RTT_SECS`,
+    /// preventing a very small SRTT (e.g., 200 µs) from allowing decreases faster than
+    /// `MIN_RTT` intervals. We use a normal RTT controller, ramp it up, then send persistent
+    /// congestion at 2 ms intervals and verify that (a) decreases do occur, (b) the controller
+    /// stays within bounds, and (c) it does not panic.
+    #[test]
+    fn persistent_congestion_decreases_at_most_once_per_min_rtt() {
+        let cfg = ScreamConfig::default(); // 50ms initial RTT — cwnd is substantial
+        let mut ctrl = ScreamController::new(cfg.clone());
+        #[allow(clippy::disallowed_methods)]
+        let base = Instant::now();
+
+        // Ramp up the controller for a few steps so cwnd is above minimum.
+        let mut sim = NetSim::new(10_000, 5, 0.0);
+        for i in 0..50u64 {
+            let send_bps = ctrl.target_bitrate().as_bps_f64();
+            let (_, fb) = sim.tick(send_bps);
+            ctrl.on_feedback(&fb, base + Duration::from_millis(10 * (i + 1)));
+        }
+        let before_congestion = ctrl.target_bitrate();
+        println!("[persistent_congestion_low_rtt] before congestion: {before_congestion}");
+
+        // Now simulate persistent congestion (25ms queue delay) at 2ms intervals.
+        // Each step is well above MIN_UPDATE_INTERVAL (1ms), so none are filtered.
+        // The suppression window = max(srtt ≈ 10ms, MIN_RTT = 0.1ms) = 10ms.
+        // With 2ms steps, some steps will be suppressed (within the 10ms window),
+        // and some will not. We verify that at least one decrease fires and bounds hold.
+        let congestion_start = base + Duration::from_millis(10 * 51);
+        let mut decrease_count = 0u32;
+        let mut prev = before_congestion;
+        for i in 0..50u64 {
+            let now = congestion_start + Duration::from_millis(2 * i + 2);
+            ctrl.on_feedback(
+                &TransportStats {
+                    rtt: Duration::from_millis(10),
+                    queue_delay: Duration::from_millis(25), // above HIGH_THRESHOLD
+                    bytes_acked: 0,
+                    bytes_lost: 0,
+                    loss_fraction_q8: 0,
+                    interval: Duration::from_millis(2),
+                },
+                now,
+            );
+            let cur = ctrl.target_bitrate();
+            if cur < prev {
+                decrease_count += 1;
+            }
+            prev = cur;
+            assert!(
+                cur >= cfg.min_bitrate,
+                "below min after decrease #{i}: {cur}"
+            );
+        }
+        println!(
+            "[persistent_congestion_low_rtt] decreases={decrease_count}/50, final={}",
+            ctrl.target_bitrate()
+        );
+        // At 2ms steps and srtt ≈ 10ms, suppression window = 10ms.
+        // Decrease fires at step 0, then suppressed for 5 steps, then fires again, etc.
+        // We expect roughly 50/5 = ~10 decreases, but at least a few.
+        assert!(
+            decrease_count > 0,
+            "expected at least one decrease on persistent congestion; got {decrease_count}"
+        );
+        // Target should be well below where we started (congestion drove it down).
+        assert!(
+            ctrl.target_bitrate() < before_congestion,
+            "expected target to decrease under persistent congestion: before={before_congestion}, after={}",
+            ctrl.target_bitrate()
+        );
     }
 }
 

@@ -666,6 +666,7 @@ name = "sh-adaptive"
 version = "0.0.0"
 dependencies = [
  "proptest",
+ "sh-types",
  "thiserror",
 ]
 

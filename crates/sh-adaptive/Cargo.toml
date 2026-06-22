@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+sh-types = { path = "../sh-types" }
 
 [dev-dependencies]
 proptest = { workspace = true }

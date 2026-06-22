@@ -59,10 +59,19 @@ pub struct TransportStats {
     /// rather than panicking or producing a negative number.
     pub bytes_lost: u32,
 
-    /// Fraction of packets lost in this feedback epoch, expressed as a value in `[0, 256]`.
+    /// Fraction of packets lost in this feedback epoch, expressed as a value in `[0, 255]`.
     ///
-    /// `0` = no loss; `256` = 100% loss (matches the RTCP Fraction Lost encoding, RFC 3550
-    /// §6.4.1, where the 8-bit field is `floor(lost/expected * 256)`).
+    /// `0` = no loss; `255` ≈ 99.6% loss. This matches the RTCP Fraction Lost encoding (RFC 3550
+    /// §6.4.1), where the 8-bit field is `floor(lost/expected * 256)`. Note that the RFC formula
+    /// yields `256` at exactly 100% loss, which wraps to `0` in a `u8`; callers MUST saturate
+    /// before storing:
+    ///
+    /// ```text
+    /// loss_fraction_q8 = ((lost as u64 * 256 / expected as u64).min(255)) as u8
+    /// ```
+    ///
+    /// Therefore `255` encodes ≈99.6% loss, not 100%. The controller treats any non-zero value
+    /// here as an indication of packet loss.
     ///
     /// Controllers may use this _instead of_ or _in addition to_ `bytes_lost`/`bytes_acked`.
     /// If the transport provides the fraction directly (e.g. from an RTCP RR), set this field;
@@ -93,7 +102,11 @@ impl Default for TransportStats {
 }
 
 impl TransportStats {
-    /// Compute the loss fraction as `f64` in `[0.0, 1.0]` from the `loss_fraction_q8` field.
+    /// Compute the loss fraction as `f64` from the `loss_fraction_q8` field.
+    ///
+    /// Returns a value in `[0.0, 255/256.0]` (approximately `[0.0, 0.996]`). Because
+    /// `loss_fraction_q8` is a `u8` saturated at `255` (see field doc), the maximum return
+    /// value is `255/256.0 ≈ 0.996`, not `1.0`.
     ///
     /// Returns `0.0` when there is no loss.
     #[inline]
