@@ -5,6 +5,12 @@
 /target/
 **/*.rs.bk
 
+# cargo-fuzz build dirs + generated corpora/artifacts (never commit — they are
+# build output, and the binaries bloat the repo). Applies to every crate's fuzz/.
+**/fuzz/target/
+**/fuzz/corpus/
+**/fuzz/artifacts/
+
 # OS / editor cruft
 .DS_Store
 *.swp
