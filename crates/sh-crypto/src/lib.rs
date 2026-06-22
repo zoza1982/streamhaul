@@ -49,14 +49,19 @@
 
 #![deny(missing_docs)]
 
+pub mod bind_cert;
+pub mod clock;
 mod error;
 mod identity;
 mod keystore;
+pub mod noise;
 mod signature;
 mod software_keystore;
 
+pub use bind_cert::{BindCert, BindCertBuilder};
 pub use error::CryptoError;
 pub use identity::{DeviceIdentity, Fingerprint};
 pub use keystore::Keystore;
+pub use noise::{HandshakeOutcome, HandshakeRole, NoiseHandshake, NoisePattern, NoiseSession};
 pub use signature::Signature;
 pub use software_keystore::SoftwareKeystore;

@@ -75,4 +75,11 @@ pub enum TransportError {
     #[cfg(feature = "insecure-lan")]
     #[error("TLS config error: {0}")]
     TlsConfig(String),
+
+    /// Failed to export Noise session-binding context from a QUIC connection's TLS layer.
+    ///
+    /// Returned by [`sh_transport::quic_binding::export_noise_session_context`] when the
+    /// QUIC connection's TLS exporter is unavailable (e.g. connection not yet established).
+    #[error("failed to export Noise session-binding context from QUIC TLS layer")]
+    NoiseContextExport,
 }
