@@ -87,4 +87,53 @@ pub enum CryptoError {
     /// Do not match on this variant expecting to receive it from the current implementation.
     #[error("protocol downgrade detected")]
     Downgrade,
+
+    // ── P3-3: pairing ───────────────────────────────────────────────────────
+    /// The Short Authentication String (SAS) values shown to the human did not match.
+    ///
+    /// This variant is used when an automated SAS comparison detects a mismatch. In the
+    /// attended pairing flow, the human is the comparator and this is signalled via
+    /// [`PairingOutcome::Aborted`](crate::pairing::PairingOutcome::Aborted) instead.
+    #[error("SAS mismatch — possible MITM; pairing aborted")]
+    SasMismatch,
+
+    /// The PAKE key-confirmation MAC did not match.
+    ///
+    /// This indicates either a wrong pairing code or an active attack (relay / relay-substitute
+    /// attack). One online guess has been consumed; the pairing code should be invalidated.
+    ///
+    /// **Security:** do not log the attempted code or any keying material. Only log this event
+    /// and the peer fingerprint for rate-limiting purposes.
+    #[error("PAKE key-confirmation failed — wrong code or active attack")]
+    PakeConfirmationFailed,
+
+    /// The pairing code's `not_after` timestamp has passed.
+    ///
+    /// The code is expired and must not be used for a PAKE exchange. A new code should be
+    /// generated.
+    #[error("pairing code has expired")]
+    PairingCodeExpired,
+
+    /// A PAKE message is structurally invalid (wrong length, bad encoding, etc.).
+    ///
+    /// `reason` is a human-readable description suitable for logging. It MUST NOT contain
+    /// any secret material (codes, keys, or keying material).
+    #[error("malformed PAKE message: {reason}")]
+    MalformedPakeMessage {
+        /// A human-readable description of the validation failure (no secrets).
+        reason: &'static str,
+    },
+
+    /// A previously revoked peer attempted re-pairing; explicit operator confirmation required.
+    ///
+    /// The pairing layer detected that the peer identity was previously revoked (R-HW-KS).
+    /// Re-pinning has been blocked. The operator must perform an explicit separate confirmation
+    /// action before `Keystore::trust_peer` is called for this identity.
+    ///
+    /// This is NOT returned by `pair_attended` / `pair_unattended` — those return
+    /// [`PairingOutcome::ReTrustAfterRevokeRequiresConfirmation`](crate::pairing::PairingOutcome::ReTrustAfterRevokeRequiresConfirmation)
+    /// instead. This variant exists for contexts where a `CryptoError` is the only
+    /// available return channel.
+    #[error("peer was previously revoked; explicit operator re-trust confirmation required")]
+    ReTrustAfterRevoke,
 }

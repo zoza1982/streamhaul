@@ -38,6 +38,9 @@ hkdf.workspace = true
 subtle.workspace = true
 zeroize.workspace = true
 
+# SPAKE2 balanced PAKE for unattended pairing (ADR-0008 §2). UNAUDITED — see SECURITY.md.
+spake2.workspace = true
+
 [dev-dependencies]
 # Property-based testing: arbitrary messages must sign+verify; arbitrary bytes
 # into Signature::decode must never panic.
@@ -52,6 +55,9 @@ rand_chacha = "=0.3.1"
 
 # `block_on` helper for async doc-tests.
 tokio-test = "=0.4.5"
+
+# Lightweight block_on for pairing tests that use SoftwareKeystore outside of tokio context.
+futures-lite = "=2.3.0"
 
 [lints]
 workspace = true

@@ -55,6 +55,8 @@ mod error;
 mod identity;
 mod keystore;
 pub mod noise;
+pub mod pairing;
+pub mod sas;
 mod signature;
 mod software_keystore;
 

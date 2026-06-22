@@ -48,4 +48,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "pake_msg_parse"
+path = "fuzz_targets/pake_msg_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_code_parse"
+path = "fuzz_targets/pairing_code_parse.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

@@ -48,7 +48,7 @@ use async_trait::async_trait;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::{CryptoRng, OsRng, RngCore};
 
-use crate::{keystore::Keystore, CryptoError, DeviceIdentity, Signature};
+use crate::{keystore::Keystore, pairing::TrustOutcome, CryptoError, DeviceIdentity, Signature};
 
 /// The trust state of a peer identity in the local trust store.
 ///
@@ -255,6 +255,43 @@ impl Keystore for SoftwareKeystore {
             .map_err(|_| CryptoError::Backend("trust store lock poisoned".into()))?;
         inner.peers.insert(fp, TrustState::Revoked);
         Ok(())
+    }
+
+    async fn was_peer_revoked(&self, id: &DeviceIdentity) -> Result<bool, CryptoError> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| CryptoError::Backend("trust store lock poisoned".into()))?;
+        Ok(matches!(
+            inner.peers.get(Self::fp(id)),
+            Some(TrustState::Revoked)
+        ))
+    }
+
+    async fn trust_peer_if_not_revoked(
+        &self,
+        id: &DeviceIdentity,
+    ) -> Result<TrustOutcome, CryptoError> {
+        let fp = Self::fp(id).to_owned();
+        // Acquire the write lock ONCE and hold it for both the check and the pin.
+        // This is the atomic critical section: no concurrent `revoke_peer` can run between
+        // the revocation check and the insert. Atomicity requirement per the Keystore trait.
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| CryptoError::Backend("trust store lock poisoned".into()))?;
+        match inner.peers.get(&fp) {
+            Some(TrustState::Revoked) => {
+                // Peer is revoked — refuse to pin. Do NOT call trust_peer; return WasRevoked
+                // so the pairing layer can surface this to the operator.
+                Ok(TrustOutcome::WasRevoked)
+            }
+            Some(TrustState::Trusted) | None => {
+                // Either already trusted (idempotent) or never seen (first pairing). Pin it.
+                inner.peers.insert(fp, TrustState::Trusted);
+                Ok(TrustOutcome::Pinned)
+            }
+        }
     }
 }
 
