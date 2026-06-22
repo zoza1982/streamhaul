@@ -10,8 +10,52 @@ Congestion control, content classification, and rate allocation for Streamhaul.
 | [`TransportStats`] | Per-feedback struct (RTT, queue delay, loss) consumed by every controller. |
 | [`Bitrate`] | Strongly-typed bits-per-second newtype (integer, no float on the API boundary). |
 | [`ScreamController`] | RFC 8298 SCReAM implementation for the native (QUIC) path. |
+| [`RateAllocator`] | Cross-channel rate allocator: splits the SCReAM target across Video/Audio/Input/Control/Clipboard/File. |
+| [`ContentClassifier`] | 4-signal heuristic + hysteresis FSM → `Work | Scrolling | Game` (LLD §5.2). |
+| [`ScoreProvider`] | Swappable scoring trait; v1 = `HeuristicScoreProvider`; v2 = ONNX (P3+). |
+| [`Signals`] | The four normalized input signals (A=mb-diff, B=dirty-rect, C=app-class, D=cursor-vel). |
 
 GCC (for the WebRTC path) arrives in Phase 4.
+
+## Content classifier
+
+The classifier maps screen-capture signals to one of three content modes that drive encoder reconfiguration (P2-4):
+
+| Mode | Encoder config | Frame rate |
+|------|---------------|-----------|
+| `Work` | Conservative 4:2:0, damage-triggered keyframes | ≤30 fps |
+| `Scrolling` | Game-quality fast encode, intra-refresh | ≤30 fps |
+| `Game` | CBR 4:2:0, max throughput, intra-refresh | 60+ fps |
+
+```rust
+use sh_adaptive::{ContentClassifier, HeuristicScoreProvider, Signals, AppClass};
+
+let mut clf = ContentClassifier::new(Box::new(HeuristicScoreProvider));
+
+// Every 4 frames:
+let signals = Signals::from_raw(
+    0.9,              // mb_diff_fraction
+    0.85,             // dirty_rect_fraction
+    AppClass::Game,   // foreground app class
+    false,            // not fullscreen-exclusive
+    1200.0,           // cursor velocity px/s
+);
+let mode = clf.on_tick(&signals);
+// mode enters Game after GAME_ENTER_DWELL=8 consecutive high-score ticks.
+```
+
+### Hysteresis constants (LLD §5.2)
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `GAME_ENTER_THRESHOLD` | 0.65 | Score must exceed this (strictly) for 8 ticks to enter Game |
+| `GAME_EXIT_THRESHOLD` | 0.40 | Score must be below this (strictly) for 30 ticks to exit Game |
+| `GAME_ENTER_DWELL` | 8 | Ticks ≈ 530 ms @60 fps |
+| `GAME_EXIT_DWELL` | 30 | Ticks ≈ 2 s @60 fps (protects against alt-tab glitches) |
+| `SCROLL_ENTER_THRESHOLD` | 0.35 | Score must exceed this for 4 ticks to enter Scrolling |
+| `SCROLL_EXIT_THRESHOLD` | 0.25 | Score must be below this for 10 ticks to leave Scrolling |
+| `SCROLL_ENTER_DWELL` | 4 | Ticks ≈ 267 ms @60 fps; fast entry, low false-positive cost (same encode params as Game, lower fps) |
+| `SCROLL_EXIT_DWELL` | 10 | Ticks ≈ 667 ms @60 fps; prevents pause-mid-scroll flapping |
 
 ## SCReAM overview
 
