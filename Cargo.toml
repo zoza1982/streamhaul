@@ -36,6 +36,7 @@ proptest = "1"
 bitflags = "2"
 bytes = "1"
 tokio = { version = "1", features = ["net", "rt", "sync"] }
+tracing = "0.1"
 
 # Workspace-wide lints enforce the CLAUDE.md panic-ban and safety posture.
 # Members opt in with `[lints] workspace = true`. CI runs clippy with `-D warnings`,
