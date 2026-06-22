@@ -1,6 +1,6 @@
 //! Cross-channel rate allocator for Streamhaul.
 //!
-//! This module splits the total send budget produced by [`CongestionController::target_bitrate`]
+//! This module splits the total send budget produced by `CongestionController::target_bitrate`
 //! across the six logical [`ChannelId`] channels, enforcing the product invariants from `LLD.md`
 //! §1 and §3.2:
 //!

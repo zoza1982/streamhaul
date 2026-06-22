@@ -1,8 +1,8 @@
 //! The [`CongestionController`] trait — the shared seam between `sh-adaptive` and the pacer.
 //!
 //! Every congestion controller (SCReAM for the native QUIC path, GCC for the WebRTC path in
-//! Phase 4) implements this trait. The pacer in `sh-transport` holds a `Box<dyn
-//! CongestionController>` and calls `on_feedback` on each receiver report, then reads
+//! Phase 4) implements this trait. The pacer in `sh-transport` holds a
+//! `Box<dyn CongestionController>` and calls `on_feedback` on each receiver report, then reads
 //! `target_bitrate` and `pacing_interval` to schedule sends.
 
 use std::time::{Duration, Instant};

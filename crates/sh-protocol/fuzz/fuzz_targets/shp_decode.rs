@@ -9,4 +9,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = sh_protocol::VideoHeader::decode(data);
     let _ = sh_protocol::InputEvent::decode(data);
     let _ = sh_protocol::decode_control(data);
+    let _ = sh_protocol::NackFeedback::decode(data);
 });

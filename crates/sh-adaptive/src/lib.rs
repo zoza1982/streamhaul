@@ -1,4 +1,5 @@
-//! `sh-adaptive` — Congestion control, content classification, and rate allocation for Streamhaul.
+//! `sh-adaptive` — Congestion control, content classification, rate allocation, and loss recovery
+//! for Streamhaul.
 //!
 //! This crate provides:
 //!
@@ -11,6 +12,11 @@
 //! - The **rate allocator** ([`allocator::RateAllocator`]): splits the SCReAM target bitrate
 //!   across Video, Audio, Input, Control, Clipboard, and File channels following the product
 //!   priority order in `LLD.md` §3.2.
+//! - The **loss-recovery policy engine** ([`loss_recovery`], P2-6): tiered RTT-band escalation
+//!   that recommends NACK, FEC, or IDR based on per-feedback loss state. Includes
+//!   [`loss_recovery::GapDetector`] for 16-bit NACK bitmap tracking,
+//!   [`loss_recovery::FecPolicy`] for adaptive FEC ratio selection, and
+//!   [`loss_recovery::RollingIntraRefresh`] for self-healing without signaling.
 //!
 //! # Design
 //!
@@ -28,6 +34,7 @@
 //! - [`classifier::ContentClassifier`] — the FSM; holds a `Box<dyn ScoreProvider>` and exposes
 //!   `on_tick(&Signals) -> ContentMode`.
 //! - [`allocator::RateAllocator`] — cross-channel rate allocator.
+//! - [`loss_recovery::LossRecoveryController`] — tiered NACK / FEC / IDR policy engine.
 //!
 //! # Clock injection
 //!
@@ -85,6 +92,7 @@ pub mod allocator;
 pub mod bitrate;
 pub mod classifier;
 pub mod controller;
+pub mod loss_recovery;
 pub mod scream;
 pub mod stats;
 
@@ -94,5 +102,9 @@ pub use classifier::{
     AppClass, ContentClassifier, ContentMode, HeuristicScoreProvider, Score, ScoreProvider, Signals,
 };
 pub use controller::CongestionController;
+pub use loss_recovery::{
+    FecPolicy, FecPolicyConfig, GapDetector, GapReport, LossRecoveryController, LossState,
+    NackRequest, RecoveryAction, RefreshStripe, RollingIntraRefresh,
+};
 pub use scream::{ScreamConfig, ScreamController};
 pub use stats::TransportStats;

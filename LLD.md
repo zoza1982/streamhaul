@@ -21,7 +21,7 @@ implementation. Illustrative Rust below is design intent, not committed code.
 | **Q4** | Relay steering | **Latency-probe-based selection** (STUN-probe all coturn candidates, score by initiator+responder RTT), optional anycast hint tier. See §4.3. |
 | **Q5** | Unattended keys + recording keys | **Hardware-bound Unattended Grant Certificate (UGC)** (MFA at enrollment, not connect) + **HPKE envelope-encrypted recordings** to a recipient set incl. customer-KMS escrow; hosted infra is never a recipient. See §6.1. |
 | **Q6** | Multi-GPU zero-copy | Detect display-vs-encode adapter; **single-adapter = zero-copy; cross-adapter = bounded pinned-memory copy to the faster (dGPU) encoder**, with a user override. See §5.3. |
-| **Q7** | Intra-refresh recovery | **Tiered, RTT-adaptive**: rolling intra-refresh always on → NACK (RTT<100ms) → FEC → forced IDR (frame_gap≥3 / RTT≥200ms+loss / loss≥5%). See §4.4. |
+| **Q7** | Intra-refresh recovery | **Tiered, RTT-adaptive**: rolling intra-refresh always on → NACK (RTT<150ms, gap<3) → FEC → forced IDR (gap threshold per band: 3/<150ms, 2/150–300ms, 1/>300ms; or loss≥5%). See §4.4. |
 | **Q8** | Protocol name | **Streamhaul Protocol (SHP)** is canonical — used in code, comments, and capability-negotiation strings. "FluxRTP" is an optional vendor-neutral alias for the *published spec document* only, if we later court third-party implementers; it is not used in the wire/code. |
 
 > **Note — Q2 refines the PRD.** The PRD named H.265 the primary codec for quality/HW-coverage reasons.
@@ -277,14 +277,23 @@ option for restrictive networks.
 Rolling intra-refresh (period `ceil(fps/4)`) is **always on** (~8–12% overhead, self-heals without
 signaling). On video loss:
 
-1. **NACK** if `RTT < 100ms AND consecutive_loss ≤ 2`; wait ≤1·RTT for retransmit.
+1. **NACK** if `RTT < 150ms AND consecutive_loss ≤ 2 AND loss_5s < 5% AND frame_gap < 3`; wait ≤1·RTT for retransmit.
+   *(Reconciled with band breakdown below: the NACK band is <150ms, matching the 50–150ms band text.
+   frame_gap ≥ 3 forces IDR even inside the NACK band so a large freeze is never masked by a NACK.)*
 2. else rely on **FEC** if `loss_5s < fec_ratio AND frame_gap ≤ 1`.
-3. else **forced IDR** (keyframe request) if any of: `frame_gap ≥ 3`, `RTT ≥ 200ms + recent loss`,
-   `loss_5s ≥ 5%`, or `>10s since keyframe + >1% loss`. Suppress further requests for `max(500ms, 2·RTT)`.
+3. else **forced IDR** (keyframe request) if any of: `frame_gap ≥ idr_gap_threshold` (see band table),
+   `loss_5s ≥ 5%`, or `>10s since keyframe + >1% loss` (strictly above 1%, per LLD intent).
+   Suppress further requests for `max(500ms, 2·RTT)`.
 
-By RTT band: <50ms NACK-first; 50–150ms NACK isolated/FEC burst/IDR at gap≥3; 150–300ms skip NACK, FEC+refresh,
-IDR at gap≥2; >300ms FEC+refresh only, IDR on any freeze. **Audio:** always RFC 2198 redundancy (50% overhead,
-cheap), never NACK, Opus PLC for residual loss.
+By RTT band (three explicit bands, each with its own IDR gap threshold):
+
+| Band      | Primary strategy                                    | IDR gap threshold |
+|-----------|-----------------------------------------------------|-------------------|
+| < 150 ms  | NACK-first (≤2 consec, <5% loss, gap<3); else IDR  | gap ≥ 3           |
+| 150–300 ms| Skip NACK; FEC+refresh; IDR at gap ≥ 2 or loss ≥ 5%| gap ≥ 2           |
+| > 300 ms  | FEC+refresh only; IDR on **any** freeze             | gap ≥ 1           |
+
+**Audio:** always RFC 2198 redundancy (50% overhead, cheap), never NACK, Opus PLC for residual loss.
 
 ---
 
