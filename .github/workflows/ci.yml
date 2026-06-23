@@ -83,6 +83,31 @@ jobs:
         run: echo "No Cargo.toml yet — test gate is a no-op until Rust code lands."
 
   # ----------------------------------------------------------------------------
+  # WASM wire-parity bridge: build + test (Node runner, no browser required).
+  # This job guards crates/sh-wasm from rotting by running the codec parity
+  # tests via wasm-pack test --node on every PR/push.  It is Linux-only because
+  # wasm-pack + Node are sufficient for the wire-codec verification; browser-matrix
+  # testing (Chrome/FF/Safari) is deferred — see R-BROWSER-INTEROP / R-BROWSER-MATRIX.
+  # ----------------------------------------------------------------------------
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add wasm32-unknown-unknown target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack (pinned, checksum-verified binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+      - name: clippy (wasm target, panic-ban)
+        run: cargo clippy --manifest-path crates/sh-wasm/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: wasm-pack test --node (wire-parity suite)
+        run: wasm-pack test --node crates/sh-wasm
+      - name: wasm-pack build --target web (artifact smoke-check)
+        run: wasm-pack build --target web crates/sh-wasm
+
+  # ----------------------------------------------------------------------------
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:
