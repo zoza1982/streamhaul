@@ -37,6 +37,13 @@ str0m = { version = "=0.20.0", default-features = false, features = ["rust-crypt
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# P4-5 integration test only (dev-only — NO production sh-transport → sh-crypto coupling).
+# The test drives a real Noise XK handshake (sh-crypto) that exchanges BindCerts committing the
+# real `WebRtcTransport::local_dtls_fingerprint()`, pins the peer's committed fingerprint, then
+# drives two WebRtcTransports through the DTLS handshake to prove the fingerprint-swap defense.
+sh-crypto = { path = "../sh-crypto" }
+x25519-dalek = { workspace = true }
+rand_core = { workspace = true }
 
 [lints]
 workspace = true

@@ -172,9 +172,13 @@ BINDCERT_TBS (the bytes that are signed AND re-serialized for verification):
                                       the signed form is the raw digest.
       46    32  NOISE_STATIC_X25519 = the peer's X25519 static public key (32 bytes)
       78     1  DTLS_FPR_ALG        = 0x01 = SHA-256 ; 0x00 = none/native-only
-      79    32  DTLS_FPR_COMMIT     = SHA-256 of the DTLS certificate SPKI, or 32 zero
-                                      bytes when DTLS_FPR_ALG = 0x00 (native QUIC, no DTLS).
-                                      Consumed by P4-5 to pin the WebRTC fingerprint.
+      79    32  DTLS_FPR_COMMIT     = SHA-256 of the whole DTLS certificate (RFC 8122
+                                      fingerprint, as computed and enforced by str0m), or
+                                      32 zero bytes when DTLS_FPR_ALG = 0x00 (native QUIC,
+                                      no DTLS). Consumed by P4-5 to pin the WebRTC
+                                      fingerprint. [Amended by ADR-0014: was "SHA-256 of
+                                      the DTLS certificate SPKI"; the engine exposes and
+                                      enforces the whole-cert digest, so that is committed.]
      111     2  PLATFORM_ATTEST_LEN = u16 BE length L of the attestation blob (0..=4096)
      113     L  PLATFORM_ATTEST     = opaque attestation blob (schema deferred — §2.4)
    113+L     8  NOT_AFTER           = i64 BE, Unix epoch seconds (UTC), absolute expiry
@@ -210,7 +214,7 @@ never a re-encode, to avoid any canonicalization mismatch; see spec §B).
 |-------|-------|----------------|
 | `DEVICE_ID` | the Ed25519 identity (trust root) | ties the cert to the pinned identity; verifier checks this equals the identity that signed it (self-consistency) and is `is_trusted` |
 | `NOISE_STATIC_X25519` | the X25519 key used in *this* Noise handshake | **the core binding**: verifier checks the live Noise static == this committed value → defeats key-substitution MITM (§3) |
-| `DTLS_FPR_COMMIT` | the WebRTC DTLS SPKI | lets P4-5 reject a signaling-swapped SDP fingerprint; the signed commitment, not the SDP, is authoritative |
+| `DTLS_FPR_COMMIT` | the WebRTC DTLS cert (whole-cert SHA-256, RFC 8122; amended by ADR-0014) | lets P4-5 reject a signaling-swapped SDP fingerprint; the signed commitment, not the SDP, is authoritative |
 | `PLATFORM_ATTEST` | hardware attestation (deferred) | future: proves the identity key lives in a real TPM/SE/StrongBox → defeats cloned-host with extracted-but-not-hardware key |
 | `NOT_AFTER` / `ISSUED_AT` | validity window | bounds the blast radius of a leaked/stale BindCert; checked against an **injected clock** |
 
@@ -371,8 +375,10 @@ This keeps P3-2 self-contained and gives P3-3/P3-4 a typed, minimal, secret-safe
 - **Follow-ups:**
   - **P3-3:** SAS from `handshake_hash`; PAKE (SPAKE2/OPAQUE) for the no-human-at-host case.
   - **P3-4:** channel key hierarchy + rekey using the `export_keying_material` seam.
-  - **P4-5:** consume `DTLS_FPR_COMMIT` to pin the WebRTC fingerprint; define the WebRTC
-    `session_context` (DTLS exporter) for the prologue.
+  - **P4-5:** consume `DTLS_FPR_COMMIT` to pin the WebRTC fingerprint — **done (ADR-0014)**, using
+    the whole-cert digest and rejecting an `ALG=NONE` downgrade for WebRTC peers. The WebRTC
+    `session_context` (DTLS exporter) for the prologue is **deferred** (it conflicts with
+    pin-before-handshake ordering); tracked as `R-DTLS-EXPORTER-BIND` (ADR-0014 §5).
   - **Later:** normalize and *verify* `PLATFORM_ATTEST` (TPM2/App Attest/Play Integrity) — currently
     opaque/unverified.
   - **GA:** `snow` security review; hardware keystore (R-HW-KS) so the BindCert signature lives in a

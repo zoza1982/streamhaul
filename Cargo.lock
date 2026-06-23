@@ -1735,13 +1735,16 @@ dependencies = [
  "async-trait",
  "bytes",
  "quinn",
+ "rand_core 0.6.4",
  "rcgen 0.13.2",
  "rustls",
+ "sh-crypto",
  "sh-types",
  "str0m",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "x25519-dalek",
 ]
 
 [[package]]

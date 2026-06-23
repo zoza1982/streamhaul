@@ -44,7 +44,7 @@ use snow::Builder;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    bind_cert::{BindCert, BindCertBuilder, BIND_CERT_VALIDITY_SECS},
+    bind_cert::{BindCert, BindCertBuilder, DtlsCommitment, DtlsPin, BIND_CERT_VALIDITY_SECS},
     clock::Clock,
     CryptoError, DeviceIdentity, Keystore,
 };
@@ -348,6 +348,44 @@ impl std::fmt::Debug for HandshakeOutcome {
     }
 }
 
+impl HandshakeOutcome {
+    /// Returns the peer's DTLS pin from the verified [`BindCert`], or `None` (P4-5).
+    ///
+    /// Thin forwarder to [`BindCert::dtls_pin`](crate::bind_cert::BindCert::dtls_pin). Returns
+    /// `Some` for a WebRTC peer (the BindCert committed a SHA-256 DTLS fingerprint) and `None`
+    /// for a QUIC peer. The pin is authenticated: it came from the identity-signed BindCert
+    /// delivered *inside* the verified Noise handshake, so it is safe to pin against the
+    /// untrusted SDP-relayed fingerprint.
+    ///
+    /// **For a path that must be WebRTC, call
+    /// [`require_webrtc_dtls_pin`](Self::require_webrtc_dtls_pin) instead.** This accessor does not
+    /// enforce the anti-downgrade rule and (per [`BindCert::dtls_pin`]) may return a `Some` whose
+    /// commit is all zeros for a malformed peer; pinning that would fail-close DTLS with no clear
+    /// diagnostic.
+    #[must_use]
+    pub fn peer_dtls_pin(&self) -> Option<DtlsPin> {
+        self.peer_bind_cert.dtls_pin()
+    }
+
+    /// Returns the peer's 32-byte committed DTLS fingerprint, enforcing the WebRTC
+    /// anti-downgrade rule (P4-5).
+    ///
+    /// Thin forwarder to
+    /// [`BindCert::require_webrtc_dtls_pin`](crate::bind_cert::BindCert::require_webrtc_dtls_pin).
+    /// Call this on the WebRTC pin path *before* the DTLS handshake; feed the returned bytes to
+    /// `WebRtcTransport::set_remote_dtls_fingerprint`. A peer BindCert that carries
+    /// `DTLS_FPR_ALG = NONE` (a stripped binding) or an all-zero commit is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::DtlsBindingMissing`] if the peer committed no usable SHA-256 DTLS
+    /// fingerprint (downgrade attempt on a WebRTC session).
+    #[must_use = "the returned pin is the anti-downgrade gate; dropping it skips the DTLS binding check"]
+    pub fn require_webrtc_dtls_pin(&self) -> Result<[u8; 32], CryptoError> {
+        self.peer_bind_cert.require_webrtc_dtls_pin()
+    }
+}
+
 // ─── NoiseHandshake ────────────────────────────────────────────────────────
 
 /// A Noise handshake in progress.
@@ -482,13 +520,18 @@ impl NoiseHandshake {
     async fn make_bind_cert<K: Keystore>(
         keystore: &K,
         local_static_pub: [u8; 32],
+        dtls_commitment: Option<DtlsCommitment>,
         clock: &dyn Clock,
     ) -> Result<BindCert, CryptoError> {
-        BindCertBuilder::new(keystore)
+        let mut builder = BindCertBuilder::new(keystore)
             .noise_static(local_static_pub)
-            .valid_for_secs(BIND_CERT_VALIDITY_SECS)
-            .build(clock)
-            .await
+            .valid_for_secs(BIND_CERT_VALIDITY_SECS);
+        if let Some(commitment) = dtls_commitment {
+            // WebRTC path: commit the local whole-cert DTLS fingerprint (P4-5, ADR-0014).
+            builder = builder.dtls_commitment(commitment);
+        }
+        // QUIC path: no commitment → DTLS_FPR_ALG = 0x00 (unchanged behavior).
+        builder.build(clock).await
     }
 
     // 7 arguments: all are required for the Noise pattern + role + crypto configuration.
@@ -505,6 +548,7 @@ impl NoiseHandshake {
         local_static: x25519_dalek::StaticSecret,
         peer_static_pub: Option<[u8; 32]>,
         session_context: &[u8],
+        dtls_commitment: Option<DtlsCommitment>,
         clock: &dyn Clock,
         pattern: NoisePattern,
         role: HandshakeRole,
@@ -532,7 +576,8 @@ impl NoiseHandshake {
             initiator,
         )?;
 
-        let local_bind_cert = Self::make_bind_cert(keystore, local_pub_bytes, clock).await?;
+        let local_bind_cert =
+            Self::make_bind_cert(keystore, local_pub_bytes, dtls_commitment, clock).await?;
         let identity = keystore.device_identity().await?;
         let local_ed25519_pub = *identity.public_key_bytes();
 
@@ -585,6 +630,43 @@ impl NoiseHandshake {
             local_static,
             Some(peer_static_pub),
             session_context,
+            None,
+            clock,
+            NoisePattern::Xk,
+            HandshakeRole::Initiator,
+        )
+        .await
+    }
+
+    /// Creates an XK initiator handshake that commits a DTLS fingerprint (WebRTC, P4-5).
+    ///
+    /// Identical to [`initiator_xk`](Self::initiator_xk) but the local `BindCert` commits
+    /// `dtls_commitment` (the local whole-cert DTLS fingerprint) so the peer can pin it before the
+    /// DTLS handshake. The commitment is **required**: this is the WebRTC entry point, and there is
+    /// no way to obtain an unpinned WebRTC handshake from it. For a QUIC / no-DTLS handshake use
+    /// [`initiator_xk`](Self::initiator_xk) instead (which commits `ALG=NONE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::HandshakeFailed`] or [`CryptoError::Backend`] on failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub async fn initiator_xk_with_dtls<K: Keystore>(
+        keystore: &K,
+        local_static: x25519_dalek::StaticSecret,
+        peer_static_pub: [u8; 32],
+        session_context: &[u8],
+        dtls_commitment: DtlsCommitment,
+        clock: &dyn Clock,
+    ) -> Result<Self, CryptoError> {
+        Self::new_inner(
+            keystore,
+            local_static,
+            Some(peer_static_pub),
+            session_context,
+            Some(dtls_commitment),
             clock,
             NoisePattern::Xk,
             HandshakeRole::Initiator,
@@ -617,6 +699,41 @@ impl NoiseHandshake {
             local_static,
             None,
             session_context,
+            None,
+            clock,
+            NoisePattern::Xk,
+            HandshakeRole::Responder,
+        )
+        .await
+    }
+
+    /// Creates an XK responder handshake that commits a DTLS fingerprint (WebRTC, P4-5).
+    ///
+    /// Identical to [`responder_xk`](Self::responder_xk) but the local `BindCert` commits
+    /// `dtls_commitment`. The commitment is **required**: this is the WebRTC entry point. For a
+    /// QUIC / no-DTLS handshake use [`responder_xk`](Self::responder_xk) instead (which commits
+    /// `ALG=NONE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::HandshakeFailed`] or [`CryptoError::Backend`] on failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub async fn responder_xk_with_dtls<K: Keystore>(
+        keystore: &K,
+        local_static: x25519_dalek::StaticSecret,
+        session_context: &[u8],
+        dtls_commitment: DtlsCommitment,
+        clock: &dyn Clock,
+    ) -> Result<Self, CryptoError> {
+        Self::new_inner(
+            keystore,
+            local_static,
+            None,
+            session_context,
+            Some(dtls_commitment),
             clock,
             NoisePattern::Xk,
             HandshakeRole::Responder,
@@ -649,6 +766,42 @@ impl NoiseHandshake {
             local_static,
             Some(peer_static_pub),
             session_context,
+            None,
+            clock,
+            NoisePattern::Ik,
+            HandshakeRole::Initiator,
+        )
+        .await
+    }
+
+    /// Creates an IK initiator handshake that commits a DTLS fingerprint (WebRTC, P4-5).
+    ///
+    /// Identical to [`initiator_ik`](Self::initiator_ik) but the local `BindCert` commits
+    /// `dtls_commitment`. The commitment is **required**: this is the WebRTC entry point. For a
+    /// QUIC / no-DTLS handshake use [`initiator_ik`](Self::initiator_ik) instead (which commits
+    /// `ALG=NONE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::HandshakeFailed`] or [`CryptoError::Backend`] on failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub async fn initiator_ik_with_dtls<K: Keystore>(
+        keystore: &K,
+        local_static: x25519_dalek::StaticSecret,
+        peer_static_pub: [u8; 32],
+        session_context: &[u8],
+        dtls_commitment: DtlsCommitment,
+        clock: &dyn Clock,
+    ) -> Result<Self, CryptoError> {
+        Self::new_inner(
+            keystore,
+            local_static,
+            Some(peer_static_pub),
+            session_context,
+            Some(dtls_commitment),
             clock,
             NoisePattern::Ik,
             HandshakeRole::Initiator,
@@ -678,6 +831,41 @@ impl NoiseHandshake {
             local_static,
             None,
             session_context,
+            None,
+            clock,
+            NoisePattern::Ik,
+            HandshakeRole::Responder,
+        )
+        .await
+    }
+
+    /// Creates an IK responder handshake that commits a DTLS fingerprint (WebRTC, P4-5).
+    ///
+    /// Identical to [`responder_ik`](Self::responder_ik) but the local `BindCert` commits
+    /// `dtls_commitment`. The commitment is **required**: this is the WebRTC entry point. For a
+    /// QUIC / no-DTLS handshake use [`responder_ik`](Self::responder_ik) instead (which commits
+    /// `ALG=NONE`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::HandshakeFailed`] or [`CryptoError::Backend`] on failure.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub async fn responder_ik_with_dtls<K: Keystore>(
+        keystore: &K,
+        local_static: x25519_dalek::StaticSecret,
+        session_context: &[u8],
+        dtls_commitment: DtlsCommitment,
+        clock: &dyn Clock,
+    ) -> Result<Self, CryptoError> {
+        Self::new_inner(
+            keystore,
+            local_static,
+            None,
+            session_context,
+            Some(dtls_commitment),
             clock,
             NoisePattern::Ik,
             HandshakeRole::Responder,
@@ -1039,6 +1227,150 @@ mod tests {
         let resp_outcome = resp.complete(resp_ks).await.unwrap();
 
         (init_outcome, resp_outcome)
+    }
+
+    // ─── P4-5: DTLS pin propagation through the handshake ────────────────
+
+    /// An XK handshake where both sides commit a DTLS fingerprint: each verified outcome exposes
+    /// the *peer's* committed pin via `peer_dtls_pin()` / `require_webrtc_dtls_pin()`.
+    #[tokio::test]
+    async fn xk_with_dtls_propagates_peer_pin() {
+        let init_ks = SoftwareKeystore::generate();
+        let resp_ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+
+        let resp_static = StaticSecret::random_from_rng(OsRng);
+        let resp_pub = x25519_dalek::PublicKey::from(&resp_static);
+        let init_static = StaticSecret::random_from_rng(OsRng);
+
+        let resp_id = resp_ks.device_identity().await.unwrap();
+        let init_id = init_ks.device_identity().await.unwrap();
+        init_ks.trust_peer(&resp_id).await.unwrap();
+        resp_ks.trust_peer(&init_id).await.unwrap();
+
+        let init_dtls = [0x11u8; 32]; // initiator's "local DTLS fingerprint"
+        let resp_dtls = [0x22u8; 32]; // responder's "local DTLS fingerprint"
+
+        let mut init = NoiseHandshake::initiator_xk_with_dtls(
+            &init_ks,
+            init_static,
+            resp_pub.to_bytes(),
+            &[],
+            DtlsCommitment::sha256(init_dtls),
+            &clock,
+        )
+        .await
+        .unwrap();
+        let mut resp = NoiseHandshake::responder_xk_with_dtls(
+            &resp_ks,
+            resp_static,
+            &[],
+            DtlsCommitment::sha256(resp_dtls),
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        let msg0 = init.write_message().unwrap();
+        resp.read_message(&msg0, &clock).unwrap();
+        let msg1 = resp.write_message().unwrap();
+        init.read_message(&msg1, &clock).unwrap();
+        let msg2 = init.write_message().unwrap();
+        resp.read_message(&msg2, &clock).unwrap();
+
+        let init_outcome = init.complete(&init_ks).await.unwrap();
+        let resp_outcome = resp.complete(&resp_ks).await.unwrap();
+
+        // The initiator pins the RESPONDER's committed fingerprint, and vice-versa.
+        assert_eq!(init_outcome.require_webrtc_dtls_pin().unwrap(), resp_dtls);
+        assert_eq!(resp_outcome.require_webrtc_dtls_pin().unwrap(), init_dtls);
+        assert_eq!(init_outcome.peer_dtls_pin().unwrap().commit(), &resp_dtls);
+        assert_eq!(resp_outcome.peer_dtls_pin().unwrap().commit(), &init_dtls);
+    }
+
+    /// An IK handshake where both sides commit a DTLS fingerprint (mutual): each verified outcome
+    /// exposes the *peer's* committed pin via `require_webrtc_dtls_pin()` / `peer_dtls_pin()`.
+    ///
+    /// This guards the IK `_with_dtls` constructors against a copy-paste delegation typo (e.g. a
+    /// wrong pattern/role/`Some` wiring in `initiator_ik_with_dtls`/`responder_ik_with_dtls`): the
+    /// IK message ordering differs from XK (the initiator sends its BindCert in msg 0), so the IK
+    /// path needs its own end-to-end coverage.
+    #[tokio::test]
+    async fn ik_with_dtls_propagates_peer_pin() {
+        let init_ks = SoftwareKeystore::generate();
+        let resp_ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+
+        let resp_static = StaticSecret::random_from_rng(OsRng);
+        let resp_pub = x25519_dalek::PublicKey::from(&resp_static);
+        let init_static = StaticSecret::random_from_rng(OsRng);
+
+        let resp_id = resp_ks.device_identity().await.unwrap();
+        let init_id = init_ks.device_identity().await.unwrap();
+        init_ks.trust_peer(&resp_id).await.unwrap();
+        resp_ks.trust_peer(&init_id).await.unwrap();
+
+        let init_dtls = [0x33u8; 32]; // initiator's "local DTLS fingerprint"
+        let resp_dtls = [0x44u8; 32]; // responder's "local DTLS fingerprint"
+
+        let mut init = NoiseHandshake::initiator_ik_with_dtls(
+            &init_ks,
+            init_static,
+            resp_pub.to_bytes(),
+            &[],
+            DtlsCommitment::sha256(init_dtls),
+            &clock,
+        )
+        .await
+        .unwrap();
+        let mut resp = NoiseHandshake::responder_ik_with_dtls(
+            &resp_ks,
+            resp_static,
+            &[],
+            DtlsCommitment::sha256(resp_dtls),
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        // IK: -> e, es, s, ss (msg 0, initiator writes BindCert)
+        let msg0 = init.write_message().unwrap();
+        resp.read_message(&msg0, &clock).unwrap();
+        // IK: <- e, ee, se (msg 1, responder writes BindCert)
+        let msg1 = resp.write_message().unwrap();
+        init.read_message(&msg1, &clock).unwrap();
+
+        let init_outcome = init.complete(&init_ks).await.unwrap();
+        let resp_outcome = resp.complete(&resp_ks).await.unwrap();
+
+        // The initiator pins the RESPONDER's committed fingerprint, and vice-versa. If the IK
+        // constructors had a copy-paste typo (wrong commitment wiring), these would not match.
+        assert_eq!(init_outcome.require_webrtc_dtls_pin().unwrap(), resp_dtls);
+        assert_eq!(resp_outcome.require_webrtc_dtls_pin().unwrap(), init_dtls);
+        assert_eq!(init_outcome.peer_dtls_pin().unwrap().commit(), &resp_dtls);
+        assert_eq!(resp_outcome.peer_dtls_pin().unwrap().commit(), &init_dtls);
+    }
+
+    /// Downgrade: if the responder builds a QUIC (no-DTLS) BindCert but the initiator treats the
+    /// session as WebRTC, `require_webrtc_dtls_pin()` rejects it. The handshake itself still
+    /// completes (the binding is stripped, not forged) — the abort happens at the pin step.
+    #[tokio::test]
+    async fn webrtc_pin_rejects_peer_without_dtls_commitment() {
+        let init_ks = SoftwareKeystore::generate();
+        let resp_ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+
+        // do_xk_handshake builds both sides with the plain (None) constructors → ALG=NONE.
+        let (init_outcome, _resp_outcome) = do_xk_handshake(&init_ks, &resp_ks, &clock).await;
+
+        assert!(init_outcome.peer_dtls_pin().is_none());
+        assert!(
+            matches!(
+                init_outcome.require_webrtc_dtls_pin(),
+                Err(CryptoError::DtlsBindingMissing)
+            ),
+            "a WebRTC pin must be rejected when the peer committed no DTLS fingerprint"
+        );
     }
 
     // ─── XK / IK full handshake tests ────────────────────────────────────

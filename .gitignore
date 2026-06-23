@@ -14,3 +14,6 @@
 # OS / editor cruft
 .DS_Store
 *.swp
+
+# stray scratch build output (e.g. rustc -o rust_out)
+/rust_out

@@ -13,6 +13,12 @@ codec-agnostic `Transport`/`Channel` trait abstraction (LLD §2) is **not** here
 - `ClientEndpoint::bind(quinn::ClientConfig)` → `connect(addr, server_name).await` → `Connection`
 - `Connection`: `send_datagram(Bytes)`, `read_datagram().await`, `max_datagram_size()`, `remote_address()`
 - `TransportError` — typed errors wrapping quinn's connect/connection/datagram/io failures
+- `WebRtcTransport` (str0m backend): `local_dtls_fingerprint()`, `set_remote_dtls_fingerprint(fp)`,
+  and `remote_dtls_fingerprint()` — the P4-5 DTLS-fingerprint pinning seam. The remote fingerprint
+  is pinned from the identity-signed `BindCert` (via `sh-crypto`) **before** the DTLS handshake;
+  str0m fail-closes any peer cert that does not match. See ADR-0014 and the
+  `tests/dtls_identity_binding.rs` integration test (dev-only `sh-crypto` dep; no production
+  coupling).
 
 ## ⚠️ `insecure-lan` feature (LAN lab only)
 
