@@ -29,11 +29,15 @@ mod error;
 mod insecure;
 
 pub mod channel;
+pub mod driver;
 pub mod quic_binding;
 pub mod webrtc;
 
 pub use channel::{Channel, ChannelSpec, QuicTransport, Reliability, Transport, MAX_FRAME_LEN};
 pub use connection::Connection;
+pub use driver::{
+    spawn_webrtc_driver, AsyncUdpSocket, DriverHandle, SimNetwork, SimUdpSocket, TokioUdpSocket,
+};
 pub use endpoint::{ClientEndpoint, ServerEndpoint};
 pub use error::TransportError;
 pub use webrtc::{PinnedWebRtcTransport, WebRtcChannel, WebRtcTransportBuilder};
