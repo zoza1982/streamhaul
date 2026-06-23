@@ -1,0 +1,20 @@
+[package]
+name = "sh-signaling-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[[bin]]
+name = "fuzz_envelope_decode"
+path = "fuzz_targets/fuzz_envelope_decode.rs"
+test = false
+doc = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+sh-signaling = { path = "..", features = ["insecure-lan"] }
