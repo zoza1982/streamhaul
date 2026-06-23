@@ -163,6 +163,12 @@ where
     outgoing: Vec<(Vec<u8>, SocketAddr)>,
     /// Transactions in flight: (transaction_id, pair_idx).
     in_flight: Vec<([u8; 12], usize)>,
+    /// Monotonic counter used to assign stable `pair_id` values at pair creation.
+    ///
+    /// Using a stable ID instead of a check-list index means that in-flight
+    /// transaction remaps and nominated-pair re-location are unambiguous even when
+    /// multiple local candidates share the same remote address (multi-homed hosts).
+    next_pair_id: u64,
 }
 
 impl<T, C, R> IceAgent<T, C, R>
@@ -213,6 +219,7 @@ where
             checking_started_us: None,
             outgoing: Vec::new(),
             in_flight: Vec::new(),
+            next_pair_id: 0,
         }
     }
 
@@ -336,21 +343,21 @@ where
         self.local_candidates.push(c);
         if !self.remote_candidates.is_empty() {
             if matches!(self.state, IceState::Checking | IceState::Connected) {
-                // Capture the remote address of each in-flight pair so we can remap
-                // indices after the sort.
-                let in_flight_addrs: Vec<([u8; 12], SocketAddr)> = self
+                // Capture the stable pair_id of each in-flight pair so we can remap
+                // indices after the sort.  Using pair_id (not remote.addr) is essential
+                // when ≥2 local candidates share a remote: each TID maps to a distinct
+                // pair and must map back to THAT pair's new index, never a neighbour's.
+                let in_flight_ids: Vec<([u8; 12], u64)> = self
                     .in_flight
                     .iter()
-                    .filter_map(|(tid, idx)| {
-                        self.check_list.get(*idx).map(|p| (*tid, p.remote.addr))
-                    })
+                    .filter_map(|(tid, idx)| self.check_list.get(*idx).map(|p| (*tid, p.pair_id)))
                     .collect();
 
-                // Preserve nominated remote addr.
-                let nominated_remote_addr = self
+                // Preserve nominated pair_id so we can re-locate it after the sort.
+                let nominated_pair_id = self
                     .nominated_idx
                     .and_then(|i| self.check_list.get(i))
-                    .map(|p| p.remote.addr);
+                    .map(|p| p.pair_id);
 
                 // Append new pairs from the new relay candidate only.
                 let is_controlling = self.config.role == IceRole::Controlling;
@@ -363,8 +370,14 @@ where
                     .remote_candidates
                     .iter()
                     .map(|remote| {
-                        let mut pair =
-                            CandidatePair::new(new_local.clone(), remote.clone(), is_controlling);
+                        let id = self.next_pair_id;
+                        self.next_pair_id = self.next_pair_id.saturating_add(1);
+                        let mut pair = CandidatePair::new(
+                            id,
+                            new_local.clone(),
+                            remote.clone(),
+                            is_controlling,
+                        );
                         pair.state = PairState::Waiting;
                         pair
                     })
@@ -373,25 +386,22 @@ where
                 self.check_list
                     .sort_by_key(|p| std::cmp::Reverse(p.priority));
 
-                // Remap in_flight indices using captured remote addresses.
-                self.in_flight = in_flight_addrs
+                // Remap in_flight indices using stable pair_ids captured before the sort.
+                // Each TID maps to its OWN pair's new position; no two TIDs can collapse
+                // onto the same index even when they share a remote address.
+                self.in_flight = in_flight_ids
                     .into_iter()
-                    .filter_map(|(tid, remote_addr)| {
+                    .filter_map(|(tid, pair_id)| {
                         self.check_list
                             .iter()
-                            .position(|p| {
-                                p.remote.addr == remote_addr && p.state == PairState::InProgress
-                            })
+                            .position(|p| p.pair_id == pair_id)
                             .map(|new_idx| (tid, new_idx))
                     })
                     .collect();
 
-                // Re-locate nominated pair.
-                if let Some(remote_addr) = nominated_remote_addr {
-                    self.nominated_idx = self
-                        .check_list
-                        .iter()
-                        .position(|p| p.remote.addr == remote_addr);
+                // Re-locate nominated pair by its stable pair_id (not remote.addr).
+                if let Some(pid) = nominated_pair_id {
+                    self.nominated_idx = self.check_list.iter().position(|p| p.pair_id == pid);
                     if let Some(idx) = self.nominated_idx {
                         if let Some(pair) = self.check_list.get_mut(idx) {
                             pair.nominated = true;
@@ -426,11 +436,17 @@ where
 
     /// Rebuild the check list from the current local × remote cross product.
     fn rebuild_check_list(&mut self) {
-        // Save the nominated remote addr so we can re-locate it after the rebuild.
-        let nominated_remote_addr = self
+        // Save the nominated pair's full key so we can re-locate it after the rebuild.
+        //
+        // A rebuild always creates brand-new pairs (new pair_ids), so we cannot
+        // remap by pair_id here.  Instead we match on the full (local.base,
+        // local.kind, remote.addr, remote.kind) key, which uniquely identifies
+        // a pair even when multiple local candidates share a remote address.
+        // Using remote.addr alone is incorrect in that multi-local scenario.
+        let nominated_key = self
             .nominated_idx
             .and_then(|i| self.check_list.get(i))
-            .map(|p| p.remote.addr);
+            .map(|p| (p.local.base, p.local.kind, p.remote.addr, p.remote.kind));
 
         let is_controlling = self.config.role == IceRole::Controlling;
         let mut pairs: Vec<CandidatePair> = self
@@ -438,25 +454,35 @@ where
             .iter()
             .flat_map(|local| {
                 self.remote_candidates.iter().map(move |remote| {
-                    let mut pair =
-                        CandidatePair::new(local.clone(), remote.clone(), is_controlling);
-                    pair.state = PairState::Waiting;
-                    pair
+                    // pair_id assigned below; use sentinel 0 here.
+                    CandidatePair::new(0, local.clone(), remote.clone(), is_controlling)
                 })
             })
             .collect();
+
+        // Assign stable pair IDs from the agent's monotonic counter.
+        for pair in &mut pairs {
+            pair.pair_id = self.next_pair_id;
+            self.next_pair_id = self.next_pair_id.saturating_add(1);
+            pair.state = PairState::Waiting;
+        }
+
         // Sort by descending pair priority.
         pairs.sort_by_key(|p| std::cmp::Reverse(p.priority));
         self.check_list = pairs;
         self.in_flight.clear();
 
-        // Re-locate the nominated pair. If it's still in the new list, preserve nomination.
-        // This handles trickle ICE arrivals post-Connected without tearing down the working path.
-        if let Some(remote_addr) = nominated_remote_addr {
-            self.nominated_idx = self
-                .check_list
-                .iter()
-                .position(|p| p.remote.addr == remote_addr);
+        // Re-locate the nominated pair by its full (local.base, local.kind, remote.addr,
+        // remote.kind) key.  This handles trickle ICE arrivals post-Connected without
+        // tearing down the working path, and is safe even when ≥2 local candidates
+        // share a remote (the key includes the local base address and kind).
+        if let Some((local_base, local_kind, remote_addr, remote_kind)) = nominated_key {
+            self.nominated_idx = self.check_list.iter().position(|p| {
+                p.local.base == local_base
+                    && p.local.kind == local_kind
+                    && p.remote.addr == remote_addr
+                    && p.remote.kind == remote_kind
+            });
             // Re-mark as nominated and Succeeded.
             if let Some(idx) = self.nominated_idx {
                 if let Some(pair) = self.check_list.get_mut(idx) {
@@ -546,6 +572,14 @@ where
     #[cfg(test)]
     pub fn in_flight_tids(&self) -> Vec<[u8; 12]> {
         self.in_flight.iter().map(|(tid, _)| *tid).collect()
+    }
+
+    /// Return the full (TID → check-list index) in-flight map (for testing).
+    ///
+    /// Each entry is `(transaction_id_bytes, check_list_index)`.
+    #[cfg(test)]
+    pub fn in_flight_map(&self) -> Vec<([u8; 12], usize)> {
+        self.in_flight.clone()
     }
 
     /// Return the nominated pair index (for testing).
@@ -2111,6 +2145,210 @@ mod tests {
         assert!(
             has_relay_local,
             "check list must contain a relay local pair after add_relay_candidate"
+        );
+    }
+
+    // ─── Multi-local correctness tests (bug regression) ──────────────────────
+
+    /// Build an IceConfig with multiple local addresses for multi-homed-host tests.
+    fn make_config_multi_local(locals: &[SocketAddr], role: IceRole, tb: u64) -> IceConfig {
+        IceConfig {
+            stun_servers: vec![],
+            turn_servers: vec![],
+            local_addrs: locals.to_vec(),
+            role,
+            tie_breaker: tb,
+            local_ufrag: "localufrag".into(),
+            local_pwd: "local-password-32chars-long-ok!".into(),
+            remote_ufrag: "remoteufrag".into(),
+            remote_pwd: "remote-password-32chars-long-ok!".into(),
+        }
+    }
+
+    /// Regression: in-flight TIDs for (local1, R) and (local2, R) must map to
+    /// DISTINCT check-list indices after `add_relay_candidate` re-sorts the list.
+    ///
+    /// Bug: the old code remapped by `remote.addr` only, so both TIDs collapsed
+    /// onto the same (first-matching) index.  The fix uses stable `pair_id`.
+    #[test]
+    fn multi_local_inflight_remap_distinct_after_relay_candidate() {
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+
+        // Two local addresses — local1 and local2 — that will form two separate
+        // Host candidates, both paired with the same remote.
+        let local1_addr = ipv4(127, 0, 0, 1, 41001);
+        let local2_addr = ipv4(127, 0, 0, 2, 41002);
+        // The transport socket only needs one bind address; we use local1.
+        // local2 is declared in local_addrs so gather() creates a Host candidate for it.
+        let sock = net.create_socket(NatType::FullCone, local1_addr).unwrap();
+
+        let cfg = make_config_multi_local(&[local1_addr, local2_addr], IceRole::Controlling, 99);
+        let mut agent = IceAgent::new(cfg, sock, FixedClock(0), TestRng(55));
+        agent.gather().unwrap();
+
+        // Single remote shared by both local candidates.
+        let remote_addr = ipv4(10, 0, 0, 1, 9001);
+        agent.add_remote_candidate(Candidate::new(
+            CandidateKind::Host,
+            remote_addr,
+            remote_addr,
+            1,
+        ));
+
+        // Transition to Checking and run one step so check_pairs fires and
+        // both (local1, R) and (local2, R) go InProgress with distinct TIDs.
+        agent.state = IceState::Checking;
+        agent.checking_started_us = Some(0);
+        let _ = agent.step(None);
+
+        let map_before = agent.in_flight_map();
+        // There must be exactly 2 in-flight entries — one per local candidate.
+        assert_eq!(
+            map_before.len(),
+            2,
+            "expected 2 in-flight TIDs (one per local candidate); got {}",
+            map_before.len()
+        );
+
+        // TIDs must be distinct.
+        assert_ne!(
+            map_before[0].0, map_before[1].0,
+            "TIDs must be distinct for (local1, R) and (local2, R)"
+        );
+        // The two TIDs must map to distinct check-list indices.
+        assert_ne!(
+            map_before[0].1, map_before[1].1,
+            "in-flight TIDs must map to distinct check-list indices before relay add"
+        );
+
+        // Inject a relay candidate.  This appends new pairs and re-sorts the list.
+        let relay_addr = ipv4(10, 0, 0, 254, 41003);
+        let base_addr = ipv4(127, 0, 0, 1, 41004);
+        agent
+            .add_relay_candidate(relay_addr, base_addr)
+            .expect("add_relay_candidate must succeed");
+
+        let map_after = agent.in_flight_map();
+
+        // Same two original TIDs must still be present.
+        let tids_after: std::collections::HashSet<[u8; 12]> =
+            map_after.iter().map(|(t, _)| *t).collect();
+        for (tid, _) in &map_before {
+            assert!(
+                tids_after.contains(tid),
+                "in-flight TID {tid:?} was lost after add_relay_candidate"
+            );
+        }
+
+        // After the re-sort the two original TIDs must STILL map to DISTINCT indices.
+        let idx_for = |tid: [u8; 12]| {
+            map_after
+                .iter()
+                .find(|(t, _)| *t == tid)
+                .map(|(_, idx)| *idx)
+        };
+        let idx0 = idx_for(map_before[0].0).expect("TID 0 must survive remap");
+        let idx1 = idx_for(map_before[1].0).expect("TID 1 must survive remap");
+        assert_ne!(
+            idx0, idx1,
+            "after relay candidate addition the two original TIDs must map to distinct \
+             check-list indices (each to its own pair, not both to the same pair)"
+        );
+
+        // Each remapped index must point at an InProgress pair (the pair's state
+        // is preserved through the sort — only newly added relay pairs are Waiting).
+        let cl = agent.check_list();
+        assert_eq!(
+            cl[idx0].state,
+            PairState::InProgress,
+            "pair at idx {idx0} (TID 0) must be InProgress after remap"
+        );
+        assert_eq!(
+            cl[idx1].state,
+            PairState::InProgress,
+            "pair at idx {idx1} (TID 1) must be InProgress after remap"
+        );
+    }
+
+    /// Regression: after `add_relay_candidate`, the nominated pair must remain on
+    /// the EXACT (local, remote) pair that was nominated before the relay add —
+    /// not silently shift to a different local candidate that shares the same remote.
+    ///
+    /// Bug: the old code re-located the nominated pair by `remote.addr` only, so
+    /// it could migrate to local1's pair when local2's pair was the one nominated.
+    #[test]
+    fn multi_local_nominated_preserved_after_relay_candidate() {
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+
+        let local1_addr = ipv4(127, 0, 0, 1, 42001);
+        let local2_addr = ipv4(127, 0, 0, 2, 42002);
+        let sock = net.create_socket(NatType::FullCone, local1_addr).unwrap();
+
+        let cfg = make_config_multi_local(&[local1_addr, local2_addr], IceRole::Controlling, 100);
+        let mut agent = IceAgent::new(cfg, sock, FixedClock(0), TestRng(66));
+        agent.gather().unwrap();
+
+        // Shared remote.
+        let remote_addr = ipv4(10, 0, 0, 2, 9002);
+        agent.add_remote_candidate(Candidate::new(
+            CandidateKind::Host,
+            remote_addr,
+            remote_addr,
+            1,
+        ));
+
+        // After gather+add_remote_candidate the check list is built.
+        // Find which index corresponds to the pair whose local base is local2.
+        let local2_pair_idx = agent
+            .check_list()
+            .iter()
+            .position(|p| p.local.base == local2_addr)
+            .expect("must have a pair for local2");
+
+        // Manually mark that pair as nominated (simulates it having been selected).
+        agent.state = IceState::Connected;
+        if let Some(pair) = agent.check_list.get_mut(local2_pair_idx) {
+            pair.state = PairState::Succeeded;
+            pair.nominated = true;
+        }
+        agent.nominated_idx = Some(local2_pair_idx);
+
+        // Record which pair_id is nominated so we can verify it doesn't move.
+        let nominated_pair_id_before = agent
+            .nominated_pair()
+            .expect("must have a nominated pair")
+            .pair_id;
+
+        // Also record local.base so we can verify the local candidate is unchanged.
+        let nominated_local_base_before = agent.nominated_pair().unwrap().local.base;
+        assert_eq!(
+            nominated_local_base_before, local2_addr,
+            "pre-condition: nominated pair must be on local2"
+        );
+
+        // Add a relay candidate.  The check list is appended and re-sorted.
+        let relay_addr = ipv4(10, 0, 0, 254, 42003);
+        let base_addr = ipv4(127, 0, 0, 1, 42004);
+        agent
+            .add_relay_candidate(relay_addr, base_addr)
+            .expect("add_relay_candidate must succeed");
+
+        // Nomination must still point at local2's pair (same pair_id and local.base).
+        let nominated_after = agent
+            .nominated_pair()
+            .expect("nomination must survive add_relay_candidate");
+
+        assert_eq!(
+            nominated_after.pair_id, nominated_pair_id_before,
+            "nominated pair_id must be unchanged after add_relay_candidate: \
+             expected {nominated_pair_id_before}, got {}",
+            nominated_after.pair_id
+        );
+        assert_eq!(
+            nominated_after.local.base, local2_addr,
+            "nominated pair's local.base must remain local2 ({local2_addr}) \
+             after add_relay_candidate; got {}",
+            nominated_after.local.base
         );
     }
 

@@ -182,6 +182,12 @@ pub enum PairState {
 /// A local-remote candidate pair under evaluation.
 #[derive(Debug, Clone)]
 pub struct CandidatePair {
+    /// Stable identity assigned at pair creation.
+    ///
+    /// This ID survives check-list re-sorts; all in-flight and nominated remaps
+    /// must use it instead of remote address alone, which is not unique when
+    /// multiple local candidates share a remote (multi-homed host scenario).
+    pub pair_id: u64,
     /// The local candidate.
     pub local: Candidate,
     /// The remote candidate.
@@ -199,6 +205,11 @@ pub struct CandidatePair {
 impl CandidatePair {
     /// Construct a candidate pair for the given role.
     ///
+    /// `pair_id` must be a unique, stable identifier supplied by the caller
+    /// (typically a monotonic counter on the owning [`crate::agent::IceAgent`]).
+    /// It survives check-list re-sorts and is used by the agent to remap
+    /// in-flight transactions and the nominated pair index after any sort.
+    ///
     /// `is_controlling` determines which candidate is considered "G" (the
     /// controlling agent's candidate) in the RFC 5245 pair priority formula.
     ///
@@ -211,13 +222,14 @@ impl CandidatePair {
     /// let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9000);
     /// let local = Candidate::new(CandidateKind::Host, addr, addr, 1);
     /// let remote = Candidate::new(CandidateKind::Host, addr, addr, 1);
-    /// let pair = CandidatePair::new(local, remote, true);
+    /// let pair = CandidatePair::new(1, local, remote, true);
     /// assert!(pair.priority > 0);
     /// ```
     #[must_use]
-    pub fn new(local: Candidate, remote: Candidate, is_controlling: bool) -> Self {
+    pub fn new(pair_id: u64, local: Candidate, remote: Candidate, is_controlling: bool) -> Self {
         let priority = compute_pair_priority(local.priority, remote.priority, is_controlling);
         Self {
+            pair_id,
             local,
             remote,
             state: PairState::Frozen,
@@ -302,8 +314,8 @@ mod tests {
         let low_local = Candidate::new(CandidateKind::Relay, a1, a1, 1);
         let low_remote = Candidate::new(CandidateKind::Relay, a2, a2, 1);
 
-        let high_pair = CandidatePair::new(high_local, high_remote, true);
-        let low_pair = CandidatePair::new(low_local, low_remote, true);
+        let high_pair = CandidatePair::new(1, high_local, high_remote, true);
+        let low_pair = CandidatePair::new(2, low_local, low_remote, true);
         assert!(high_pair.priority > low_pair.priority);
     }
 
