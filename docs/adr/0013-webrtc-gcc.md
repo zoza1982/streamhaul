@@ -45,7 +45,6 @@ We need:
   work unchanged.
 - str0m's sans-IO design makes the drive loop fully testable in synchronous unit tests
   without mocking sockets or timers.
-- Small dependency surface: str0m adds one crate subtree with no tokio runtime requirement.
 
 **Negative / trade-offs:**
 - Two ICE stacks means two code paths to audit for security bugs (ICE mismatch attacks, etc.).
@@ -57,7 +56,34 @@ We need:
 - `WebRtcTransport` must be driven by an external task (no internal timer). The production
   drive task is deferred to P5 (signaling wiring).
 
+**Dependency reality (CLAUDE.md §7):**
+`str0m = "=0.20.0"` is pinned with `default-features = false, features = ["rust-crypto"]`.
+Despite the `rust-crypto` feature flag, str0m's transitive dependency `dimpl` pulls in
+`aws-lc-rs` AND a second copy of `rcgen` (0.14, alongside the workspace's `rcgen 0.13`)
+into the dependency tree. This means the tree contains both `ring` (via quinn/rustls) and
+`aws-lc-rs` (via str0m→dimpl) as crypto backends. This is a **wider crypto surface than
+the comment in `sh-transport/Cargo.toml` previously implied**. Mitigation: `cargo audit`
+is clean, `str0m` itself is exact-pinned so the tree is deterministic, and str0m's
+DTLS/crypto operations are isolated behind `WebRtcTransport`. If a future str0m version
+avoids `dimpl`/`aws-lc-rs`, the dependency should be re-evaluated. This posture is
+acceptable at P4 but must be revisited at GA (tracked as `R-STR0M-AUDIT`).
+
+**What P4-4 does NOT do (doc honesty):**
+- P4-4 establishes the DTLS transport and exposes the fingerprint seam
+  (`WebRtcTransport::local_dtls_fingerprint()` and `set_remote_dtls_fingerprint()`), but
+  does **NOT** bind the DTLS fingerprint to the device identity. That binding is the P4-5
+  task (wiring `WebRtcTransport::local_dtls_fingerprint()` into `BindCertBuilder::dtls_fpr()`
+  and verifying the remote fingerprint against the peer's `BindCert`).
+- P4-4 does **NOT** feed live str0m stats (RTT/loss/queue_delay) into GCC. The
+  `GccController` currently receives `TransportStats.queue_delay` from a placeholder; real
+  TWCC extraction from str0m's per-packet receive timestamps is the P5 drive loop task.
+- Do NOT interpret "DTLS established" as "peer authenticated" — peer authentication requires
+  the P4-5 BindCert fingerprint binding. Until then, the DTLS channel is encrypted but the
+  remote certificate is not bound to a device identity.
+
 **Follow-ups / deferrals:**
+- P4-5: Bind local DTLS fingerprint to `BindCert` (`BindCertBuilder::dtls_fpr`) and pin
+  the remote fingerprint from the peer's verified `BindCert`. Closes the DTLS MITM surface.
 - P5: Wire `WebRtcTransport` drive task to the tokio runtime and real UDP socket.
 - P5: Wire coturn relay for TURN traversal.
 - P5: Browser interop testing (offer/answer SDP exchange with Chrome/Firefox).

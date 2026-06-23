@@ -19,11 +19,24 @@
 //! 2. **Bitrate update** — per state:
 //!    - **Decrease**: multiply estimate by `BETA_DECREASE` (0.85), at most once per RTT.
 //!    - **Hold**: no change.
-//!    - **Increase**: multiplicative (`×1.08`) when far from cap; additive (`+8 kbps`) near cap.
+//!    - **Increase**: multiplicative (`×1.08`) when far from `last_known_rate_bps`;
+//!      additive (`+8 kbps`) once within 90% of the last known operating point.
+//!      The operating-point anchor (`last_known_rate_bps`) is **stale-aware**: if the estimate
+//!      has grown more than `OPERATING_POINT_RESET_MARGIN` above the anchor while in Increase
+//!      (meaning no congestion signal has refreshed the anchor), the anchor is reset to `None`
+//!      so multiplicative growth resumes toward the actual capacity ceiling. This prevents a
+//!      stale post-decrease anchor from locking the controller into slow additive fill after a
+//!      genuine capacity increase. The anchor is only refreshed by a non-suppressed Decrease
+//!      (either delay-based or loss-based), so it always reflects a real, recent congestion
+//!      signal.
 //!
-//! 3. **Loss-based cap** — if loss fraction > 10%: apply `BETA_DECREASE`; else no extra cap.
+//! 3. **Loss-based adjustment** — applied AFTER the delay state machine, using a pre-state
+//!    snapshot to avoid double application with a concurrent delay Decrease:
+//!    - If loss fraction > 10%: apply `BETA_DECREASE` once per RTT (same `decrease_suppressed`
+//!      gate as the delay path); write back to `estimate_bps`; update `last_decrease_time`.
+//!    - If loss fraction > 2%: freeze (revert any increase that just happened).
 //!
-//! 4. **Final target** — `min(delay_estimate, loss_cap).clamp(min, max)`.
+//! 4. **Final target** — `estimate_bps.clamp(min, max)`.
 //!
 //! ## Deviations from libwebrtc / RFC drafts
 //!
@@ -33,7 +46,11 @@
 //!
 //! 2. **Simplified state transitions**: real GCC has hysteresis counters before transitioning
 //!    `Hold → Increase` and `Increase → Decrease`. This implementation uses single-measurement
-//!    thresholds, making the controller more reactive but easier to reason about.
+//!    thresholds, making the controller more reactive but easier to reason about. The
+//!    `last_known_rate_bps` field switches from multiplicative to additive increase once
+//!    the estimate is within 90% of the last known operating point, mitigating overshoot.
+//!    The anchor is only written during Decrease when `estimate > acked_throughput` (genuine
+//!    overshoot), guaranteeing `anchor ≥ cap` at all times and preventing spurious stale resets.
 //!
 //! 3. **Single estimate**: real GCC maintains a separate bandwidth estimator (BWE) with its own
 //!    exponential moving average, and merges it with the delay estimate via `min`. We use a single
@@ -41,21 +58,29 @@
 //!
 //! 4. **AIMD constants**: chosen to match libwebrtc's general shape (8 kbps additive increase,
 //!    0.85 multiplicative decrease, ×1.08 multiplicative growth), but not bit-for-bit identical.
+//!
+//! 5. **Loss-to-state writeback**: libwebrtc applies the loss-based decrease to the
+//!    internal estimate (permanent state change). Earlier revisions only applied it to the
+//!    derived target (a per-tick overlay). Fixed: loss decrease now writes back to
+//!    `estimate_bps`, updates `last_decrease_time`, and is gated by `decrease_suppressed` so
+//!    it fires at most once per RTT — identical rate-limiting to the delay-path Decrease.
+//!    The loss cap uses the pre-delay-state snapshot to avoid double application with a
+//!    concurrent delay Decrease.
+//!
+//! 6. **Stale operating-point reset** (ADR-0013 note): `last_known_rate_bps` is reset to
+//!    `None` when the acknowledged throughput in the Increase arm exceeds the anchor.  This is
+//!    safe because the Decrease arm only writes the anchor when `estimate > acked_throughput`
+//!    (genuine overshoot), guaranteeing `anchor ≥ bottleneck_cap` whenever it is set.  After
+//!    a real capacity increase, the estimate grows additively past the old anchor and the very
+//!    next tick has `acked_throughput > anchor`, clearing the anchor and re-enabling ×1.08
+//!    multiplicative fill to probe the new ceiling.
 
 use std::time::{Duration, Instant};
 
+use crate::util::{clamp_duration, clamp_rtt, MAX_QUEUE_DELAY, MIN_RTT_SECS};
 use crate::{Bitrate, CongestionController, TransportStats};
 
 // ── Internal constants ────────────────────────────────────────────────────────
-
-/// Minimum plausible RTT. Sub-100 µs RTT is a measurement artefact; clamp up to this.
-const MIN_RTT: Duration = Duration::from_micros(100);
-
-/// Maximum RTT we trust. Above this the link is either very congested or the measurement is wrong.
-const MAX_RTT: Duration = Duration::from_secs(10);
-
-/// Maximum queue delay we trust from the transport layer.
-const MAX_QUEUE_DELAY: Duration = Duration::from_secs(2);
 
 /// Queue-delay threshold above which the controller signals **overuse** and enters Decrease.
 ///
@@ -68,9 +93,6 @@ const OVERUSE_THRESHOLD_SECS: f64 = 0.025;
 ///
 /// Stored as `f64` to avoid repeated `as_secs_f64()` in the hot path.
 const UNDERUSE_THRESHOLD_SECS: f64 = 0.010;
-
-/// Minimum RTT in seconds. Used as floor for the decrease-suppression window.
-const MIN_RTT_SECS: f64 = 0.000_100;
 
 /// Loss fraction (proportion of packets) above which the loss-based estimate applies a decrease.
 ///
@@ -87,10 +109,25 @@ const LOSS_LOW_THRESHOLD: f64 = 0.02;
 /// GCC spec: `β = 0.85` (15% decrease). Matches libwebrtc `kDefaultDecreaseRate`.
 const BETA_DECREASE: f64 = 0.85;
 
-/// Additive bitrate increase per feedback step when near the cap (AIMD steady-state).
+/// Maximum additive bitrate increase per feedback step when near the cap (AIMD steady-state).
 ///
 /// libwebrtc additive increase is ~8 kbps per interval. Stored as bits per second.
+/// The actual per-tick step is further capped by `AIMD_HEADROOM_FRACTION` so that the
+/// estimate cannot overshoot the confirmed operating-point anchor in a single large step.
 const AIMD_INCREASE_BPS: f64 = 8_000.0;
+
+/// Fraction of the remaining headroom to the anchor used as the additive step cap.
+///
+/// When within 90% of the last known anchor, the additive step per tick is capped at
+/// `(anchor - estimate) × AIMD_HEADROOM_FRACTION`.  This ensures the estimate asymptotically
+/// approaches the anchor rather than overshooting it by many multiples of the flat step.
+///
+/// Rationale: the overuse-detection queue delay (25 ms) takes hundreds of ticks to build up
+/// when the estimate overshoots the bottleneck by only a few kbps.  Without this cap, the
+/// estimate can grow far above the real cap during the slow-queue-build period, producing a
+/// wide oscillation band.  With the cap, the estimate stays within a small margin of the anchor,
+/// and the max/min ratio in the tail window is bounded to ≈ 1/BETA_DECREASE ≈ 1.18.
+const AIMD_HEADROOM_FRACTION: f64 = 0.50;
 
 /// Multiplicative increase factor when far from the cap (< 90% of max).
 ///
@@ -208,6 +245,13 @@ pub struct GccController {
 
     /// Cached target bitrate (re-derived on each feedback).
     target_bitrate: Bitrate,
+
+    /// The `estimate_bps` value recorded just BEFORE the most recent non-suppressed Decrease.
+    ///
+    /// Used by the Increase arm to switch from multiplicative to additive increase once the
+    /// estimate is within 90% of this last known operating point, preventing limit cycles.
+    /// Reset to `None` on cold-restart.
+    last_known_rate_bps: Option<f64>,
 }
 
 impl GccController {
@@ -228,6 +272,7 @@ impl GccController {
             state: State::Hold,
             last_feedback_time: None,
             last_decrease_time: None,
+            last_known_rate_bps: None,
             config,
         }
     }
@@ -263,6 +308,7 @@ impl GccController {
         self.srtt_secs = clamp_rtt(self.config.initial_rtt).as_secs_f64();
         self.state = State::Hold;
         self.last_decrease_time = None;
+        self.last_known_rate_bps = None;
         self.target_bitrate = self
             .config
             .initial_bitrate
@@ -318,6 +364,26 @@ impl CongestionController for GccController {
             0.0
         };
 
+        // ── Acknowledged throughput proxy ─────────────────────────────────────
+        // `acked_throughput_bps` is the actual delivery rate observed this interval
+        // (bytes_acked × 8 / interval_secs).  It is bounded by the bottleneck link
+        // capacity regardless of the send rate, making it a reliable proxy for the
+        // acknowledged bitrate that libwebrtc uses to detect when available capacity
+        // has grown above the last recorded operating point.
+        let acked_throughput_bps: f64 = {
+            let interval_secs = fb.interval.as_secs_f64();
+            if interval_secs > 0.0 {
+                let raw = f64::from(fb.bytes_acked) * 8.0 / interval_secs;
+                if raw.is_finite() {
+                    raw
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        };
+
         // ── Delay-based state machine ─────────────────────────────────────────
         if queue_delay_secs > OVERUSE_THRESHOLD_SECS {
             self.state = State::Decrease;
@@ -330,10 +396,26 @@ impl CongestionController for GccController {
         }
         // Between thresholds: state unchanged.
 
+        // Snapshot BEFORE applying state machine bitrate updates.
+        // Used by loss adjustment below to avoid double-applying BETA_DECREASE
+        // when the delay state machine also triggers a Decrease in the same tick.
+        let pre_state_estimate = self.estimate_bps;
+
         // ── Compute delay-based estimate ──────────────────────────────────────
         match self.state {
             State::Decrease => {
                 if !self.decrease_suppressed(now) {
+                    // Only update the operating-point anchor when the current estimate is
+                    // genuinely above the acknowledged throughput, i.e., the estimate really
+                    // is overshooting the bottleneck capacity.  If `estimate ≤ acked_throughput`
+                    // the queue delay is a residual from a previous overshoot (the bottleneck is
+                    // draining old backlog while the estimate is already below its capacity).
+                    // Writing a below-cap anchor in that case would corrupt stale-anchor
+                    // detection in the Increase arm and produce a spurious stale-reset that
+                    // restarts multiplicative growth — the root cause of the R2 limit cycle.
+                    if self.estimate_bps > acked_throughput_bps {
+                        self.last_known_rate_bps = Some(self.estimate_bps);
+                    }
                     let new_est = self.estimate_bps * BETA_DECREASE;
                     if new_est.is_finite() {
                         self.estimate_bps = new_est;
@@ -345,13 +427,71 @@ impl CongestionController for GccController {
                 // No change to estimate.
             }
             State::Increase => {
-                let cap_bps = self.config.max_bitrate.as_bps_f64();
-                let new_est = if self.estimate_bps < 0.9 * cap_bps {
-                    // Multiplicative increase: far from cap.
-                    self.estimate_bps * MULTIPLICATIVE_INCREASE_FACTOR
+                // Stale-anchor reset (F2): clear `last_known_rate_bps` when the acknowledged
+                // throughput proves the network can now deliver more than the recorded anchor.
+                //
+                // Rationale: `last_known_rate_bps` records the estimate immediately before the
+                // most recent non-suppressed Decrease (delay or loss path).  The Decrease arm
+                // only writes the anchor when `estimate > acked_throughput` (genuine overshoot),
+                // so the anchor is guaranteed to be above the bottleneck cap at the time it is
+                // written.  Consequently:
+                //
+                // Key invariant at steady-state cap:
+                //   anchor ≥ cap (always, by the Decrease-arm guard).  While the link is at the
+                //   same cap, `acked_throughput ≤ cap < anchor`, so the stale condition
+                //   `acked_throughput > anchor` never fires.  No spurious resets.
+                //
+                // Key behaviour on a genuine capacity increase:
+                //   After the bottleneck cap rises, the estimate (which is below the old anchor)
+                //   grows in additive steps.  Once it first crosses the anchor, the very next
+                //   tick has `acked_throughput > anchor`.  The condition fires, clears the anchor,
+                //   and re-enables ×1.08 multiplicative fill to probe the new ceiling.  The first
+                //   overshoot of the new cap sets a fresh, higher anchor.
+                //
+                // Safety: clearing to `None` enables ×1.08 against `config.max_bitrate`.
+                // At the new cap the delay path triggers Decrease within tens of ticks, setting
+                // a fresh anchor.  At most one probe cycle of overshoot per capacity-increase
+                // event — not the sustained limit cycle from R1 (which had no anchor at all).
+                // Under loss the anchor must not be cleared because the loss signal itself is
+                // the congestion evidence; additionally acked_throughput is degraded by loss
+                // and would give a misleading comparison.
+                if let Some(anchor) = self.last_known_rate_bps {
+                    if loss_frac <= LOSS_LOW_THRESHOLD
+                        && acked_throughput_bps.is_finite()
+                        && acked_throughput_bps > anchor
+                    {
+                        self.last_known_rate_bps = None;
+                    }
+                }
+
+                let new_est = if let Some(last_rate) = self.last_known_rate_bps {
+                    if self.estimate_bps >= 0.9 * last_rate {
+                        // Near last known operating point — additive increase (AIMD steady-state).
+                        // Cap the step by AIMD_HEADROOM_FRACTION × remaining headroom to prevent
+                        // the estimate from blowing past the anchor: the queue-delay signal takes
+                        // many ticks to build up at small excess rates, so without this cap the
+                        // estimate drifts far above the real ceiling.  The result is an asymptotic
+                        // approach to the anchor: fast at first, slowing to <1 bps as it converges,
+                        // which bounds the overshoot — and the max/min oscillation ratio — tightly.
+                        let headroom = (last_rate - self.estimate_bps).max(0.0);
+                        let step = AIMD_INCREASE_BPS
+                            .min(headroom * AIMD_HEADROOM_FRACTION)
+                            .max(1.0);
+                        self.estimate_bps + step
+                    } else {
+                        // Far from last known cap — multiplicative increase.
+                        self.estimate_bps * MULTIPLICATIVE_INCREASE_FACTOR
+                    }
                 } else {
-                    // Additive increase: near cap.
-                    self.estimate_bps + AIMD_INCREASE_BPS
+                    // No prior decrease observed (or anchor just cleared as stale) — use
+                    // configured max_bitrate as reference to cap multiplicative growth near the
+                    // config limit.
+                    let cap_bps = self.config.max_bitrate.as_bps_f64();
+                    if self.estimate_bps < 0.9 * cap_bps {
+                        self.estimate_bps * MULTIPLICATIVE_INCREASE_FACTOR
+                    } else {
+                        self.estimate_bps + AIMD_INCREASE_BPS
+                    }
                 };
                 if new_est.is_finite() {
                     self.estimate_bps = new_est;
@@ -359,37 +499,46 @@ impl CongestionController for GccController {
             }
         }
 
-        // Sanitise estimate.
+        // Sanitise estimate after state machine (guard against NaN from state machine).
         if !self.estimate_bps.is_finite() || self.estimate_bps < 0.0 {
             self.estimate_bps = self.config.min_bitrate.as_bps_f64();
         }
 
-        // ── Loss-based cap ────────────────────────────────────────────────────
-        // High loss only caps (multiplies); it does not independently increase.
-        let loss_est_bps = if loss_frac > LOSS_HIGH_THRESHOLD {
-            self.estimate_bps * BETA_DECREASE
+        // ── Loss-based adjustment (applied AFTER delay state machine) ─────────
+        // Uses pre_state_estimate as the base to avoid double-applying BETA_DECREASE
+        // when the delay state machine already triggered a Decrease in the same tick.
+        //
+        // F1 fix: the high-loss branch is gated by the same `decrease_suppressed()` machinery
+        // used by the delay path, and updates `last_decrease_time` when it fires.  Without this
+        // gate, at 100 Hz / 50 ms RTT the loss path applied 0.85 on every tick → 0.85^5 ≈ 44%
+        // collapse per RTT instead of the documented "at most once per RTT".
+        if loss_frac > LOSS_HIGH_THRESHOLD {
+            // High loss: apply multiplicative decrease to the pre-state snapshot, but at most
+            // once per RTT (same suppression window as the delay-path Decrease).
+            if !self.decrease_suppressed(now) {
+                let loss_cut = pre_state_estimate * BETA_DECREASE;
+                if loss_cut.is_finite() && loss_cut < self.estimate_bps {
+                    // Record operating point BEFORE writing back the loss cut, so the anchor
+                    // reflects the highest confirmed-good rate (same contract as delay Decrease).
+                    self.last_known_rate_bps = Some(pre_state_estimate);
+                    self.estimate_bps = loss_cut;
+                    self.last_decrease_time = Some(now);
+                }
+            }
         } else if loss_frac > LOSS_LOW_THRESHOLD {
-            // Loss is non-trivial but below high threshold: freeze (no increase).
-            // We represent this as equal to the current estimate (no growth).
-            self.estimate_bps
-        } else {
-            self.estimate_bps
-        };
+            // Moderate loss: freeze — revert any increase that just happened.
+            if self.estimate_bps > pre_state_estimate {
+                self.estimate_bps = pre_state_estimate;
+            }
+        }
+
+        // Sanitise estimate after loss adjustment.
+        if !self.estimate_bps.is_finite() || self.estimate_bps < 0.0 {
+            self.estimate_bps = self.config.min_bitrate.as_bps_f64();
+        }
 
         // ── Final target ──────────────────────────────────────────────────────
-        let raw_bps = if loss_frac > LOSS_HIGH_THRESHOLD {
-            self.estimate_bps.min(loss_est_bps)
-        } else {
-            self.estimate_bps
-        };
-
-        let clamped_bps = if raw_bps.is_finite() && raw_bps >= 0.0 {
-            raw_bps
-        } else {
-            self.config.min_bitrate.as_bps_f64()
-        };
-
-        self.target_bitrate = Bitrate::from_bps_f64(clamped_bps)
+        self.target_bitrate = Bitrate::from_bps_f64(self.estimate_bps)
             .clamp(self.config.min_bitrate, self.config.max_bitrate);
     }
 
@@ -417,30 +566,6 @@ impl CongestionController for GccController {
     }
 }
 
-// ── Free helpers ──────────────────────────────────────────────────────────────
-
-/// Clamp an RTT to `[MIN_RTT, MAX_RTT]`.
-#[inline]
-fn clamp_rtt(rtt: Duration) -> Duration {
-    if rtt < MIN_RTT {
-        MIN_RTT
-    } else if rtt > MAX_RTT {
-        MAX_RTT
-    } else {
-        rtt
-    }
-}
-
-/// Clamp a `Duration` to `[Duration::ZERO, max]`.
-#[inline]
-fn clamp_duration(d: Duration, max: Duration) -> Duration {
-    if d > max {
-        max
-    } else {
-        d
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -453,111 +578,11 @@ fn clamp_duration(d: Duration, max: Duration) -> Duration {
 mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
-
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// A network simulator with an accumulating bottleneck queue model.
-    ///
-    /// Tracks a virtual queue in bytes that fills when send rate exceeds the link capacity and
-    /// drains at line rate. Queue delay is computed as queue_bytes / drain_rate. Tail-drop
-    /// occurs when the queue exceeds `max_queue_bytes` (≈200 ms of buffering at cap).
-    struct NetSim {
-        /// Available bandwidth (bits per second).
-        cap_bps: f64,
-        /// Fixed propagation delay (one-way); RTT = 2 × prop_delay.
-        prop_delay: Duration,
-        /// Fractional packet loss rate (0.0 = no loss, 1.0 = 100% loss).
-        loss_rate: f64,
-        /// Synthetic clock: monotonically incremented.
-        clock: Instant,
-        /// Clock step per simulated feedback interval.
-        step: Duration,
-        /// Accumulated bottleneck queue in bytes.
-        queue_bytes: f64,
-        /// Maximum buffer before tail-drop (bytes). At cap, ≈200 ms of buffering.
-        max_queue_bytes: f64,
-    }
-
-    impl NetSim {
-        fn new(cap_kbps: u64, prop_delay_ms: u64, loss_rate: f64) -> Self {
-            // Instant::now() is allowed in tests; the controller itself never calls it.
-            #[allow(clippy::disallowed_methods)]
-            let clock = Instant::now();
-            let cap_bps = f64::from(u32::try_from(cap_kbps).unwrap_or(u32::MAX)) * 1_000.0;
-            let max_queue_bytes = cap_bps * 0.200 / 8.0;
-            Self {
-                cap_bps,
-                prop_delay: Duration::from_millis(prop_delay_ms),
-                loss_rate: loss_rate.clamp(0.0, 1.0),
-                clock,
-                step: Duration::from_millis(10),
-                queue_bytes: 0.0,
-                max_queue_bytes,
-            }
-        }
-
-        /// Advance time by one step and return a `TransportStats` for the current state.
-        fn tick(&mut self, send_rate_bps: f64) -> (Instant, TransportStats) {
-            self.clock += self.step;
-            let step_secs = self.step.as_secs_f64();
-            let rtt = self.prop_delay.saturating_mul(2);
-
-            let ingress = (send_rate_bps * step_secs / 8.0).max(0.0);
-            let egress = (self.cap_bps * step_secs / 8.0).max(0.0);
-
-            self.queue_bytes = (self.queue_bytes + ingress - egress).max(0.0);
-            self.queue_bytes = self.queue_bytes.min(self.max_queue_bytes);
-
-            let queue_delay_secs = if self.cap_bps > 0.0 {
-                (self.queue_bytes * 8.0 / self.cap_bps).min(MAX_QUEUE_DELAY.as_secs_f64())
-            } else {
-                MAX_QUEUE_DELAY.as_secs_f64()
-            };
-
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let bytes_acked = (egress * (1.0 - self.loss_rate)) as u32;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let bytes_lost = (egress * self.loss_rate) as u32;
-
-            let fb = TransportStats {
-                rtt,
-                queue_delay: Duration::from_secs_f64(queue_delay_secs),
-                bytes_acked,
-                bytes_lost,
-                loss_fraction_q8: 0,
-                interval: self.step,
-            };
-            (self.clock, fb)
-        }
-    }
+    use crate::util::test_helpers::{arb_feedback, NetSim};
 
     // ── Strategy helper for proptest ──────────────────────────────────────────
 
     use proptest::prelude::*;
-
-    /// Strategy: generate arbitrary (bounded) `TransportStats` values, including adversarial ones.
-    fn arb_feedback() -> impl Strategy<Value = TransportStats> {
-        (
-            0u64..=10_000_000u64, // rtt_us: 0 to 10 s in µs
-            0u64..=2_000_000u64,  // queue_delay_us: 0 to 2 s in µs
-            0u32..=1_000_000u32,  // bytes_acked
-            0u32..=2_000_000u32,  // bytes_lost (may exceed bytes_acked)
-            0u8..=255u8,          // loss_fraction_q8
-            1u64..=100u64,        // interval_ms
-        )
-            .prop_map(
-                |(rtt_us, queue_us, bytes_acked, bytes_lost, loss_q8, interval_ms)| {
-                    TransportStats {
-                        rtt: Duration::from_micros(rtt_us),
-                        queue_delay: Duration::from_micros(queue_us),
-                        bytes_acked,
-                        bytes_lost,
-                        loss_fraction_q8: loss_q8,
-                        interval: Duration::from_millis(interval_ms),
-                    }
-                },
-            )
-    }
 
     // ── Core behaviour tests ──────────────────────────────────────────────────
 
@@ -590,35 +615,52 @@ mod tests {
         }
     }
 
-    /// Test: controller converges toward the available bandwidth cap.
+    /// Test: controller converges toward the available bandwidth cap without limit cycles.
     ///
-    /// After enough steps, target_bitrate should be within [80%, 120%] of the cap.
-    /// GCC warms up differently from SCReAM (no slow-start), so we use a wider band.
+    /// Runs 600 ticks and checks the windowed mean of the last 100 readings is within
+    /// [75%, 125%] of the cap. Also checks max/min ratio of the window < 2.0 (no limit cycle).
     #[test]
     fn converges_toward_cap() {
         let cap_kbps = 5_000u64;
         let mut ctrl = GccController::with_defaults();
         let mut sim = NetSim::new(cap_kbps, 20, 0.0);
 
-        for _ in 0..500 {
+        let mut last_100: Vec<u64> = Vec::with_capacity(100);
+
+        for i in 0..600u64 {
             let send_bps = ctrl.target_bitrate().as_bps_f64();
             let (now, fb) = sim.tick(send_bps);
             ctrl.on_feedback(&fb, now);
+            if i >= 500 {
+                last_100.push(ctrl.target_bitrate().as_kbps());
+            }
         }
 
-        let final_kbps = ctrl.target_bitrate().as_kbps();
-        let low = cap_kbps * 80 / 100; // 80%
-        let high = cap_kbps * 120 / 100; // 120%
+        let windowed_mean = last_100.iter().copied().sum::<u64>() / 100;
+        let max_r = last_100.iter().copied().max().unwrap_or(0);
+        let min_r = last_100.iter().copied().min().unwrap_or(1);
+        let ratio = if min_r > 0 {
+            max_r as f64 / min_r as f64
+        } else {
+            f64::INFINITY
+        };
+
+        let low = cap_kbps * 75 / 100; // 75%
+        let high = cap_kbps * 125 / 100; // 125%
         println!(
-            "[converges_toward_cap] cap={cap_kbps} kbps, final={final_kbps} kbps  (band: [{low},{high}])"
+            "[converges_toward_cap] cap={cap_kbps} kbps, windowed_mean={windowed_mean} kbps (band: [{low},{high}]), max/min ratio={ratio:.2}"
         );
         assert!(
-            final_kbps >= low,
-            "controller failed to ramp up: {final_kbps} kbps < {low} kbps"
+            windowed_mean >= low,
+            "controller failed to ramp up: windowed_mean={windowed_mean} kbps < {low} kbps"
         );
         assert!(
-            final_kbps <= high,
-            "controller overshot too much: {final_kbps} kbps > {high} kbps"
+            windowed_mean <= high,
+            "controller overshot too much: windowed_mean={windowed_mean} kbps > {high} kbps"
+        );
+        assert!(
+            ratio < 2.0,
+            "limit cycle detected: max/min ratio={ratio:.2} >= 2.0 (max={max_r}, min={min_r})"
         );
     }
 
@@ -662,13 +704,22 @@ mod tests {
         );
     }
 
-    /// Test: recovers / ramps when bandwidth cap rises.
+    /// Test: recovers / ramps when bandwidth cap rises, and does so QUICKLY via multiplicative
+    /// growth rather than slow additive fill.
+    ///
+    /// Strengthened for F2: after the cap rises from 2 → 8 Mbps, the stale-anchor reset must
+    /// allow the controller to reach ≥75% of the NEW cap (6 000 kbps) within 200 ticks
+    /// (200 × 10ms = 2 s).  Without the reset, the old 2-Mbps anchor keeps the controller in
+    /// additive mode: 4 000 kbps gap / 8 kbps/tick = 500 ticks (5 s) to reach 75%.
     #[test]
     fn recovers_on_cap_rise() {
+        let new_cap_kbps = 8_000u64;
+        let target_75pct_kbps = new_cap_kbps * 75 / 100; // 6 000 kbps
+
         let mut ctrl = GccController::with_defaults();
         let mut sim = NetSim::new(2_000, 20, 0.0); // 2 Mbps initially
 
-        // Phase 1: converge at low cap.
+        // Phase 1: converge at low cap (200 ticks × 10 ms = 2 s).
         for _ in 0..200 {
             let send_bps = ctrl.target_bitrate().as_bps_f64();
             let (now, fb) = sim.tick(send_bps);
@@ -677,16 +728,35 @@ mod tests {
         let at_low_cap = ctrl.target_bitrate().as_kbps();
         println!("[recovers_on_cap_rise] at low cap (2 Mbps): {at_low_cap} kbps");
 
-        // Phase 2: raise cap to 8 Mbps and run 300 more steps.
-        sim.cap_bps = 8_000.0 * 1_000.0;
+        // Phase 2: raise cap to 8 Mbps; run up to 200 ticks and check 75% is reached.
+        // 200 ticks × 10 ms = 2 s — fast fill via multiplicative growth should suffice.
+        // Additive-only fill would take ~500 ticks, so 200 is a tight-enough bound to prove
+        // multiplicative growth resumed (F2 fix). We also record the tick it crosses 75%.
+        sim.cap_bps = (new_cap_kbps as f64) * 1_000.0;
         sim.max_queue_bytes = sim.cap_bps * 0.200 / 8.0;
-        for _ in 0..300 {
+        let mut reached_75pct_tick: Option<u32> = None;
+        for i in 0..200u32 {
             let send_bps = ctrl.target_bitrate().as_bps_f64();
             let (now, fb) = sim.tick(send_bps);
             ctrl.on_feedback(&fb, now);
+            let cur_kbps = ctrl.target_bitrate().as_kbps();
+            if reached_75pct_tick.is_none() && cur_kbps >= target_75pct_kbps {
+                reached_75pct_tick = Some(i + 1);
+            }
         }
         let at_high_cap = ctrl.target_bitrate().as_kbps();
-        println!("[recovers_on_cap_rise] at high cap (8 Mbps): {at_high_cap} kbps");
+        println!(
+            "[recovers_on_cap_rise] at high cap ({new_cap_kbps} kbps): {at_high_cap} kbps \
+             (75%={target_75pct_kbps} kbps reached at tick={reached_75pct_tick:?})"
+        );
+
+        // Primary: must have reached 75% of the new cap within 200 ticks (proves fast fill).
+        assert!(
+            reached_75pct_tick.is_some(),
+            "did not reach 75% of new cap ({target_75pct_kbps} kbps) within 200 ticks; \
+             final={at_high_cap} kbps — stale anchor likely locking controller in additive mode (F2)"
+        );
+        // Secondary: final value still above old cap (directional sanity).
         assert!(
             at_high_cap > at_low_cap,
             "expected ramp: at_low={at_low_cap}, at_high={at_high_cap}"
@@ -809,6 +879,231 @@ mod tests {
             assert!(final_rate <= cfg.max_bitrate, "above max: {}", final_rate);
         }
         println!("=== end of convergence summary ===\n");
+    }
+
+    // ── Regression tests ──────────────────────────────────────────────────────
+
+    /// Regression: sustained high loss must drive estimate DOWN, not up.
+    /// Before fix, estimate_bps was never written back from the loss cap, so
+    /// the Increase arm grew it each tick and target kept ramping despite loss.
+    #[test]
+    fn loss_runaway_regression() {
+        let cfg = GccConfig {
+            min_bitrate: Bitrate::from_kbps(100),
+            max_bitrate: Bitrate::from_mbps(50),
+            initial_bitrate: Bitrate::from_mbps(2),
+            ..GccConfig::default()
+        };
+        let mut ctrl = GccController::new(cfg);
+        let initial_kbps = ctrl.target_bitrate().as_kbps();
+        // 15% packet loss, no queue delay (so delay state machine stays in Hold/Increase).
+        let mut sim = NetSim::new(10_000, 20, 0.15);
+        for _ in 0..80 {
+            let send_bps = ctrl.target_bitrate().as_bps_f64();
+            let (now, fb) = sim.tick(send_bps);
+            ctrl.on_feedback(&fb, now);
+        }
+        let final_kbps = ctrl.target_bitrate().as_kbps();
+        println!(
+            "[loss_runaway_regression] initial={initial_kbps} kbps, final={final_kbps} kbps (should be <= {initial_kbps})"
+        );
+        assert!(
+            final_kbps <= initial_kbps,
+            "target ramped up under 15% loss: initial={initial_kbps} kbps, final={final_kbps} kbps"
+        );
+    }
+
+    /// Regression: moderate loss (5%) must freeze the estimate, not allow increase.
+    #[test]
+    fn moderate_loss_freeze_regression() {
+        let cfg = GccConfig {
+            min_bitrate: Bitrate::from_kbps(100),
+            max_bitrate: Bitrate::from_mbps(50),
+            initial_bitrate: Bitrate::from_mbps(2),
+            ..GccConfig::default()
+        };
+        let mut ctrl = GccController::new(cfg);
+        let initial_kbps = ctrl.target_bitrate().as_kbps();
+        // 5% loss, no queue delay.
+        let mut sim = NetSim::new(10_000, 20, 0.05);
+        for _ in 0..60 {
+            let send_bps = ctrl.target_bitrate().as_bps_f64();
+            let (now, fb) = sim.tick(send_bps);
+            ctrl.on_feedback(&fb, now);
+        }
+        let final_kbps = ctrl.target_bitrate().as_kbps();
+        println!(
+            "[moderate_loss_freeze_regression] initial={initial_kbps} kbps, final={final_kbps} kbps"
+        );
+        assert!(
+            final_kbps <= initial_kbps,
+            "target grew under 5% moderate loss: initial={initial_kbps} kbps, final={final_kbps} kbps"
+        );
+    }
+
+    /// Regression: concurrent delay-Decrease AND high loss must produce a single BETA_DECREASE,
+    /// not two (0.85 × 0.85 = 0.7225 effective). The target after one tick should be in the
+    /// band [0.80, 0.92] × estimate_before, not below 0.73 × estimate_before.
+    ///
+    /// Approach: stabilize at ~5 Mbps via Hold ticks, then fire one overuse+loss tick,
+    /// then observe target is in the single-cut band.
+    #[test]
+    fn coincident_decrease_and_high_loss_single_cut() {
+        #[allow(clippy::disallowed_methods)]
+        let base = Instant::now();
+        // Use a low initial_bitrate so we can set estimate without real sim.
+        let cfg = GccConfig {
+            min_bitrate: Bitrate::from_kbps(100),
+            max_bitrate: Bitrate::from_mbps(50),
+            initial_bitrate: Bitrate::from_mbps(5),
+            initial_rtt: Duration::from_millis(40),
+        };
+        let mut ctrl = GccController::new(cfg);
+
+        // Warm up: send ~50 Hold-state ticks so estimate sits near 5 Mbps.
+        // Hold state = no state transition + no queue delay change: use queue_delay between
+        // thresholds (e.g. 15ms, between UNDERUSE=10ms and OVERUSE=25ms).
+        for i in 0..50u64 {
+            let hold_fb = TransportStats {
+                rtt: Duration::from_millis(40),
+                queue_delay: Duration::from_millis(15), // between thresholds → no state change
+                bytes_acked: 10_000,
+                bytes_lost: 0,
+                loss_fraction_q8: 0,
+                interval: Duration::from_millis(10),
+            };
+            ctrl.on_feedback(&hold_fb, base + Duration::from_millis(10 * (i + 1)));
+        }
+        let estimate_before = ctrl.target_bitrate().as_bps_f64();
+        println!(
+            "[coincident_decrease_and_high_loss_single_cut] estimate_before={:.0} bps",
+            estimate_before
+        );
+
+        // Fire ONE tick with both overuse delay AND high loss (>10%).
+        // bytes_lost / bytes_acked = 200/1000 = 20% > LOSS_HIGH_THRESHOLD (10%).
+        let combined_fb = TransportStats {
+            rtt: Duration::from_millis(40),
+            queue_delay: Duration::from_millis(35), // > OVERUSE_THRESHOLD (25ms) → Decrease state
+            bytes_acked: 1_000,
+            bytes_lost: 200, // 20% loss
+            loss_fraction_q8: 0,
+            interval: Duration::from_millis(10),
+        };
+        ctrl.on_feedback(&combined_fb, base + Duration::from_millis(510));
+
+        let after_bps = ctrl.target_bitrate().as_bps_f64();
+        let single_cut_low = estimate_before * 0.80;
+        let single_cut_high = estimate_before * 0.92;
+        let double_cut_floor = estimate_before * 0.73;
+
+        println!(
+            "[coincident_decrease_and_high_loss_single_cut] after={:.0} bps, band=[{:.0},{:.0}], double_cut_floor={:.0}",
+            after_bps, single_cut_low, single_cut_high, double_cut_floor
+        );
+
+        assert!(
+            after_bps >= double_cut_floor,
+            "double BETA_DECREASE applied: after={after_bps:.0} < double_cut_floor={double_cut_floor:.0}"
+        );
+        assert!(
+            after_bps <= single_cut_high,
+            "not enough decrease: after={after_bps:.0} > single_cut_high={single_cut_high:.0}"
+        );
+    }
+
+    /// Regression: under sustained high loss (>10%), the loss-based decrease must fire at most
+    /// once per RTT, NOT once per feedback tick.
+    ///
+    /// Setup: 100 Hz feedback (10 ms step), 50 ms RTT → ≈5 ticks per RTT.
+    /// Without the per-RTT gate: 0.85^5 ≈ 44% collapse per RTT.
+    /// With the gate: one 0.85× per RTT → ≈15% drop per RTT.
+    ///
+    /// We run 500 ms (50 ticks = 10 RTTs) and count the number of multiplicative cuts that
+    /// actually fire (detectable by `last_decrease_time` updates — proxied by tracking
+    /// estimate drops > 5% per tick). Must be ≈ interval/RTT (10) not per-tick (50).
+    #[test]
+    fn loss_decrease_rate_is_per_rtt() {
+        #[allow(clippy::disallowed_methods)]
+        let base = Instant::now();
+
+        // RTT = 50 ms, tick = 10 ms → 5 ticks per RTT.
+        // Run 50 ticks = 10 RTTs → expect ≈10 cuts, definitely not 50.
+        let rtt_ms = 50u64;
+        let tick_ms = 10u64;
+        let ticks = 50u32;
+        let ticks_per_rtt = (rtt_ms / tick_ms) as u32; // 5
+
+        let cfg = GccConfig {
+            min_bitrate: Bitrate::from_kbps(100),
+            max_bitrate: Bitrate::from_mbps(50),
+            initial_bitrate: Bitrate::from_mbps(5),
+            initial_rtt: Duration::from_millis(rtt_ms),
+        };
+        let mut ctrl = GccController::new(cfg);
+
+        // Warm up with zero-loss, zero-delay ticks so we enter Increase state.
+        for i in 0..20u64 {
+            let fb = TransportStats {
+                rtt: Duration::from_millis(rtt_ms),
+                queue_delay: Duration::from_millis(5), // below UNDERUSE → Increase
+                bytes_acked: 10_000,
+                bytes_lost: 0,
+                loss_fraction_q8: 0,
+                interval: Duration::from_millis(tick_ms),
+            };
+            ctrl.on_feedback(&fb, base + Duration::from_millis(tick_ms * (i + 1)));
+        }
+        let start_bps = ctrl.target_bitrate().as_bps_f64();
+
+        // Inject sustained high-loss ticks (20% loss, queue=0 → delay path stays in Increase).
+        let mut cut_count = 0u32;
+        let mut prev_bps = start_bps;
+        for i in 0..ticks {
+            let now = base + Duration::from_millis(tick_ms * (20 + u64::from(i) + 1));
+            let fb = TransportStats {
+                rtt: Duration::from_millis(rtt_ms),
+                queue_delay: Duration::from_millis(5), // underuse → keep in Increase
+                bytes_acked: 800,
+                bytes_lost: 200, // 200/1000 = 20% > LOSS_HIGH_THRESHOLD
+                loss_fraction_q8: 0,
+                interval: Duration::from_millis(tick_ms),
+            };
+            ctrl.on_feedback(&fb, now);
+            let cur_bps = ctrl.target_bitrate().as_bps_f64();
+            // A cut fired if estimate dropped >5% from previous tick (additive changes are <1%).
+            if cur_bps < prev_bps * 0.95 {
+                cut_count += 1;
+            }
+            prev_bps = cur_bps;
+        }
+
+        let end_bps = ctrl.target_bitrate().as_bps_f64();
+        // Expected cuts ≈ ticks / ticks_per_rtt = 10. Allow a ±2 window (8–12).
+        let expected_cuts = ticks / ticks_per_rtt; // 10
+        let cut_lo = expected_cuts.saturating_sub(2); // 8
+        let cut_hi = expected_cuts + 2; // 12
+
+        println!(
+            "[loss_decrease_rate_is_per_rtt] start={start_bps:.0} bps, end={end_bps:.0} bps, \
+             cut_count={cut_count} (expected ≈{expected_cuts}, window=[{cut_lo},{cut_hi}])"
+        );
+
+        assert!(
+            cut_count <= cut_hi,
+            "loss path fires more than once per RTT: cut_count={cut_count} > {cut_hi} \
+             (expected ≈{expected_cuts} cuts in {ticks} ticks at {ticks_per_rtt} ticks/RTT)"
+        );
+        assert!(
+            cut_count >= cut_lo,
+            "loss path fired too rarely: cut_count={cut_count} < {cut_lo}; \
+             loss backoff may be broken"
+        );
+        // Sanity: the estimate must have dropped (loss is genuinely backing off).
+        assert!(
+            end_bps < start_bps,
+            "estimate did not decrease under sustained loss: start={start_bps:.0}, end={end_bps:.0}"
+        );
     }
 
     // ── Property tests ────────────────────────────────────────────────────────

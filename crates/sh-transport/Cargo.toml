@@ -14,7 +14,8 @@ insecure-lan = ["dep:rcgen", "dep:rustls"]
 thiserror.workspace = true
 bytes.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "time"] }
+tracing.workspace = true
 async-trait = "0.1"
 sh-types = { path = "../sh-types" }
 
@@ -25,6 +26,13 @@ sh-types = { path = "../sh-types" }
 # the module + the release compile_error guard in `lib.rs`, not this optional dep.
 rcgen = { version = "0.13", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+# str0m: exact-pinned sans-IO WebRTC engine (ICE/DTLS/SCTP/DataChannel).
+# `rust-crypto` selects RustCrypto crates (sha2, aes-gcm, etc.) as the underlying crypto.
+# DEPENDENCY REALITY: despite `rust-crypto`, str0m's transitive dep `dimpl` still pulls
+# `aws-lc-rs` AND a second `rcgen 0.14` into the tree (alongside the workspace's ring/rustls
+# and rcgen 0.13). The tree therefore contains both `ring` and `aws-lc-rs` as crypto backends.
+# This is the actual posture as of str0m 0.20.0; see ADR-0013 for the full justification.
+# `cargo audit` must remain clean after every str0m update. Security posture: R-STR0M-AUDIT.
 str0m = { version = "=0.20.0", default-features = false, features = ["rust-crypto"] }
 
 [dev-dependencies]

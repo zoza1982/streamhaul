@@ -96,6 +96,7 @@ pub mod gcc;
 pub mod loss_recovery;
 pub mod scream;
 pub mod stats;
+pub(crate) mod util;
 
 pub use allocator::{AllocatorConfig, ChannelAllocation, RateAllocator};
 pub use bitrate::Bitrate;
