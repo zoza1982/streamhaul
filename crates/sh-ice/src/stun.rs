@@ -517,7 +517,7 @@ fn decode_type(type_word: u16) -> Result<(StunClass, StunMethod), IceError> {
         (0, 1) => StunClass::Indication,
         (1, 0) => StunClass::SuccessResponse,
         (1, 1) => StunClass::ErrorResponse,
-        // SAFETY: c1 and c0 are each masked to 1 bit → only 4 combinations, all covered above.
+        // INVARIANT: c1 and c0 are each masked to 1 bit → only 4 combinations, all covered above.
         _ => StunClass::Request,
     };
     // Extract method bits: M11..M7 from bits 13..9, M6..M4 from bits 7..5, M3..M0 from bits 3..0.

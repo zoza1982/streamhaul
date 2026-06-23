@@ -154,10 +154,12 @@ pub fn compute_priority(kind: CandidateKind, local_preference: u32, component: u
 
 /// Compute an RFC 5245 foundation string.
 ///
-/// Foundation = `{prefix}{base_ip}{base_port}` where prefix is `h`, `s`, or `r`.
+/// Foundation = `{prefix}{base_addr}` where prefix is `h`, `s`, or `r` and `base_addr`
+/// is the `SocketAddr` Display form (`ip:port`), which avoids collisions between
+/// addresses like `10.0.0.1:50` and `10.0.0.15:0`.
 #[must_use]
 pub fn compute_foundation(kind: CandidateKind, base: SocketAddr) -> String {
-    format!("{}{}{}", kind.foundation_prefix(), base.ip(), base.port())
+    format!("{}{}", kind.foundation_prefix(), base)
 }
 
 // ─── Candidate pair ───────────────────────────────────────────────────────────
@@ -319,5 +321,14 @@ mod tests {
             host.foundation, srflx.foundation,
             "same base but different type → different foundation"
         );
+    }
+
+    #[test]
+    fn foundation_no_collision() {
+        let base_a = ipv4(10, 0, 0, 1, 50);
+        let base_b = ipv4(10, 0, 0, 15, 0);
+        let f_a = compute_foundation(CandidateKind::Host, base_a);
+        let f_b = compute_foundation(CandidateKind::Host, base_b);
+        assert_ne!(f_a, f_b, "foundations must differ: {f_a} vs {f_b}");
     }
 }

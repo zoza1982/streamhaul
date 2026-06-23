@@ -104,10 +104,22 @@ struct NetworkInner {
 }
 
 impl NetworkInner {
-    fn alloc_ext_port(&mut self) -> u16 {
-        let p = self.next_ext_port;
-        self.next_ext_port = self.next_ext_port.wrapping_add(1).max(1024);
-        p
+    fn alloc_ext_port(&mut self) -> Result<u16, IceError> {
+        // Try up to 65535 ports before giving up.
+        for _ in 0u32..65535 {
+            let p = self.next_ext_port;
+            self.next_ext_port = self.next_ext_port.wrapping_add(1);
+            if self.next_ext_port < 1024 {
+                self.next_ext_port = 1024;
+            }
+            let in_use = self.sockets.values().any(|s| {
+                s.external_addr.port() == p || s.sym_mappings.values().any(|e| e.port() == p)
+            });
+            if p >= 1024 && !in_use {
+                return Ok(p);
+            }
+        }
+        Err(IceError::Transport("external port space exhausted".into()))
     }
 
     /// Determine the external address that `internal` uses when sending to `dest`.
@@ -125,8 +137,7 @@ impl NetworkInner {
                     return Some(mapped);
                 }
                 // Allocate a new external port and record the mapping.
-                let ext_port = self.next_ext_port;
-                self.next_ext_port = self.next_ext_port.wrapping_add(1).max(1024);
+                let ext_port = self.alloc_ext_port().ok()?;
                 let ext = SocketAddr::new(self.external_ip, ext_port);
                 if let Some(state) = self.sockets.get_mut(&internal) {
                     state.sym_mappings.insert(dest, ext);
@@ -257,7 +268,7 @@ impl NatSimNetwork {
         internal_addr: SocketAddr,
     ) -> Result<SimSocket, IceError> {
         let mut inner = self.lock()?;
-        let ext_port = inner.alloc_ext_port();
+        let ext_port = inner.alloc_ext_port()?;
         let external_addr = SocketAddr::new(inner.external_ip, ext_port);
         inner.sockets.insert(
             internal_addr,

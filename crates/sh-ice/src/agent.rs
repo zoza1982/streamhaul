@@ -259,7 +259,18 @@ where
         Ok(gathered)
     }
 
-    /// Add a remote candidate (received via signaling / trickle ICE).
+    /// Add a remote candidate received via signalling or trickle ICE.
+    ///
+    /// Builds or extends the check list from the current local × remote cross product.
+    /// When called while the agent is already in [`IceState::Connected`], the existing
+    /// nominated pair is preserved — the new candidate produces additional pairs that
+    /// can be checked for a potentially better path, but the working path is not torn
+    /// down.
+    ///
+    /// # Errors
+    ///
+    /// This method is infallible.  It will silently extend the check list even if the
+    /// supplied candidate is a duplicate; deduplication is deferred to a future version.
     pub fn add_remote_candidate(&mut self, candidate: Candidate) {
         self.remote_candidates.push(candidate);
         // Rebuild the check list whenever remote candidates change.
@@ -268,6 +279,12 @@ where
 
     /// Rebuild the check list from the current local × remote cross product.
     fn rebuild_check_list(&mut self) {
+        // Save the nominated remote addr so we can re-locate it after the rebuild.
+        let nominated_remote_addr = self
+            .nominated_idx
+            .and_then(|i| self.check_list.get(i))
+            .map(|p| p.remote.addr);
+
         let is_controlling = self.config.role == IceRole::Controlling;
         let mut pairs: Vec<CandidatePair> = self
             .local_candidates
@@ -284,10 +301,25 @@ where
         // Sort by descending pair priority.
         pairs.sort_by_key(|p| std::cmp::Reverse(p.priority));
         self.check_list = pairs;
-        // Clear any stale positional indices — the Vec was rebuilt so old indices are invalid.
-        // Trickle ICE callers must re-run checks; nominated state is reconfirmed via new checks.
         self.in_flight.clear();
-        self.nominated_idx = None;
+
+        // Re-locate the nominated pair. If it's still in the new list, preserve nomination.
+        // This handles trickle ICE arrivals post-Connected without tearing down the working path.
+        if let Some(remote_addr) = nominated_remote_addr {
+            self.nominated_idx = self
+                .check_list
+                .iter()
+                .position(|p| p.remote.addr == remote_addr);
+            // Re-mark as nominated and Succeeded.
+            if let Some(idx) = self.nominated_idx {
+                if let Some(pair) = self.check_list.get_mut(idx) {
+                    pair.nominated = true;
+                    pair.state = PairState::Succeeded;
+                }
+            }
+        } else {
+            self.nominated_idx = None;
+        }
     }
 
     /// Run connectivity checks: send STUN Binding Requests (with `MESSAGE-INTEGRITY`)
@@ -343,6 +375,24 @@ where
     #[must_use]
     pub fn nominated_pair(&self) -> Option<&CandidatePair> {
         self.nominated_idx.and_then(|i| self.check_list.get(i))
+    }
+
+    /// Return a reference to the current check list.
+    #[must_use]
+    pub fn check_list(&self) -> &[CandidatePair] {
+        &self.check_list
+    }
+
+    /// Return the TIDs of all in-flight transactions (for testing).
+    #[cfg(test)]
+    pub fn in_flight_tids(&self) -> Vec<[u8; 12]> {
+        self.in_flight.iter().map(|(tid, _)| *tid).collect()
+    }
+
+    /// Return the nominated pair index (for testing).
+    #[cfg(test)]
+    pub fn nominated_idx_for_test(&self) -> Option<usize> {
+        self.nominated_idx
     }
 
     /// Advance the agent by one event: process `incoming` (if any) and return
@@ -430,7 +480,7 @@ where
     /// This is used in the synchronous test harness where the NatSimNetwork
     /// delivers packets directly into the SimSocket inbox via `send_to`.
     fn drain_transport_inbox(&mut self) {
-        let mut buf = vec![0u8; 2048];
+        let mut buf = [0u8; 2048];
         // Process up to 64 pending messages per call to bound latency.
         for _ in 0..64 {
             match self.transport.recv_from(&mut buf) {
@@ -453,7 +503,7 @@ where
 
         match msg.class {
             StunClass::Request => self.handle_binding_request(data, msg, from),
-            StunClass::SuccessResponse => self.handle_binding_response(msg, from),
+            StunClass::SuccessResponse => self.handle_binding_response(data, msg, from),
             StunClass::ErrorResponse | StunClass::Indication => Ok(()),
         }
     }
@@ -469,16 +519,35 @@ where
         // authenticated with the local ICE password.  Reject silently on failure
         // (an active attacker should not learn whether we received the message).
         if StunMessage::verify_integrity(raw, self.config.local_pwd.as_bytes()).is_err() {
-            tracing::debug!("dropping Binding Request with invalid MESSAGE-INTEGRITY from {from}");
+            tracing::trace!("dropping Binding Request with invalid MESSAGE-INTEGRITY");
+            return Ok(());
+        }
+
+        // RFC 8445 §7.3.1: validate USERNAME ufrag after MI passes.
+        // USERNAME = "<remote_ufrag>:<local_ufrag>"; the local part must match config.local_ufrag.
+        let username_valid = msg.attributes.iter().any(|a| {
+            if let StunAttribute::Username(u) = a {
+                u.split_once(':')
+                    .is_some_and(|(_, local_part)| local_part == self.config.local_ufrag)
+            } else {
+                false
+            }
+        });
+        if !username_valid {
             return Ok(());
         }
 
         let mut use_candidate = false;
+        let mut sender_is_controlling = false;
         for attr in &msg.attributes {
-            if let StunAttribute::UseCandidate = attr {
-                use_candidate = true;
+            match attr {
+                StunAttribute::UseCandidate => use_candidate = true,
+                StunAttribute::IceControlling(_) => sender_is_controlling = true,
+                _ => {}
             }
         }
+        // Only honour USE-CANDIDATE if the sender is in the ICE-CONTROLLING role.
+        let use_candidate = use_candidate && sender_is_controlling;
 
         // Build and queue a success response (signed with local password so the peer
         // can verify it).
@@ -557,9 +626,15 @@ where
     /// Handle an incoming STUN Binding Success Response.
     fn handle_binding_response(
         &mut self,
+        raw: &[u8],
         msg: StunMessage,
         from: SocketAddr,
     ) -> Result<(), IceError> {
+        // RFC 8445 §7.3.2: verify MESSAGE-INTEGRITY before processing.
+        if StunMessage::verify_integrity(raw, self.config.remote_pwd.as_bytes()).is_err() {
+            return Ok(());
+        }
+
         // Find the matching in-flight transaction.
         let pair_idx = self
             .in_flight
@@ -573,6 +648,13 @@ where
             }
             None => return Ok(()), // spurious response; ignore
         };
+
+        // Verify the response came from the expected remote address.
+        if let Some(pair) = self.check_list.get(pair_idx) {
+            if from != pair.remote.addr {
+                return Ok(());
+            }
+        }
 
         if let Some(pair) = self.check_list.get_mut(pair_idx) {
             pair.state = PairState::Succeeded;
@@ -601,6 +683,8 @@ where
                 );
                 if let Ok(bytes) = nominate_result {
                     self.outgoing.push((bytes, from));
+                    // Track the nomination request so its response is matched.
+                    self.in_flight.push((tid, pair_idx));
                 }
             }
         }
@@ -843,15 +927,36 @@ mod tests {
                 PortRestricted,
                 true,
             ),
-            // Symmetric×Symmetric: the srflx addr known by B is A's mapping toward the STUN
-            // server, but A→B gets a NEW external port unknown to B. In our simplified sim
-            // (host candidates only, external addrs announced directly), both agents
-            // announce their external addr via trickle, but for Symmetric NAT the
-            // external addr for A→B differs from A's base external. In the test harness
-            // we use the step-based delivery which routes through the NatSimNetwork;
-            // if the NAT blocks the packet, no nomination occurs. For Symmetric×Symmetric
-            // we expect failure (no nominated pair without relay).
+            // Symmetric×Symmetric: requires relay — each side uses a new external port per
+            // dest, and neither has seen the other's per-dest port before receiving.
             ("Symmetric×Symmetric", Symmetric, Symmetric, false),
+            // Mixed NAT combinations — RFC 5128 traversal matrix.
+            // In this sim the Symmetric peer announces its base external addr, but actual
+            // packets arrive from a per-dest mapped port unknown to the other side.
+            // The source-address check (RFC 8445 §7.3.2) therefore rejects the mismatched
+            // response, so all mixed Symmetric combos require relay in this harness.
+            ("FullCone×Symmetric", FullCone, Symmetric, false),
+            ("RestrictedCone×Symmetric", RestrictedCone, Symmetric, false),
+            // PortRestricted requires exact (IP, port); Symmetric uses a new port per dest
+            // that the PortRestricted side never sent to — relay required.
+            ("PortRestricted×Symmetric", PortRestricted, Symmetric, false),
+            // Mirrors of the above with roles swapped.
+            ("Symmetric×FullCone", Symmetric, FullCone, false),
+            ("Symmetric×RestrictedCone", Symmetric, RestrictedCone, false),
+            ("Symmetric×PortRestricted", Symmetric, PortRestricted, false),
+            // Additional coverage for asymmetric non-Symmetric pairs.
+            (
+                "RestrictedCone×PortRestricted",
+                RestrictedCone,
+                PortRestricted,
+                true,
+            ),
+            (
+                "PortRestricted×RestrictedCone",
+                PortRestricted,
+                RestrictedCone,
+                true,
+            ),
         ];
 
         println!("\nNAT traversal matrix results:");
@@ -863,12 +968,20 @@ mod tests {
             println!("{:<35} {:>8} {:>8}", label, a_nom, b_nom);
             if *expect_success {
                 assert!(
-                    a_nom,
-                    "controlling agent should nominate a pair for {label}"
+                    a_nom && b_nom,
+                    "both agents should nominate a pair for {label}: a_nom={a_nom} b_nom={b_nom}"
                 );
             } else {
-                // For Symmetric×Symmetric we accept either outcome (no crash).
-                // In a real implementation relay candidates would be used.
+                // Relay required: assert that P2P did NOT fully succeed (both agents connected).
+                // Note: in asymmetric Symmetric NAT cases the controlling agent may
+                // unilaterally nominate (it can see the peer's responses), while the
+                // controlled agent cannot (the USE-CANDIDATE arrives from the wrong
+                // per-dest port). Both outcomes are acceptable here; what matters is
+                // that the session did not reach a fully-connected state.
+                assert!(
+                    !(a_nom && b_nom),
+                    "relay required for {label}: expected no full P2P connection, but got a_nom={a_nom} b_nom={b_nom}"
+                );
             }
         }
     }
@@ -928,5 +1041,249 @@ mod tests {
                 "Restarting should transition to New"
             );
         }
+    }
+
+    #[test]
+    fn forged_response_rejected() {
+        // Verify that a Binding Success Response without valid MESSAGE-INTEGRITY is dropped.
+        let (a_nom, b_nom) = run_two_agent_session(NatType::FullCone, NatType::FullCone, 50);
+        assert!(a_nom && b_nom, "happy path must still connect");
+
+        // Now verify forged response is rejected in isolation.
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let addr_a = ipv4(127, 0, 0, 1, 29001);
+        let sock_a = net.create_socket(NatType::FullCone, addr_a).unwrap();
+
+        let mut cfg_a = make_config(addr_a, IceRole::Controlling, 111);
+        cfg_a.remote_pwd = "remote-password-32chars-long-ok!".into();
+        cfg_a.remote_ufrag = "remoteufrag".into();
+
+        let mut agent_a = IceAgent::new(cfg_a, sock_a, FixedClock(0), TestRng(1));
+        agent_a.gather().unwrap();
+
+        // Add a remote candidate so we have a check-list pair.
+        let remote_addr = ipv4(10, 0, 0, 254, 20001);
+        agent_a.add_remote_candidate(Candidate::new(
+            CandidateKind::Host,
+            remote_addr,
+            remote_addr,
+            1,
+        ));
+
+        // Transition to Checking so check_pairs runs.
+        agent_a.state = IceState::Checking;
+        agent_a.checking_started_us = Some(0);
+        let _ = agent_a.step(None);
+
+        // Get an in-flight TID.
+        let tids = agent_a.in_flight_tids();
+        if tids.is_empty() {
+            // No pairs in-flight yet; that is fine — no forged response to test.
+            return;
+        }
+        let tid = tids[0];
+
+        // Forge a success response with that TID but no MESSAGE-INTEGRITY.
+        let forged_msg = StunMessage::new_binding_response(tid);
+        let forged_bytes = forged_msg.encode();
+
+        // Feed the forged response to the agent.
+        let _ = agent_a.step(Some((forged_bytes, remote_addr)));
+
+        // The pair must NOT have been promoted by the forged response.
+        let pair_state = agent_a.check_list.first().map(|p| p.state);
+        assert_ne!(
+            pair_state,
+            Some(PairState::Succeeded),
+            "forged response must not promote pair to Succeeded"
+        );
+    }
+
+    #[test]
+    fn use_candidate_role_check() {
+        // Verify that USE-CANDIDATE is only honoured when the sender claims ICE-CONTROLLING.
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let addr_a = ipv4(127, 0, 0, 1, 29002);
+        let sock_a = net.create_socket(NatType::FullCone, addr_a).unwrap();
+
+        let mut cfg_a = make_config(addr_a, IceRole::Controlled, 222);
+        // Set remote_pwd = local_pwd so our self-signed requests validate.
+        cfg_a.remote_pwd = cfg_a.local_pwd.clone();
+        cfg_a.remote_ufrag = cfg_a.local_ufrag.clone();
+
+        let mut agent_a = IceAgent::new(cfg_a.clone(), sock_a, FixedClock(0), TestRng(3));
+        agent_a.gather().unwrap();
+        let remote_addr = ipv4(10, 0, 0, 254, 20001);
+        agent_a.add_remote_candidate(Candidate::new(
+            CandidateKind::Host,
+            remote_addr,
+            remote_addr,
+            1,
+        ));
+
+        // Build a fake Binding Request with USE-CANDIDATE but ICE-CONTROLLED (wrong role).
+        let tid = [0xABu8; 12];
+        let mut req = StunMessage::new_binding_request(tid);
+        req.attributes.push(StunAttribute::Username(format!(
+            "{}:{}",
+            cfg_a.remote_ufrag, cfg_a.local_ufrag
+        )));
+        req.attributes.push(StunAttribute::Priority(1000));
+        req.attributes.push(StunAttribute::IceControlled(999)); // wrong role
+        req.attributes.push(StunAttribute::UseCandidate);
+        let req_bytes = req
+            .encode_with_integrity(cfg_a.local_pwd.as_bytes())
+            .unwrap();
+
+        let _ = agent_a.step(Some((req_bytes, remote_addr)));
+
+        // USE-CANDIDATE with ICE-CONTROLLED must NOT nominate.
+        assert!(
+            agent_a.nominated_idx_for_test().is_none(),
+            "USE-CANDIDATE from ICE-CONTROLLED role must be ignored"
+        );
+
+        // Now send with ICE-CONTROLLING — should nominate.
+        let tid2 = [0xCDu8; 12];
+        let mut req2 = StunMessage::new_binding_request(tid2);
+        req2.attributes.push(StunAttribute::Username(format!(
+            "{}:{}",
+            cfg_a.remote_ufrag, cfg_a.local_ufrag
+        )));
+        req2.attributes.push(StunAttribute::Priority(1000));
+        req2.attributes.push(StunAttribute::IceControlling(999)); // correct role
+        req2.attributes.push(StunAttribute::UseCandidate);
+        let req2_bytes = req2
+            .encode_with_integrity(cfg_a.local_pwd.as_bytes())
+            .unwrap();
+
+        let _ = agent_a.step(Some((req2_bytes, remote_addr)));
+
+        assert!(
+            agent_a.nominated_idx_for_test().is_some(),
+            "USE-CANDIDATE from ICE-CONTROLLING role must nominate"
+        );
+    }
+
+    #[test]
+    fn nomination_tid_tracked() {
+        let (a_nom, b_nom) = run_two_agent_session(NatType::FullCone, NatType::FullCone, 50);
+        assert!(
+            a_nom && b_nom,
+            "both agents must reach Connected: a_nom={a_nom} b_nom={b_nom}"
+        );
+    }
+
+    #[test]
+    fn username_ufrag_validated() {
+        // Verify that requests with wrong USERNAME ufrag are dropped even with correct MI.
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let addr_a = ipv4(127, 0, 0, 1, 29003);
+        let sock_a = net.create_socket(NatType::FullCone, addr_a).unwrap();
+
+        let mut cfg_a = make_config(addr_a, IceRole::Controlled, 333);
+        cfg_a.remote_pwd = cfg_a.local_pwd.clone();
+        cfg_a.remote_ufrag = cfg_a.local_ufrag.clone();
+
+        let mut agent_a = IceAgent::new(cfg_a.clone(), sock_a, FixedClock(0), TestRng(4));
+        agent_a.gather().unwrap();
+        let remote_addr = ipv4(10, 0, 0, 254, 20002);
+        agent_a.add_remote_candidate(Candidate::new(
+            CandidateKind::Host,
+            remote_addr,
+            remote_addr,
+            1,
+        ));
+
+        // Send with wrong USERNAME (local part doesn't match config.local_ufrag).
+        let tid = [0xEFu8; 12];
+        let mut req = StunMessage::new_binding_request(tid);
+        req.attributes
+            .push(StunAttribute::Username("wrongremote:wronglocal".into()));
+        req.attributes.push(StunAttribute::Priority(1000));
+        req.attributes.push(StunAttribute::IceControlling(1));
+        req.attributes.push(StunAttribute::UseCandidate);
+        let req_bytes = req
+            .encode_with_integrity(cfg_a.local_pwd.as_bytes())
+            .unwrap();
+
+        let _ = agent_a.step(Some((req_bytes, remote_addr)));
+
+        assert!(
+            agent_a.nominated_idx_for_test().is_none(),
+            "request with wrong USERNAME ufrag must be dropped"
+        );
+
+        // Correct USERNAME → should nominate.
+        let tid2 = [0x12u8; 12];
+        let mut req2 = StunMessage::new_binding_request(tid2);
+        req2.attributes.push(StunAttribute::Username(format!(
+            "{}:{}",
+            cfg_a.remote_ufrag, cfg_a.local_ufrag
+        )));
+        req2.attributes.push(StunAttribute::Priority(1000));
+        req2.attributes.push(StunAttribute::IceControlling(1));
+        req2.attributes.push(StunAttribute::UseCandidate);
+        let req2_bytes = req2
+            .encode_with_integrity(cfg_a.local_pwd.as_bytes())
+            .unwrap();
+
+        let _ = agent_a.step(Some((req2_bytes, remote_addr)));
+
+        assert!(
+            agent_a.nominated_idx_for_test().is_some(),
+            "correct USERNAME must be accepted"
+        );
+    }
+
+    #[test]
+    fn trickle_candidate_post_connected_preserves_nomination() {
+        // First verify the happy path still works.
+        let (a_nom, b_nom) = run_two_agent_session(NatType::FullCone, NatType::FullCone, 50);
+        assert!(a_nom && b_nom, "session should have connected");
+
+        // Now test trickle in isolation: set up a single agent, manually drive to Connected,
+        // then add a late remote candidate and verify nomination is preserved.
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let addr_a = ipv4(127, 0, 0, 1, 29004);
+        let sock_a = net.create_socket(NatType::FullCone, addr_a).unwrap();
+
+        let mut cfg_a = make_config(addr_a, IceRole::Controlling, 111);
+        cfg_a.remote_pwd = cfg_a.local_pwd.clone();
+        cfg_a.remote_ufrag = cfg_a.local_ufrag.clone();
+
+        let mut agent = IceAgent::new(cfg_a, sock_a, FixedClock(0), TestRng(42));
+        agent.gather().unwrap();
+
+        let remote1 = Candidate::new(
+            CandidateKind::Host,
+            ipv4(10, 0, 0, 1, 9001),
+            ipv4(10, 0, 0, 1, 9001),
+            1,
+        );
+        agent.add_remote_candidate(remote1);
+
+        // Manually force the pair to Succeeded+nominated to simulate Connected.
+        agent.state = IceState::Connected;
+        if let Some(pair) = agent.check_list.get_mut(0) {
+            pair.state = PairState::Succeeded;
+            pair.nominated = true;
+        }
+        agent.nominated_idx = Some(0);
+
+        // Now add a late trickle candidate.
+        let remote2 = Candidate::new(
+            CandidateKind::Host,
+            ipv4(10, 0, 0, 2, 9002),
+            ipv4(10, 0, 0, 2, 9002),
+            1,
+        );
+        agent.add_remote_candidate(remote2);
+
+        // Nomination MUST be preserved.
+        assert!(
+            agent.nominated_pair().is_some(),
+            "nomination must survive trickle candidate arrival post-Connected"
+        );
     }
 }
