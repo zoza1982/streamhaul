@@ -11,7 +11,7 @@
 //! is the primary threat model; this target is mandatory per CLAUDE.md §5.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use sh_ice::transport::{NatSimNetwork, NatType, SimSocket};
+use sh_ice::transport::SimSocket;
 use sh_types::FixedClock;
 
 fuzz_target!(|data: &[u8]| {

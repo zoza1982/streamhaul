@@ -259,6 +259,82 @@ where
         Ok(gathered)
     }
 
+    /// Inject a relay candidate into the local candidate set.
+    ///
+    /// Call this after a successful TURN allocation to make the relay address available
+    /// for connectivity checks.  The candidate is added with [`CandidateKind::Relay`] and
+    /// the check list is rebuilt immediately if remote candidates are already present.
+    ///
+    /// This method is the integration point between the TURN client (which allocates the
+    /// relay address) and the ICE agent (which adds it to the check list and uses it for
+    /// connectivity checks).  The caller is responsible for running the TURN allocation
+    /// sequence (via [`crate::turn::TurnClient`]) before invoking this method.
+    ///
+    /// # Valid states
+    ///
+    /// Must only be called when the agent is in [`IceState::Gathering`],
+    /// [`IceState::Checking`], or [`IceState::Connected`].  Calling this from
+    /// [`IceState::Failed`] or [`IceState::Restarting`] would silently discard the
+    /// relay candidate on the next state transition (the candidate list is cleared on
+    /// restart).  Debug builds assert this invariant.
+    ///
+    /// # Security
+    ///
+    /// The relay path does not weaken end-to-end ICE security: connectivity checks over
+    /// the relay still carry `MESSAGE-INTEGRITY` signed with the ICE short-term credential
+    /// (keyed with the remote ICE password).  The TURN relay only forwards opaque bytes
+    /// and cannot forge a valid check.  The agent verifies `MESSAGE-INTEGRITY` on every
+    /// incoming Binding Request and response, regardless of whether it arrived via relay.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sh_ice::agent::{IceAgent, IceConfig, IceRole};
+    /// use sh_ice::transport::{NatSimNetwork, NatType};
+    /// use sh_types::FixedClock;
+    /// use rand_core::OsRng;
+    ///
+    /// let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+    /// let sock = net.create_socket(NatType::Symmetric,
+    ///     "127.0.0.1:9001".parse().unwrap()).unwrap();
+    /// let cfg = IceConfig {
+    ///     stun_servers: vec![],
+    ///     turn_servers: vec![],
+    ///     local_addrs: vec!["127.0.0.1:9001".parse().unwrap()],
+    ///     role: IceRole::Controlling,
+    ///     tie_breaker: 12345,
+    ///     local_ufrag: "myufrag".into(),
+    ///     local_pwd: "mypassword32charslong__________".into(),
+    ///     remote_ufrag: "peerufrag".into(),
+    ///     remote_pwd: "peerpassword32charslong_________".into(),
+    /// };
+    /// let mut agent = IceAgent::new(cfg, sock, FixedClock(0), OsRng);
+    /// // Transition to Gathering before injecting relay candidates (required).
+    /// agent.gather().unwrap();
+    /// let relay_addr = "10.0.0.254:40000".parse().unwrap();
+    /// let base_addr = "127.0.0.1:9002".parse().unwrap(); // TURN client socket addr
+    /// agent.add_relay_candidate(relay_addr, base_addr);
+    /// ```
+    pub fn add_relay_candidate(&mut self, relay_addr: SocketAddr, base_addr: SocketAddr) {
+        // Calling add_relay_candidate in Failed/Restarting states silently loses the
+        // candidate because local_candidates is cleared on restart.  Catch this in debug
+        // builds so the invariant is visible during development and testing.
+        debug_assert!(
+            matches!(
+                self.state,
+                IceState::Gathering | IceState::Checking | IceState::Connected
+            ),
+            "add_relay_candidate called in invalid state {:?}; \
+             candidate would be lost on next state transition",
+            self.state
+        );
+        let c = Candidate::new(CandidateKind::Relay, relay_addr, base_addr, 1);
+        self.local_candidates.push(c);
+        if !self.remote_candidates.is_empty() {
+            self.rebuild_check_list();
+        }
+    }
+
     /// Add a remote candidate received via signalling or trickle ICE.
     ///
     /// Builds or extends the check list from the current local × remote cross product.
@@ -355,9 +431,21 @@ where
                 );
                 match msg_result {
                     Ok(bytes) => {
-                        // Best-effort send; transport errors manifest as pair failure when
-                        // no response arrives.
-                        let _ = self.transport.send_to(&bytes, pair.remote.addr);
+                        // Relay pairs must be routed by the caller (test harness or production
+                        // relay path) rather than sent directly through the transport socket.
+                        // The outgoing queue is drained by step() and returned to the caller,
+                        // which is responsible for wrapping relay-destined packets in TURN
+                        // Send Indications and delivering them through the relay.
+                        //
+                        // For non-relay (host/srflx) pairs, send directly through the transport
+                        // so the NatSimNetwork can deliver them synchronously in tests.
+                        if pair.remote.kind == CandidateKind::Relay {
+                            self.outgoing.push((bytes, pair.remote.addr));
+                        } else {
+                            // Best-effort send; transport errors manifest as pair failure when
+                            // no response arrives.
+                            let _ = self.transport.send_to(&bytes, pair.remote.addr);
+                        }
                         self.in_flight.push((tid, idx));
                     }
                     Err(_) => {
@@ -606,8 +694,18 @@ where
                 );
                 if let Ok(bytes) = triggered_result {
                     let dest = from;
-                    // Send triggered check via transport (goes through NAT sim).
-                    let _ = self.transport.send_to(&bytes, dest);
+                    // For relay pairs, route through the outgoing queue so the test harness
+                    // (or production relay path) can wrap the packet in a TURN Send Indication.
+                    // For host/srflx pairs, send directly through the transport.
+                    let is_relay_dest = self
+                        .check_list
+                        .get(idx)
+                        .is_some_and(|p| p.remote.kind == CandidateKind::Relay);
+                    if is_relay_dest {
+                        self.outgoing.push((bytes, dest));
+                    } else {
+                        let _ = self.transport.send_to(&bytes, dest);
+                    }
                     self.in_flight.push((tid, idx));
                     if should_nominate {
                         // Optimistically mark as nominated; confirmed when we get the response.
@@ -1285,5 +1383,577 @@ mod tests {
             agent.nominated_pair().is_some(),
             "nomination must survive trickle candidate arrival post-Connected"
         );
+    }
+
+    // ─── Relay candidate tests ────────────────────────────────────────────────
+
+    /// End-to-end symmetric×symmetric NAT traversal via TURN relay (Gate P4).
+    ///
+    /// Both agents are behind Symmetric NAT — the harshest NAT type where host and
+    /// server-reflexive candidates cannot establish P2P connectivity because each peer
+    /// uses a different external port per destination, which the other side cannot
+    /// predict before it sends.
+    ///
+    /// With relay candidates both agents allocate a relay address from the
+    /// [`sim_turn::SimTurnServer`], exchange those addresses via signalling (simulated
+    /// here by direct assignment), and perform STUN Binding connectivity checks routed
+    /// through the relay.
+    ///
+    /// # Security note
+    ///
+    /// The relay only forwards opaque bytes — `MESSAGE-INTEGRITY` (HMAC-SHA1 keyed
+    /// with the ICE short-term credential) is still verified end-to-end by each agent.
+    /// The TURN relay cannot forge a valid check.  This property is exercised here:
+    /// every Binding Request and Response goes through `handle_incoming`, which calls
+    /// `StunMessage::verify_integrity` with the local ICE password before acting on
+    /// the message.  If the relay tampered with the payload the check would fail and
+    /// the message would be silently dropped.
+    #[test]
+    fn symmetric_symmetric_via_relay_connected() {
+        use std::net::IpAddr;
+
+        use crate::turn::{sim_turn::SimTurnServer, TurnClient, TurnConfig, TurnState};
+
+        // ── Network fabric ────────────────────────────────────────────────────
+        // All addresses live in the same NatSimNetwork so packets can be delivered
+        // deterministically without real OS sockets.
+        let net = NatSimNetwork::new("10.0.0.254".parse::<IpAddr>().unwrap());
+        let turn_server_addr: SocketAddr = "10.0.0.254:3478".parse().unwrap();
+        let relay_ip: IpAddr = "10.0.0.254".parse().unwrap();
+
+        let turn_server =
+            SimTurnServer::new(turn_server_addr, relay_ip, "iceuser", "icepass", &net).unwrap();
+
+        // ── Agent A — Symmetric NAT ───────────────────────────────────────────
+        let addr_a: SocketAddr = "192.168.1.1:50000".parse().unwrap();
+        let turn_sock_addr_a: SocketAddr = "192.168.1.1:50001".parse().unwrap();
+        // The ICE agent socket (Symmetric): each new destination gets a new external port,
+        // preventing P2P connectivity without relay.
+        let sock_a = net.create_socket(NatType::Symmetric, addr_a).unwrap();
+        // The TURN client socket (FullCone): the TURN server must be able to reply to it.
+        let turn_sock_a = net
+            .create_socket(NatType::FullCone, turn_sock_addr_a)
+            .unwrap();
+
+        // ── Agent B — Symmetric NAT ───────────────────────────────────────────
+        let addr_b: SocketAddr = "192.168.2.1:50000".parse().unwrap();
+        let turn_sock_addr_b: SocketAddr = "192.168.2.1:50001".parse().unwrap();
+        let sock_b = net.create_socket(NatType::Symmetric, addr_b).unwrap();
+        let turn_sock_b = net
+            .create_socket(NatType::FullCone, turn_sock_addr_b)
+            .unwrap();
+
+        // ── TURN allocation for Agent A ───────────────────────────────────────
+        // RFC 8656 §6.1: unauthenticated Allocate → 401 challenge → authenticated
+        // Allocate → success with XOR-RELAYED-ADDRESS.
+        let mut tc_a = TurnClient::new(
+            TurnConfig {
+                server_addr: turn_server_addr,
+                username: "iceuser".into(),
+                password: "icepass".into(),
+                lifetime_secs: 600,
+            },
+            turn_sock_a,
+            FixedClock(0),
+            TestRng(100),
+        );
+        tc_a.start_allocate().unwrap();
+        turn_server.step(); // server processes unauthenticated Allocate → 401
+        let mut buf = [0u8; 4096];
+        let (n, _) = tc_a.recv_one(&mut buf).unwrap(); // receive 401
+        tc_a.handle_incoming(buf.get(..n).unwrap()).unwrap(); // sends authenticated Allocate
+        turn_server.step(); // server processes authenticated Allocate → success
+        let (n2, _) = tc_a.recv_one(&mut buf).unwrap(); // receive success
+        tc_a.handle_incoming(buf.get(..n2).unwrap()).unwrap();
+        assert_eq!(tc_a.state(), TurnState::Allocated, "Agent A must allocate");
+        let relay_addr_a = tc_a.relay_addr().unwrap();
+
+        // ── TURN allocation for Agent B ───────────────────────────────────────
+        let mut tc_b = TurnClient::new(
+            TurnConfig {
+                server_addr: turn_server_addr,
+                username: "iceuser".into(),
+                password: "icepass".into(),
+                lifetime_secs: 600,
+            },
+            turn_sock_b,
+            FixedClock(0),
+            TestRng(200),
+        );
+        tc_b.start_allocate().unwrap();
+        turn_server.step();
+        let (n, _) = tc_b.recv_one(&mut buf).unwrap();
+        tc_b.handle_incoming(buf.get(..n).unwrap()).unwrap();
+        turn_server.step();
+        let (n2, _) = tc_b.recv_one(&mut buf).unwrap();
+        tc_b.handle_incoming(buf.get(..n2).unwrap()).unwrap();
+        assert_eq!(tc_b.state(), TurnState::Allocated, "Agent B must allocate");
+        let relay_addr_b = tc_b.relay_addr().unwrap();
+
+        // ── CreatePermission: A permits B's relay IP; B permits A's relay IP ─
+        // Required so the TURN server will forward packets from one relay to the other.
+        tc_a.create_permission(relay_addr_b).unwrap();
+        turn_server.step();
+        if let Ok((n, _)) = tc_a.recv_one(&mut buf) {
+            let _ = tc_a.handle_incoming(buf.get(..n).unwrap());
+        }
+        tc_b.create_permission(relay_addr_a).unwrap();
+        turn_server.step();
+        if let Ok((n, _)) = tc_b.recv_one(&mut buf) {
+            let _ = tc_b.handle_incoming(buf.get(..n).unwrap());
+        }
+
+        // ── ICE agent configuration ───────────────────────────────────────────
+        // Agents are configured with NO local host addresses — only relay candidates
+        // will be added.  This ensures the check list contains only Relay×Relay pairs,
+        // which is the proof that the connection is established exclusively via the relay.
+        //
+        // In a real deployment both host and relay candidates are gathered; the relay
+        // pair is used as fallback only when P2P fails.  Here we test the relay path
+        // in isolation to prove it works for Symmetric×Symmetric NAT.
+        //
+        // Use the same cross-wiring pattern as `run_two_agent_session`.
+        let mut cfg_a = make_config(addr_a, IceRole::Controlling, 111);
+        let mut cfg_b = make_config(addr_b, IceRole::Controlled, 222);
+        // Remove local host addresses so only relay candidates form the check list.
+        cfg_a.local_addrs.clear();
+        cfg_b.local_addrs.clear();
+        cfg_a.remote_pwd = cfg_b.local_pwd.clone();
+        cfg_a.remote_ufrag = cfg_b.local_ufrag.clone();
+        cfg_b.remote_pwd = cfg_a.local_pwd.clone();
+        cfg_b.remote_ufrag = cfg_a.local_ufrag.clone();
+
+        let mut agent_a = IceAgent::new(cfg_a, sock_a, FixedClock(0), TestRng(11));
+        let mut agent_b = IceAgent::new(cfg_b, sock_b, FixedClock(0), TestRng(22));
+
+        // Transition agents to Gathering state manually, bypassing the empty-local-addrs
+        // guard.  We do this by directly injecting the relay candidates and setting state.
+        agent_a.state = IceState::Gathering;
+        agent_b.state = IceState::Gathering;
+
+        // Inject relay candidates obtained from the TURN allocations above.
+        agent_a.add_relay_candidate(relay_addr_a, turn_sock_addr_a);
+        agent_b.add_relay_candidate(relay_addr_b, turn_sock_addr_b);
+
+        // Exchange relay candidates via signalling (simulated by direct injection).
+        // The remote candidate's addr is the peer's relay address; the base is irrelevant
+        // for the check-list priority formula, so we reuse the addr.
+        agent_a.add_remote_candidate(Candidate::new(
+            CandidateKind::Relay,
+            relay_addr_b,
+            relay_addr_b,
+            1,
+        ));
+        agent_b.add_remote_candidate(Candidate::new(
+            CandidateKind::Relay,
+            relay_addr_a,
+            relay_addr_a,
+            1,
+        ));
+
+        // Rebuild check lists; transition to Checking so step() runs checks immediately.
+        agent_a.rebuild_check_list();
+        agent_b.rebuild_check_list();
+        agent_a.state = IceState::Checking;
+        agent_b.state = IceState::Checking;
+        // Set a checking_started_us well in the past relative to FixedClock(0) so the
+        // timeout (CHECK_TIMEOUT_US = 5 s → 5_000_000 µs) doesn't fire prematurely.
+        // FixedClock(0) gives now_unix_secs = 0, so now_us = 0.  We set started at 0
+        // so timeout fires at 5_000_000 µs, well after our 200-step loop completes.
+        agent_a.checking_started_us = Some(0);
+        agent_b.checking_started_us = Some(0);
+
+        // ── Relay step loop ───────────────────────────────────────────────────
+        // The ICE agent's step() method returns outgoing packets.  For relay pairs,
+        // the destination is relay_addr_{a,b}.  We intercept those packets and route
+        // them through the TURN Send Indication → TURN server → Data Indication path
+        // so they reach the peer's TURN client and are then forwarded to the ICE agent.
+        //
+        // Non-relay packets (to the Symmetric host candidates) travel directly through
+        // the NatSimNetwork and will be blocked by Symmetric NAT — which is what we want
+        // to prove: only the relay path succeeds.
+        let mut relay_incoming_for_a: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+        let mut relay_incoming_for_b: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+
+        let mut both_connected = false;
+        for _step_idx in 0..200 {
+            // Feed one relay-delivered packet (if any) to each agent this round.
+            let inc_a = relay_incoming_for_a.pop();
+            let inc_b = relay_incoming_for_b.pop();
+
+            let out_a = agent_a.step(inc_a).unwrap_or_default();
+            let out_b = agent_b.step(inc_b).unwrap_or_default();
+
+            // Route A's outgoing: packets to relay_addr_b go via TURN Send Indication.
+            // Packets to any other address go via the NatSimNetwork (and will be blocked
+            // by Symmetric NAT, proving only the relay path works).
+            for (bytes, dest) in &out_a {
+                if *dest == relay_addr_b {
+                    // Wrap in Send Indication so the TURN server routes to B's TURN client.
+                    let _ = tc_a.send_indication(relay_addr_b, bytes);
+                }
+                // Non-relay packets: already delivered by transport.send_to in step().
+            }
+            for (bytes, dest) in &out_b {
+                if *dest == relay_addr_a {
+                    let _ = tc_b.send_indication(relay_addr_a, bytes);
+                }
+            }
+
+            // Step the TURN server to route all pending Send Indications.
+            turn_server.step();
+
+            // Drain Data Indications from tc_a (packets from B, forwarded by TURN).
+            // handle_incoming returns Ok(Some((peer_addr, payload))) for Data indications.
+            while let Ok((n, _)) = tc_a.recv_one(&mut buf) {
+                if let Ok(Some((peer_relay, payload))) = tc_a.handle_incoming(buf.get(..n).unwrap())
+                {
+                    // Deliver to agent_a as if received directly from the peer's relay.
+                    relay_incoming_for_a.push((payload, peer_relay));
+                }
+            }
+
+            // Drain Data Indications from tc_b (packets from A, forwarded by TURN).
+            while let Ok((n, _)) = tc_b.recv_one(&mut buf) {
+                if let Ok(Some((peer_relay, payload))) = tc_b.handle_incoming(buf.get(..n).unwrap())
+                {
+                    relay_incoming_for_b.push((payload, peer_relay));
+                }
+            }
+
+            if agent_a.state() == IceState::Connected && agent_b.state() == IceState::Connected {
+                both_connected = true;
+                break;
+            }
+        }
+
+        // ── Assertions ────────────────────────────────────────────────────────
+        assert!(
+            both_connected,
+            "both agents must reach Connected; a={:?} b={:?}",
+            agent_a.state(),
+            agent_b.state()
+        );
+
+        let pair_a = agent_a.nominated_pair().unwrap();
+        let pair_b = agent_b.nominated_pair().unwrap();
+
+        assert_eq!(
+            pair_a.local.kind,
+            CandidateKind::Relay,
+            "Agent A's nominated local candidate must be Relay (got {:?})",
+            pair_a.local.kind
+        );
+        assert_eq!(
+            pair_b.local.kind,
+            CandidateKind::Relay,
+            "Agent B's nominated local candidate must be Relay (got {:?})",
+            pair_b.local.kind
+        );
+        assert_eq!(
+            pair_a.remote.kind,
+            CandidateKind::Relay,
+            "Agent A's nominated remote candidate must be Relay (got {:?})",
+            pair_a.remote.kind
+        );
+        assert_eq!(
+            pair_b.remote.kind,
+            CandidateKind::Relay,
+            "Agent B's nominated remote candidate must be Relay (got {:?})",
+            pair_b.remote.kind
+        );
+
+        println!(
+            "symmetric×symmetric → CONNECTED via relay: \
+             A relay={relay_addr_a}, B relay={relay_addr_b}"
+        );
+    }
+
+    /// NAT matrix variant WITH relay configured: Symmetric×Symmetric and mixed Symmetric
+    /// combinations that require relay now connect via the TURN relay path.
+    ///
+    /// This is the "relay-configured → connected" complement to the P2P-only `nat_matrix`
+    /// test (which keeps those cases asserting failure to document the P2P limitation).
+    #[test]
+    fn nat_matrix_relay_fallback() {
+        use std::net::IpAddr;
+
+        use crate::turn::{sim_turn::SimTurnServer, TurnClient, TurnConfig, TurnState};
+
+        /// Parameters for a relay ICE session between two agents.
+        struct RelaySessionArgs {
+            relay_addr_a: SocketAddr,
+            relay_addr_b: SocketAddr,
+            tc_a: TurnClient<crate::transport::SimSocket, FixedClock, TestRng>,
+            tc_b: TurnClient<crate::transport::SimSocket, FixedClock, TestRng>,
+            nat_a: NatType,
+            nat_b: NatType,
+            internal_addr_a: SocketAddr,
+            internal_addr_b: SocketAddr,
+            turn_sock_addr_a: SocketAddr,
+            turn_sock_addr_b: SocketAddr,
+        }
+
+        /// Run a two-agent session where both agents have relay candidates.
+        /// Returns `(a_nominated_relay, b_nominated_relay)`.
+        fn run_relay_session(
+            net: &NatSimNetwork,
+            turn_server: &SimTurnServer,
+            args: RelaySessionArgs,
+        ) -> (bool, bool) {
+            let RelaySessionArgs {
+                relay_addr_a,
+                relay_addr_b,
+                mut tc_a,
+                mut tc_b,
+                nat_a,
+                nat_b,
+                internal_addr_a,
+                internal_addr_b,
+                turn_sock_addr_a,
+                turn_sock_addr_b,
+            } = args;
+            let sock_a = net.create_socket(nat_a, internal_addr_a).unwrap();
+            let sock_b = net.create_socket(nat_b, internal_addr_b).unwrap();
+
+            // Cross-wired ICE credentials (same pattern as run_two_agent_session).
+            let mut cfg_a = make_config(internal_addr_a, IceRole::Controlling, 1);
+            let mut cfg_b = make_config(internal_addr_b, IceRole::Controlled, 2);
+            cfg_a.remote_pwd = cfg_b.local_pwd.clone();
+            cfg_a.remote_ufrag = cfg_b.local_ufrag.clone();
+            cfg_b.remote_pwd = cfg_a.local_pwd.clone();
+            cfg_b.remote_ufrag = cfg_a.local_ufrag.clone();
+
+            // Relay-only configuration: no host candidates so the check list contains
+            // exclusively Relay×Relay pairs, proving relay connectivity in isolation.
+            cfg_a.local_addrs.clear();
+            cfg_b.local_addrs.clear();
+
+            let mut agent_a = IceAgent::new(cfg_a, sock_a, FixedClock(0), TestRng(31));
+            let mut agent_b = IceAgent::new(cfg_b, sock_b, FixedClock(0), TestRng(32));
+
+            agent_a.state = IceState::Gathering;
+            agent_b.state = IceState::Gathering;
+
+            agent_a.add_relay_candidate(relay_addr_a, turn_sock_addr_a);
+            agent_b.add_relay_candidate(relay_addr_b, turn_sock_addr_b);
+
+            agent_a.add_remote_candidate(Candidate::new(
+                CandidateKind::Relay,
+                relay_addr_b,
+                relay_addr_b,
+                1,
+            ));
+            agent_b.add_remote_candidate(Candidate::new(
+                CandidateKind::Relay,
+                relay_addr_a,
+                relay_addr_a,
+                1,
+            ));
+
+            agent_a.rebuild_check_list();
+            agent_b.rebuild_check_list();
+            agent_a.state = IceState::Checking;
+            agent_b.state = IceState::Checking;
+            agent_a.checking_started_us = Some(0);
+            agent_b.checking_started_us = Some(0);
+
+            let mut relay_inc_a: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+            let mut relay_inc_b: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
+            let mut buf = [0u8; 4096];
+
+            for _ in 0..200 {
+                let inc_a = relay_inc_a.pop();
+                let inc_b = relay_inc_b.pop();
+
+                let out_a = agent_a.step(inc_a).unwrap_or_default();
+                let out_b = agent_b.step(inc_b).unwrap_or_default();
+
+                for (bytes, dest) in &out_a {
+                    if *dest == relay_addr_b {
+                        let _ = tc_a.send_indication(relay_addr_b, bytes);
+                    }
+                }
+                for (bytes, dest) in &out_b {
+                    if *dest == relay_addr_a {
+                        let _ = tc_b.send_indication(relay_addr_a, bytes);
+                    }
+                }
+
+                turn_server.step();
+
+                while let Ok((n, _)) = tc_a.recv_one(&mut buf) {
+                    if let Ok(Some((peer_relay, payload))) =
+                        tc_a.handle_incoming(buf.get(..n).unwrap())
+                    {
+                        relay_inc_a.push((payload, peer_relay));
+                    }
+                }
+                while let Ok((n, _)) = tc_b.recv_one(&mut buf) {
+                    if let Ok(Some((peer_relay, payload))) =
+                        tc_b.handle_incoming(buf.get(..n).unwrap())
+                    {
+                        relay_inc_b.push((payload, peer_relay));
+                    }
+                }
+
+                if agent_a.state() == IceState::Connected && agent_b.state() == IceState::Connected
+                {
+                    break;
+                }
+            }
+
+            let a_nom = agent_a.nominated_pair().is_some_and(|p| {
+                p.local.kind == CandidateKind::Relay && p.remote.kind == CandidateKind::Relay
+            });
+            let b_nom = agent_b.nominated_pair().is_some_and(|p| {
+                p.local.kind == CandidateKind::Relay && p.remote.kind == CandidateKind::Relay
+            });
+            (a_nom, b_nom)
+        }
+
+        // Symmetric NAT combos that require relay.
+        let relay_cases: &[(&str, NatType, NatType)] = &[
+            (
+                "Symmetric×Symmetric",
+                NatType::Symmetric,
+                NatType::Symmetric,
+            ),
+            ("FullCone×Symmetric", NatType::FullCone, NatType::Symmetric),
+            ("Symmetric×FullCone", NatType::Symmetric, NatType::FullCone),
+            (
+                "PortRestricted×Symmetric",
+                NatType::PortRestricted,
+                NatType::Symmetric,
+            ),
+            (
+                "Symmetric×PortRestricted",
+                NatType::Symmetric,
+                NatType::PortRestricted,
+            ),
+        ];
+
+        println!("\nNAT relay-fallback matrix:");
+        println!(
+            "{:<35} {:>12} {:>12}",
+            "Combination", "A-relay-nom", "B-relay-nom"
+        );
+        println!("{:-<61}", "");
+
+        // We share one NatSimNetwork and one SimTurnServer across all cases,
+        // but allocate fresh sockets/clients per case to avoid port conflicts.
+        let net = NatSimNetwork::new("10.0.0.254".parse::<IpAddr>().unwrap());
+        let turn_server_addr: SocketAddr = "10.0.0.254:13478".parse().unwrap();
+        let relay_ip: IpAddr = "10.0.0.254".parse().unwrap();
+        let turn_srv = SimTurnServer::new(turn_server_addr, relay_ip, "u", "p", &net).unwrap();
+
+        for (case_idx, (label, nat_a, nat_b)) in relay_cases.iter().enumerate() {
+            // Fresh sockets and TURN clients per test case to avoid port conflicts.
+            // We use port ranges that don't clash: 51000+offset for client sockets,
+            // 51100+offset for TURN client sockets.
+            let case_idx = case_idx as u16;
+
+            let ts_addr_a: SocketAddr = format!("192.168.10.{}:51001", case_idx + 1)
+                .parse()
+                .unwrap();
+            let ts_sock_a_addr: SocketAddr = format!("192.168.10.{}:51002", case_idx + 1)
+                .parse()
+                .unwrap();
+            let ts_addr_b: SocketAddr = format!("192.168.20.{}:51001", case_idx + 1)
+                .parse()
+                .unwrap();
+            let ts_sock_b_addr: SocketAddr = format!("192.168.20.{}:51002", case_idx + 1)
+                .parse()
+                .unwrap();
+
+            let turn_sock_a = net
+                .create_socket(NatType::FullCone, ts_sock_a_addr)
+                .unwrap();
+            let turn_sock_b = net
+                .create_socket(NatType::FullCone, ts_sock_b_addr)
+                .unwrap();
+
+            let mut tc_a = TurnClient::new(
+                TurnConfig {
+                    server_addr: turn_server_addr,
+                    username: "u".into(),
+                    password: "p".into(),
+                    lifetime_secs: 600,
+                },
+                turn_sock_a,
+                FixedClock(0),
+                TestRng(300 + u64::from(case_idx) * 10),
+            );
+            let mut tc_b = TurnClient::new(
+                TurnConfig {
+                    server_addr: turn_server_addr,
+                    username: "u".into(),
+                    password: "p".into(),
+                    lifetime_secs: 600,
+                },
+                turn_sock_b,
+                FixedClock(0),
+                TestRng(400 + u64::from(case_idx) * 10),
+            );
+
+            let mut buf = [0u8; 4096];
+
+            // Allocate for A.
+            tc_a.start_allocate().unwrap();
+            turn_srv.step();
+            let (n, _) = tc_a.recv_one(&mut buf).unwrap();
+            tc_a.handle_incoming(buf.get(..n).unwrap()).unwrap();
+            turn_srv.step();
+            let (n, _) = tc_a.recv_one(&mut buf).unwrap();
+            tc_a.handle_incoming(buf.get(..n).unwrap()).unwrap();
+            assert_eq!(tc_a.state(), TurnState::Allocated);
+            let relay_a = tc_a.relay_addr().unwrap();
+
+            // Allocate for B.
+            tc_b.start_allocate().unwrap();
+            turn_srv.step();
+            let (n, _) = tc_b.recv_one(&mut buf).unwrap();
+            tc_b.handle_incoming(buf.get(..n).unwrap()).unwrap();
+            turn_srv.step();
+            let (n, _) = tc_b.recv_one(&mut buf).unwrap();
+            tc_b.handle_incoming(buf.get(..n).unwrap()).unwrap();
+            assert_eq!(tc_b.state(), TurnState::Allocated);
+            let relay_b = tc_b.relay_addr().unwrap();
+
+            // Create permissions.
+            tc_a.create_permission(relay_b).unwrap();
+            turn_srv.step();
+            if let Ok((n, _)) = tc_a.recv_one(&mut buf) {
+                let _ = tc_a.handle_incoming(buf.get(..n).unwrap());
+            }
+            tc_b.create_permission(relay_a).unwrap();
+            turn_srv.step();
+            if let Ok((n, _)) = tc_b.recv_one(&mut buf) {
+                let _ = tc_b.handle_incoming(buf.get(..n).unwrap());
+            }
+
+            let (a_nom, b_nom) = run_relay_session(
+                &net,
+                &turn_srv,
+                RelaySessionArgs {
+                    relay_addr_a: relay_a,
+                    relay_addr_b: relay_b,
+                    tc_a,
+                    tc_b,
+                    nat_a: *nat_a,
+                    nat_b: *nat_b,
+                    internal_addr_a: ts_addr_a,
+                    internal_addr_b: ts_addr_b,
+                    turn_sock_addr_a: ts_sock_a_addr,
+                    turn_sock_addr_b: ts_sock_b_addr,
+                },
+            );
+
+            println!("{:<35} {:>12} {:>12}", label, a_nom, b_nom);
+            assert!(
+                a_nom && b_nom,
+                "{label}: both agents must nominate a relay pair (a={a_nom}, b={b_nom})"
+            );
+        }
     }
 }

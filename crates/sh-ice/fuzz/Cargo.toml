@@ -9,9 +9,13 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+rand_core = "0.6"
 
 [dependencies.sh-ice]
 path = ".."
+
+[dependencies.sh-types]
+path = "../../sh-types"
 
 [[bin]]
 name = "stun_decode"

@@ -1072,6 +1072,19 @@ where
         self.relay_addr = None;
     }
 
+    /// Receive one datagram from the underlying transport socket.
+    ///
+    /// Used by the integration-test relay step loop to drain Data Indications from
+    /// the TURN server and feed them to [`Self::handle_incoming`].  The transport
+    /// field is private so this thin accessor is provided only for test contexts.
+    #[cfg(test)]
+    pub fn recv_one(
+        &self,
+        buf: &mut [u8],
+    ) -> Result<(usize, std::net::SocketAddr), crate::error::IceError> {
+        self.transport.recv_from(buf)
+    }
+
     fn gen_tid(&mut self) -> [u8; 12] {
         let mut tid = [0u8; 12];
         self.rng.fill_bytes(&mut tid);
