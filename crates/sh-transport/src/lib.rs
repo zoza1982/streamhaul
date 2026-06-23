@@ -27,11 +27,13 @@ mod insecure;
 
 pub mod channel;
 pub mod quic_binding;
+pub mod webrtc;
 
 pub use channel::{Channel, ChannelSpec, QuicTransport, Reliability, Transport, MAX_FRAME_LEN};
 pub use connection::Connection;
 pub use endpoint::{ClientEndpoint, ServerEndpoint};
 pub use error::TransportError;
+pub use webrtc::{WebRtcChannel, WebRtcTransport};
 
 #[cfg(feature = "insecure-lan")]
 pub use insecure::{

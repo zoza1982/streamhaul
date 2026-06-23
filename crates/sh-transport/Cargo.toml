@@ -25,6 +25,7 @@ sh-types = { path = "../sh-types" }
 # the module + the release compile_error guard in `lib.rs`, not this optional dep.
 rcgen = { version = "0.13", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"], optional = true }
+str0m = { version = "=0.20.0", default-features = false, features = ["rust-crypto"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
