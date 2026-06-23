@@ -224,7 +224,7 @@ pub trait SignalingChannel: Send + 'static {
 /// The `webrtc_peer_pin` value is derived from the cryptographically verified Noise
 /// `HandshakeOutcome` (via [`HandshakeOutcome::require_webrtc_dtls_pin`]). It is the
 /// peer's DTLS fingerprint committed inside its identity-signed `BindCert`. The factory
-/// must pass it to `WebRtcTransport::set_remote_dtls_fingerprint` before DTLS begins.
+/// must pass it to `WebRtcTransportBuilder::pin_remote_dtls` before DTLS begins.
 ///
 /// A production follow-up (`PinnedWebRtcTransport` builder, tracked in R-WEBRTC-LIVE) will
 /// enforce pin application structurally so the factory cannot silently skip it.
@@ -233,7 +233,7 @@ pub trait TransportFactory: Send + 'static {
     ///
     /// `webrtc_peer_pin` is `Some([u8; 32])` **only** when `kind == Webrtc`; it is `None` when
     /// `kind == Quic`. Implementors must apply the pin (e.g., via
-    /// `WebRtcTransport::set_remote_dtls_fingerprint`) before returning.
+    /// `WebRtcTransportBuilder::pin_remote_dtls`) before returning.
     ///
     /// # Errors
     ///

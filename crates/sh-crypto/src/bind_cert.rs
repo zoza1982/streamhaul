@@ -144,7 +144,7 @@ impl DtlsCommitment {
 ///
 /// Returned by [`BindCert::dtls_pin`]. For a WebRTC peer, `alg` is [`DTLS_FPR_ALG_SHA256`] and
 /// `commit` is the 32-byte whole-certificate fingerprint to pin via
-/// `WebRtcTransport::set_remote_dtls_fingerprint`. For a QUIC peer (no DTLS) the BindCert carries
+/// `WebRtcTransportBuilder::pin_remote_dtls`. For a QUIC peer (no DTLS) the BindCert carries
 /// no pin and `dtls_pin()` returns `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DtlsPin {
@@ -675,7 +675,7 @@ impl BindCert {
     /// non-zero commitment. A signaling/SDP MITM cannot forge the Ed25519-signed commitment, so the
     /// only available attack is to **strip** the binding down to `ALG = NONE`; this method rejects
     /// that (ADR-0014, §3). Call this on the WebRTC pin path *before* the DTLS handshake starts,
-    /// then feed the returned bytes to `WebRtcTransport::set_remote_dtls_fingerprint`.
+    /// then feed the returned bytes to `WebRtcTransportBuilder::pin_remote_dtls`.
     ///
     /// # Errors
     ///
