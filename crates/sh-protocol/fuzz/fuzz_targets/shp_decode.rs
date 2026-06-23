@@ -12,4 +12,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = sh_protocol::NackFeedback::decode(data);
     // P2-5: codec capability offer/answer decoder (untrusted peer bytes).
     let _ = sh_protocol::capability::decode_caps(data);
+    // P4-6: transport capability decoder (untrusted peer bytes — 2-byte fixed format).
+    let _ = sh_protocol::decode_transport_caps(data);
 });

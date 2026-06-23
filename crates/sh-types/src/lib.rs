@@ -358,6 +358,41 @@ impl TryFrom<u8> for ChannelId {
     }
 }
 
+// ─── Transport kind ───────────────────────────────────────────────────────────
+
+/// The network transport protocol to use for a Streamhaul session.
+///
+/// This is a **leaf type** (no dependencies) intentionally placed in `sh-types` so that both
+/// `sh-protocol` (negotiation logic) and `sh-transport` (factory implementations) can import it
+/// without creating a dependency cycle.
+///
+/// # Preference order
+///
+/// When both transports are available, QUIC is preferred over WebRTC for native-to-native
+/// connections: QUIC has lower overhead (no DTLS + SRTP stack), direct multiplexing, and
+/// purpose-built congestion control. WebRTC is used as the browser-compatible fallback.
+///
+/// The canonical ordering is encoded in [`sh_protocol::transport_caps::negotiate`].
+///
+/// # Examples
+///
+/// ```
+/// use sh_types::TransportKind;
+///
+/// let kind = TransportKind::Quic;
+/// assert_eq!(format!("{kind:?}"), "Quic");
+/// assert_ne!(TransportKind::Quic, TransportKind::Webrtc);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransportKind {
+    /// Native QUIC transport (quinn / RFC 9000). Preferred for native↔native sessions.
+    Quic,
+    /// WebRTC transport (str0m). Used for browser↔native and browser↔browser sessions.
+    Webrtc,
+}
+
+// ─── Shared error ──────────────────────────────────────────────────────────────
+
 /// Errors shared across Streamhaul crates. Crate-specific errors wrap or convert into this where they
 /// cross a public boundary.
 ///

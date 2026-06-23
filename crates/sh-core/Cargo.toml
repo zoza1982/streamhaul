@@ -16,6 +16,9 @@ sh-media = { path = "../sh-media" }
 sh-transport = { path = "../sh-transport" }
 sh-protocol = { path = "../sh-protocol" }
 sh-crypto = { path = "../sh-crypto" }
+sh-signaling = { path = "../sh-signaling" }
+sh-ice = { path = "../sh-ice" }
+async-trait = "0.1"
 bytes.workspace = true
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 thiserror.workspace = true
@@ -29,11 +32,14 @@ sh-input = { path = "../sh-input", optional = true }
 [dev-dependencies]
 sh-transport = { path = "../sh-transport", features = ["insecure-lan"] }
 sh-media = { path = "../sh-media" }
+sh-crypto = { path = "../sh-crypto" }
+sh-signaling = { path = "../sh-signaling" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 proptest.workspace = true
 rand_core.workspace = true
 rand_chacha = "=0.3.1"
 x25519-dalek.workspace = true
+str0m = { version = "=0.20.0", default-features = false, features = ["rust-crypto"] }
 
 [[test]]
 name = "loopback_harness"

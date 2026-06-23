@@ -46,4 +46,10 @@ pub enum ProtocolError {
     /// `cumulative_lost` exceeds [`crate::MAX_CUMULATIVE_LOST`] (does not fit the 24-bit wire field).
     #[error("cumulative_lost {0} exceeds 24-bit maximum")]
     CumulativeLostTooLarge(u32),
+    /// The version byte in a framed payload does not match the expected version.
+    ///
+    /// Returned by [`crate::transport_caps::decode_transport_caps`] when byte 0 is not `0x01`.
+    /// The raw byte is preserved so callers can surface a diagnostic ("got 0x02, expected 0x01").
+    #[error("unknown version byte: {0:#04x}")]
+    UnknownVersion(u8),
 }
