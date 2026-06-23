@@ -65,18 +65,26 @@ fingerprints against a signed token (planned for the signed-token auth work afte
 
 ### Server
 
+`AcceptAll` is **test-only** and is exported only under the `insecure-lan` feature (which
+fails to compile in release builds — see Security notes). A production server must supply a
+real `PeerAuthenticator` that validates each peer's `from_fp` against a signed token.
+
 ```rust,no_run
+# #[cfg(feature = "insecure-lan")]
+# {
 use std::sync::Arc;
 use sh_signaling::{SignalingServer, auth::AcceptAll};
 
 #[tokio::main]
 async fn main() -> Result<(), sh_signaling::SignalingError> {
+    // PRODUCTION: replace `AcceptAll` with a real PeerAuthenticator (R-SIG-AUTH).
     let server = SignalingServer::bind(
         "0.0.0.0:8765".parse().unwrap(),
         Arc::new(AcceptAll),
     ).await?;
     server.run().await
 }
+# }
 ```
 
 ### Client
@@ -123,11 +131,23 @@ async fn main() -> Result<(), sh_signaling::SignalingError> {
 ## Security notes
 
 - The `insecure-lan` feature must not be enabled in production builds. A `compile_error!` guard
-  is planned for a future PR when the release TLS path is finalized.
-- The server performs spoof rejection: each connection is bound to a single `from_fp` on `Hello`
-  and any subsequent message with a different `from_fp` is rejected and the connection closed.
+  **is implemented** (`auth.rs`): `cargo build --release --features insecure-lan` fails to compile.
 - The `payload` field is opaque to the server — this is the structural enforcement of the
-  zero-knowledge relay invariant.
+  zero-knowledge relay invariant (the server routes on `(session_id, to_fp)` only and never
+  parses, logs, or branches on the payload).
+- The server performs spoof rejection: each connection is bound to a single `from_fp` on `Hello`;
+  a subsequent message with a different `from_fp` is rejected and the connection closed. DoS
+  bounds are enforced (max connections, per-session peer cap, WS message-size cap, handshake +
+  idle timeouts).
+- **Residual risks (NOT yet mitigated by P4-1 — do not over-rely on signaling security):**
+  - **`from_fp` is not bound to a verified identity until R-SIG-AUTH lands.** With the test-only
+    `AcceptAll` authenticator, any peer can register (and thus impersonate) any fingerprint within
+    a session. The production `PeerAuthenticator` must cryptographically bind `from_fp`.
+  - **Plain-WS signaling is MITM-exposed.** TLS is terminated at a reverse proxy; even so, a
+    signaling-path MITM cannot read content (the payload is E2E-encrypted) but **can drop,
+    reorder, or inject ICE candidates** to force a worse path, downgrade, or block connection
+    setup. This is defeated only by the **P4-5 BindCert/DTLS-fingerprint binding**, which P4-1
+    does not provide.
 
 ## Related crates
 
