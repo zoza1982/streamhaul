@@ -71,7 +71,7 @@ pub mod sas;
 mod signature;
 mod software_keystore;
 
-pub use bind_cert::{BindCert, BindCertBuilder};
+pub use bind_cert::{BindCert, BindCertBuilder, DtlsCommitment, DtlsPin};
 pub use channel_crypto::{
     ChannelFrameHeader, Direction, SessionKeys, CHANNEL_HEADER_LEN, CHANNEL_MAGIC,
 };

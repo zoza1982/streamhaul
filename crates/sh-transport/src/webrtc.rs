@@ -430,6 +430,33 @@ impl WebRtcTransport {
             .set_remote_fingerprint(fingerprint);
     }
 
+    /// The remote peer's DTLS fingerprint **as derived from its certificate after the DTLS
+    /// handshake verifies that certificate** — *not* the value pinned via
+    /// [`set_remote_dtls_fingerprint`](Self::set_remote_dtls_fingerprint).
+    ///
+    /// These are two distinct str0m fields: `set_remote_dtls_fingerprint` writes the *expected*
+    /// fingerprint (the pin), while this getter reads the fingerprint str0m computed from the
+    /// *presented peer certificate*, which is populated only once DTLS completes and the cert is
+    /// verified. Returns `None` until then. Because str0m fail-closes any mismatch against the
+    /// pin, once this returns `Some` its value necessarily equals the pin — which makes it useful
+    /// for a post-handshake assertion that the peer cert matched the `BindCert`-committed
+    /// fingerprint. [`Fingerprint`]'s `PartialEq` compares `hash_func` with ordinary string
+    /// equality and only the `bytes` with a constant-time compare; in this codebase `hash_func`
+    /// is always `"sha-256"`, so the `bytes` compare is what runs.
+    ///
+    /// # Security
+    ///
+    /// The returned value is security-sensitive pairing material; do not log it at `info` or
+    /// higher (use `tracing::trace!` if you must).
+    #[must_use]
+    pub fn remote_dtls_fingerprint(&self) -> Option<Fingerprint> {
+        self.lock()
+            .rtc
+            .direct_api()
+            .remote_dtls_fingerprint()
+            .cloned()
+    }
+
     /// The last-known RTT for this connection.
     ///
     /// **For data-only connections this always returns [`Duration::ZERO`].** str0m 0.20 derives

@@ -24,7 +24,8 @@
 //!   14      32    DEVICE_ID (SHA-256 digest of Ed25519 pubkey, raw 32 bytes)
 //!   46      32    NOISE_STATIC_X25519 (X25519 static public key, 32 bytes)
 //!   78       1    DTLS_FPR_ALG (0x01=SHA-256, 0x00=none)
-//!   79      32    DTLS_FPR_COMMIT (32 bytes, zeros if ALG=0x00)
+//!   79      32    DTLS_FPR_COMMIT (32 bytes = SHA-256 of the whole DTLS cert, RFC 8122,
+//!                 as computed/enforced by str0m; zeros if ALG=0x00. See ADR-0014.)
 //!  111       2    PLATFORM_ATTEST_LEN (u16 BE, 0..=4096)
 //!  113       L    PLATFORM_ATTEST (opaque, NOT verified in P3-2)
 //!  113+L     8    NOT_AFTER (i64 BE, Unix epoch)
@@ -82,6 +83,90 @@ const OFF_PLATFORM_ATTEST_DATA: usize = 113;
 pub const DTLS_FPR_ALG_NONE: u8 = 0x00;
 /// DTLS fingerprint algorithm: SHA-256.
 pub const DTLS_FPR_ALG_SHA256: u8 = 0x01;
+
+/// A DTLS fingerprint commitment supplied by the local device when it builds its own
+/// [`BindCert`] for a WebRTC session (P4-5).
+///
+/// `commit` is the 32-byte SHA-256 fingerprint of the **whole DTLS certificate** (RFC 8122),
+/// exactly as computed and enforced by `str0m` (the value returned by
+/// `WebRtcTransport::local_dtls_fingerprint().bytes`). This deviates from the literal wording
+/// of ADR-0007 §2.1 ("SHA-256 of the DTLS SPKI") — see ADR-0014: `str0m` does not expose the
+/// SPKI separately, and the whole-certificate digest is what it fail-closes against, so that is
+/// the value we must commit to. The transport layer never depends on `sh-crypto`; this struct
+/// is constructed from a plain 32-byte array.
+///
+/// QUIC sessions (no DTLS) pass `None` to the handshake constructors instead of a
+/// `DtlsCommitment`, which produces `DTLS_FPR_ALG = 0x00` and an all-zero commit as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtlsCommitment {
+    /// The DTLS fingerprint algorithm byte. Currently always [`DTLS_FPR_ALG_SHA256`].
+    alg: u8,
+    /// The 32-byte whole-certificate SHA-256 fingerprint (RFC 8122), as computed by `str0m`.
+    commit: [u8; 32],
+}
+
+impl DtlsCommitment {
+    /// Creates a SHA-256 DTLS commitment from a 32-byte whole-certificate fingerprint.
+    ///
+    /// `commit` is `WebRtcTransport::local_dtls_fingerprint().bytes` (a 32-byte SHA-256). The
+    /// caller is responsible for ensuring it is the live local DTLS fingerprint.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sh_crypto::bind_cert::DtlsCommitment;
+    /// let c = DtlsCommitment::sha256([7u8; 32]);
+    /// assert_eq!(c.alg(), sh_crypto::bind_cert::DTLS_FPR_ALG_SHA256);
+    /// assert_eq!(c.commit(), &[7u8; 32]);
+    /// ```
+    #[must_use]
+    pub fn sha256(commit: [u8; 32]) -> Self {
+        Self {
+            alg: DTLS_FPR_ALG_SHA256,
+            commit,
+        }
+    }
+
+    /// Returns the algorithm byte.
+    #[must_use]
+    pub fn alg(&self) -> u8 {
+        self.alg
+    }
+
+    /// Returns the 32-byte commitment.
+    #[must_use]
+    pub fn commit(&self) -> &[u8; 32] {
+        &self.commit
+    }
+}
+
+/// The peer's DTLS pin extracted from a verified, identity-signed [`BindCert`] (P4-5 verify side).
+///
+/// Returned by [`BindCert::dtls_pin`]. For a WebRTC peer, `alg` is [`DTLS_FPR_ALG_SHA256`] and
+/// `commit` is the 32-byte whole-certificate fingerprint to pin via
+/// `WebRtcTransport::set_remote_dtls_fingerprint`. For a QUIC peer (no DTLS) the BindCert carries
+/// no pin and `dtls_pin()` returns `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtlsPin {
+    /// The DTLS fingerprint algorithm byte ([`DTLS_FPR_ALG_SHA256`] for WebRTC peers).
+    alg: u8,
+    /// The 32-byte whole-certificate SHA-256 fingerprint committed under the identity signature.
+    commit: [u8; 32],
+}
+
+impl DtlsPin {
+    /// Returns the algorithm byte.
+    #[must_use]
+    pub fn alg(&self) -> u8 {
+        self.alg
+    }
+
+    /// Returns the 32-byte committed fingerprint.
+    #[must_use]
+    pub fn commit(&self) -> &[u8; 32] {
+        &self.commit
+    }
+}
 
 /// A clock skew tolerance (5 minutes) applied to `ISSUED_AT` validation.
 ///
@@ -555,6 +640,86 @@ impl BindCert {
         &self.fields.dtls_fpr_commit
     }
 
+    /// Returns the peer's DTLS pin if this BindCert commits one, else `None` (P4-5 verify side).
+    ///
+    /// Returns `Some(DtlsPin)` when `DTLS_FPR_ALG == 0x01` (SHA-256). Returns `None` when
+    /// `DTLS_FPR_ALG == 0x00` (native QUIC, no DTLS) — there is nothing to pin. The owning
+    /// semantics of the field stay here in `BindCert`; the Noise layer simply forwards this.
+    ///
+    /// This does **not** itself enforce the WebRTC anti-downgrade rule (rejecting ALG=NONE for a
+    /// WebRTC session), and the returned [`DtlsPin`] is *not* guaranteed to carry a non-zero
+    /// commitment: the canonical encoding forbids a non-zero commit under `ALG=NONE`, but it does
+    /// not (yet) forbid an all-zero commit under `ALG=SHA256`, so a malformed peer could yield a
+    /// `Some(DtlsPin)` whose commit is all zeros. **Any caller on a path that must be WebRTC MUST
+    /// use [`require_webrtc_dtls_pin`](Self::require_webrtc_dtls_pin) instead** — it rejects both
+    /// ALG=NONE and a zero commit with a typed [`CryptoError::DtlsBindingMissing`]. This accessor
+    /// is for inspection/diagnostics only.
+    // TODO(P4-6): tighten the canonical invariant to `ALG=SHA256 ⟹ non-zero commit` at decode and
+    // build (symmetric to the existing ALG=NONE ⟹ zero-commit rule), then this method's Some-branch
+    // can never carry a zero commit. Tracked under R-DTLS-EXPORTER-BIND / the P4-6 orchestration glue.
+    #[must_use]
+    pub fn dtls_pin(&self) -> Option<DtlsPin> {
+        if self.fields.dtls_fpr_alg == DTLS_FPR_ALG_SHA256 {
+            Some(DtlsPin {
+                alg: self.fields.dtls_fpr_alg,
+                commit: self.fields.dtls_fpr_commit,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns the 32-byte committed DTLS fingerprint, enforcing the WebRTC anti-downgrade rule.
+    ///
+    /// For a WebRTC session the peer's BindCert MUST carry `DTLS_FPR_ALG == 0x01` (SHA-256) with a
+    /// non-zero commitment. A signaling/SDP MITM cannot forge the Ed25519-signed commitment, so the
+    /// only available attack is to **strip** the binding down to `ALG = NONE`; this method rejects
+    /// that (ADR-0014, §3). Call this on the WebRTC pin path *before* the DTLS handshake starts,
+    /// then feed the returned bytes to `WebRtcTransport::set_remote_dtls_fingerprint`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CryptoError::DtlsBindingMissing`] if the BindCert carries `ALG = NONE` (no DTLS
+    /// commitment — a downgrade for a WebRTC peer) or if the SHA-256 commitment is all-zero.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use sh_crypto::{SoftwareKeystore, Keystore, CryptoError};
+    /// # use sh_crypto::bind_cert::{BindCert, BindCertBuilder, DtlsCommitment};
+    /// # use sh_crypto::clock::FixedClock;
+    /// # tokio_test::block_on(async {
+    /// let ks = SoftwareKeystore::generate();
+    /// let clock = FixedClock(1_000_000);
+    /// // A QUIC BindCert (no DTLS commitment) must be rejected on a WebRTC path.
+    /// let quic_cert = BindCertBuilder::new(&ks)
+    ///     .noise_static([1u8; 32]).valid_for_secs(3600).build(&clock).await.unwrap();
+    /// assert!(matches!(
+    ///     quic_cert.require_webrtc_dtls_pin(),
+    ///     Err(CryptoError::DtlsBindingMissing),
+    /// ));
+    /// // A WebRTC BindCert returns the committed fingerprint.
+    /// let web_cert = BindCertBuilder::new(&ks)
+    ///     .noise_static([1u8; 32]).valid_for_secs(3600)
+    ///     .dtls_commitment(DtlsCommitment::sha256([9u8; 32]))
+    ///     .build(&clock).await.unwrap();
+    /// assert_eq!(web_cert.require_webrtc_dtls_pin().unwrap(), [9u8; 32]);
+    /// # });
+    /// ```
+    #[must_use = "the returned pin is the anti-downgrade gate; dropping it skips the DTLS binding check"]
+    pub fn require_webrtc_dtls_pin(&self) -> Result<[u8; 32], CryptoError> {
+        if self.fields.dtls_fpr_alg != DTLS_FPR_ALG_SHA256 {
+            // ALG = NONE on a WebRTC path is a stripped/downgraded binding.
+            return Err(CryptoError::DtlsBindingMissing);
+        }
+        // A SHA-256 ALG with an all-zero commit is not a usable pin (and `decode`/`build` already
+        // reject ALG=NONE with non-zero commit; this is the symmetric guard for the SHA-256 case).
+        if self.fields.dtls_fpr_commit == [0u8; 32] {
+            return Err(CryptoError::DtlsBindingMissing);
+        }
+        Ok(self.fields.dtls_fpr_commit)
+    }
+
     /// Returns the opaque platform attestation blob (NOT verified in P3-2).
     ///
     /// See ADR-0007 §2.4 for the deferred schema.
@@ -630,16 +795,31 @@ impl<'a, K: Keystore> BindCertBuilder<'a, K> {
         self
     }
 
-    /// Sets a DTLS fingerprint commitment (for WebRTC / P4-5).
+    /// Sets a DTLS fingerprint commitment by raw `alg`/`commit` (low-level; prefer
+    /// [`dtls_commitment`](Self::dtls_commitment) for WebRTC / P4-5).
     ///
-    /// `alg` must be [`DTLS_FPR_ALG_SHA256`] (`0x01`) and `commit` the SHA-256 of the DTLS SPKI.
-    /// [`build`](Self::build) returns [`CryptoError::MalformedBindCert`] if `alg` is unknown
-    /// (i.e. not `DTLS_FPR_ALG_NONE` or `DTLS_FPR_ALG_SHA256`) or if ALG=`0x00` but commit is
-    /// non-zero.
+    /// `alg` must be [`DTLS_FPR_ALG_SHA256`] (`0x01`) and `commit` the SHA-256 of the **whole
+    /// DTLS certificate** (RFC 8122, as computed and enforced by `str0m`; see ADR-0014 for why
+    /// this is the whole cert, not the SPKI). [`build`](Self::build) returns
+    /// [`CryptoError::MalformedBindCert`] if `alg` is unknown (i.e. not `DTLS_FPR_ALG_NONE` or
+    /// `DTLS_FPR_ALG_SHA256`) or if ALG=`0x00` but commit is non-zero.
     #[must_use]
     pub fn dtls_fpr(mut self, alg: u8, commit: [u8; 32]) -> Self {
         self.dtls_fpr_alg = alg;
         self.dtls_fpr_commit = commit;
+        self
+    }
+
+    /// Sets the DTLS fingerprint commitment from a typed [`DtlsCommitment`] (preferred, P4-5).
+    ///
+    /// This is the typed entry point used by the WebRTC handshake path: it commits the local
+    /// whole-certificate DTLS fingerprint so the verifying peer can pin it before its DTLS
+    /// handshake (defeating a signaling/SDP fingerprint swap). QUIC callers do not call this
+    /// (the BindCert then carries `DTLS_FPR_ALG = 0x00`).
+    #[must_use]
+    pub fn dtls_commitment(mut self, commitment: DtlsCommitment) -> Self {
+        self.dtls_fpr_alg = commitment.alg;
+        self.dtls_fpr_commit = commitment.commit;
         self
     }
 
@@ -1100,6 +1280,70 @@ mod tests {
         );
     }
 
+    /// Golden conformance vector for the TBS byte layout with `DTLS_FPR_ALG = SHA256` (P4-5).
+    ///
+    /// The ALG=NONE golden vector above does not exercise the DTLS commitment fields (ALG@78,
+    /// COMMIT@79..111), so a byte-order or offset regression in `build_tbs` for the WebRTC path
+    /// could slip past it. This vector pins the exact wire bytes for a known device-id digest and a
+    /// known 32-byte commit (`0x5A` repeated), giving an external-implementer-equivalent check on
+    /// the §5 protocol-encoding requirement for the SHA256 case.
+    #[test]
+    fn golden_tbs_conformance_vector_sha256_commit() {
+        // Fixed, known inputs for deterministic output.
+        let device_id_digest = [0x01u8; 32]; // DEVICE_ID
+        let noise_static = [0x02u8; 32]; // NOISE_STATIC_X25519
+        let dtls_fpr_alg = DTLS_FPR_ALG_SHA256; // 0x01
+        let dtls_fpr_commit = [0x5Au8; 32]; // known whole-cert SHA-256 commit
+        let platform_attest: &[u8] = &[]; // empty
+        let not_after: i64 = 0x0000_0000_3B9A_CA00_i64; // 1_000_000_000
+        let issued_at: i64 = 0x0000_0000_3B9A_C9FC_i64; // 999_999_996
+
+        let tbs = build_tbs(
+            &device_id_digest,
+            &noise_static,
+            dtls_fpr_alg,
+            &dtls_fpr_commit,
+            platform_attest,
+            not_after,
+            issued_at,
+        );
+
+        // Length is identical to the ALG=NONE case: the DTLS fields are fixed-width.
+        assert_eq!(tbs.len(), TBS_MIN_LEN, "TBS must be exactly 129 bytes");
+
+        // Fixed prefix is unchanged from the ALG=NONE vector.
+        assert_eq!(&tbs[0..12], b"SHP-BINDCERT", "domain tag mismatch");
+        assert_eq!(tbs[12], 0x01, "TBS_VERSION must be 0x01");
+        assert_eq!(tbs[13], 0x06, "FIELD_COUNT must be 0x06");
+        assert_eq!(&tbs[14..46], &[0x01u8; 32], "DEVICE_ID mismatch");
+        assert_eq!(&tbs[46..78], &[0x02u8; 32], "NOISE_STATIC_X25519 mismatch");
+
+        // The P4-5-specific fields: ALG@78 and COMMIT@79..111 carry the SHA256 commitment.
+        assert_eq!(tbs[78], 0x01, "DTLS_FPR_ALG must be 0x01 (SHA-256)");
+        assert_eq!(
+            &tbs[79..111],
+            &[0x5Au8; 32],
+            "DTLS_FPR_COMMIT must be the committed 32-byte fingerprint at offset 79..111"
+        );
+
+        // Trailer fields keep their offsets (unshifted by the non-zero commit).
+        assert_eq!(
+            &tbs[111..113],
+            &[0x00, 0x00],
+            "PLATFORM_ATTEST_LEN must be 0"
+        );
+        assert_eq!(
+            &tbs[113..121],
+            &not_after.to_be_bytes(),
+            "NOT_AFTER bytes mismatch"
+        );
+        assert_eq!(
+            &tbs[121..129],
+            &issued_at.to_be_bytes(),
+            "ISSUED_AT bytes mismatch"
+        );
+    }
+
     /// ADR-0007 §2.1: an unknown DTLS_FPR_ALG byte must be rejected by `decode()`.
     #[tokio::test]
     async fn unknown_dtls_fpr_alg_rejected_by_decode() {
@@ -1260,10 +1504,171 @@ mod tests {
         );
     }
 
+    // ─── P4-5: DTLS fingerprint commitment + downgrade defense ───────────────
+
+    const DTLS_COMMIT: [u8; 32] = [0x5Au8; 32];
+
+    /// Build a WebRTC BindCert (SHA-256 DTLS commit) → decode + verify round-trips, and the
+    /// committed fingerprint survives the encode/decode.
+    #[tokio::test]
+    async fn dtls_commitment_roundtrip_and_verify() {
+        let ks = SoftwareKeystore::generate();
+        let id = ks.device_identity().await.unwrap();
+        let ns = [0x9Au8; 32];
+        let clock = FixedClock(NOW);
+        let cert = BindCertBuilder::new(&ks)
+            .noise_static(ns)
+            .valid_for_secs(VALID_FOR)
+            .dtls_commitment(DtlsCommitment::sha256(DTLS_COMMIT))
+            .build(&clock)
+            .await
+            .unwrap();
+        assert_eq!(cert.dtls_fpr_alg(), DTLS_FPR_ALG_SHA256);
+        assert_eq!(cert.dtls_fpr_commit(), &DTLS_COMMIT);
+
+        let wire = cert.encode();
+        let decoded = BindCert::decode(&wire).unwrap();
+        assert_eq!(decoded.dtls_fpr_alg(), DTLS_FPR_ALG_SHA256);
+        assert_eq!(decoded.dtls_fpr_commit(), &DTLS_COMMIT);
+        // Full signature + binding verification still passes.
+        decoded.verify(&id, &ns, &clock).unwrap();
+        // The committed pin is the one we set.
+        assert_eq!(decoded.require_webrtc_dtls_pin().unwrap(), DTLS_COMMIT);
+    }
+
+    /// Tampering a single byte of DTLS_FPR_COMMIT must break the signature (the commit is signed).
+    #[tokio::test]
+    async fn tampered_dtls_commit_byte_breaks_signature() {
+        let ks = SoftwareKeystore::generate();
+        let id = ks.device_identity().await.unwrap();
+        let ns = [0x9Bu8; 32];
+        let clock = FixedClock(NOW);
+        let cert = BindCertBuilder::new(&ks)
+            .noise_static(ns)
+            .valid_for_secs(VALID_FOR)
+            .dtls_commitment(DtlsCommitment::sha256(DTLS_COMMIT))
+            .build(&clock)
+            .await
+            .unwrap();
+        let mut wire = cert.encode();
+        // DTLS_FPR_COMMIT begins at TBS offset 79; +4 for the lp32 prefix.
+        let commit_byte = 4 + OFF_DTLS_FPR_COMMIT;
+        wire[commit_byte] ^= 0xff;
+        // decode() still accepts it structurally (SHA-256 ALG with non-zero commit is valid)…
+        let decoded = BindCert::decode(&wire).unwrap();
+        // …but the signature no longer covers these bytes → verify fails.
+        assert!(
+            matches!(
+                decoded.verify(&id, &ns, &clock),
+                Err(CryptoError::Signature)
+            ),
+            "tampered DTLS_FPR_COMMIT must fail signature verification"
+        );
+    }
+
+    /// `require_webrtc_dtls_pin` returns the commit for a SHA-256 BindCert.
+    #[tokio::test]
+    async fn require_webrtc_pin_ok_for_sha256() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let cert = BindCertBuilder::new(&ks)
+            .noise_static([1u8; 32])
+            .valid_for_secs(VALID_FOR)
+            .dtls_commitment(DtlsCommitment::sha256(DTLS_COMMIT))
+            .build(&clock)
+            .await
+            .unwrap();
+        assert_eq!(cert.require_webrtc_dtls_pin().unwrap(), DTLS_COMMIT);
+        assert_eq!(cert.dtls_pin().unwrap().commit(), &DTLS_COMMIT);
+    }
+
+    /// `require_webrtc_dtls_pin` rejects a QUIC (ALG=NONE) BindCert — the downgrade defense.
+    #[tokio::test]
+    async fn require_webrtc_pin_rejects_alg_none() {
+        let ks = SoftwareKeystore::generate();
+        let clock = FixedClock(NOW);
+        let cert = BindCertBuilder::new(&ks)
+            .noise_static([1u8; 32])
+            .valid_for_secs(VALID_FOR)
+            .build(&clock)
+            .await
+            .unwrap();
+        assert_eq!(cert.dtls_fpr_alg(), DTLS_FPR_ALG_NONE);
+        assert!(cert.dtls_pin().is_none());
+        assert!(
+            matches!(
+                cert.require_webrtc_dtls_pin(),
+                Err(CryptoError::DtlsBindingMissing)
+            ),
+            "ALG=NONE must be rejected on a WebRTC path (downgrade)"
+        );
+    }
+
+    /// `require_webrtc_dtls_pin` rejects a SHA-256 ALG with an all-zero commit.
+    ///
+    /// We construct this directly (the builder's canonical-encoding checks allow ALG=SHA256 with
+    /// a zero commit — only ALG=NONE forces a zero commit), to prove the symmetric guard.
+    #[tokio::test]
+    async fn require_webrtc_pin_rejects_sha256_zero_commit() {
+        let ks = SoftwareKeystore::generate();
+        let id = ks.device_identity().await.unwrap();
+        let mut device_id_digest = [0u8; 32];
+        device_id_digest.copy_from_slice(Sha256::digest(id.public_key_bytes()).as_slice());
+        let ns = [0u8; 32];
+        let tbs = build_tbs(
+            &device_id_digest,
+            &ns,
+            DTLS_FPR_ALG_SHA256,
+            &[0u8; 32], // zero commit, but ALG=SHA256
+            &[],
+            NOW + VALID_FOR,
+            NOW,
+        );
+        let sig = ks.sign(&tbs).await.unwrap();
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&(tbs.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&tbs);
+        wire.extend_from_slice(&sig.encode());
+        let decoded = BindCert::decode(&wire).unwrap();
+        // It is structurally valid and even signature-valid…
+        decoded.verify(&id, &ns, &FixedClock(NOW)).unwrap();
+        // …but an all-zero commit is not a usable pin.
+        assert!(
+            matches!(
+                decoded.require_webrtc_dtls_pin(),
+                Err(CryptoError::DtlsBindingMissing)
+            ),
+            "SHA-256 ALG with all-zero commit must be rejected"
+        );
+    }
+
     proptest! {
         #[test]
         fn arbitrary_bytes_decode_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
             let _ = BindCert::decode(&data);
+        }
+
+        /// Encode/decode round-trip preserves a populated SHA-256 DTLS commitment (fuzz-path
+        /// validity for the non-zero commit case, complementing the ALG=NONE prop test below).
+        #[test]
+        fn dtls_commit_roundtrip_prop(seed in any::<u64>(), commit in any::<[u8; 32]>()) {
+            use rand_core::SeedableRng;
+            let rng = rand_chacha::ChaCha8Rng::seed_from_u64(seed);
+            let ks = SoftwareKeystore::generate_with_rng(rng);
+            let id = tokio_test::block_on(ks.device_identity()).unwrap();
+            let clock = FixedClock(NOW);
+            let cert = tokio_test::block_on(
+                BindCertBuilder::new(&ks)
+                    .noise_static([0x33u8; 32])
+                    .valid_for_secs(VALID_FOR)
+                    .dtls_commitment(DtlsCommitment::sha256(commit))
+                    .build(&clock),
+            )
+            .unwrap();
+            let wire = cert.encode();
+            let decoded = BindCert::decode(&wire).unwrap();
+            prop_assert_eq!(decoded.dtls_fpr_commit(), &commit);
+            prop_assert!(decoded.verify(&id, &[0x33u8; 32], &clock).is_ok());
         }
 
         #[test]

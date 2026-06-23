@@ -84,3 +84,8 @@ the fuzzer's hot path.
 - **P3-3** ✅: TOFU pairing UI, SAS, PAKE (SPAKE2/OPAQUE).
 - **P3-4** ✅ (current): Channel encryption + key hierarchy + PFS rotation.
 - **P3-5**: Authorization capability mask + kill-switch.
+- **P4-5** ✅: WebRTC DTLS fingerprint binding. The `BindCert` commits the local whole-cert DTLS
+  fingerprint (`DtlsCommitment::sha256`, via `NoiseHandshake::*_with_dtls`); the verifier reads the
+  peer's pin from the handshake (`HandshakeOutcome::peer_dtls_pin` /
+  `require_webrtc_dtls_pin`) and rejects an `ALG=NONE` downgrade for WebRTC peers
+  (`CryptoError::DtlsBindingMissing`). See ADR-0014.

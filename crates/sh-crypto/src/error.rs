@@ -61,6 +61,16 @@ pub enum CryptoError {
     #[error("Noise static key does not match BindCert commitment")]
     NoiseStaticMismatch,
 
+    /// A WebRTC peer's `BindCert` carries no usable DTLS fingerprint commitment (P4-5).
+    ///
+    /// For a WebRTC session the peer's identity-signed `BindCert` MUST commit a SHA-256 DTLS
+    /// fingerprint (`DTLS_FPR_ALG = 0x01`, non-zero commit). A signaling/SDP MITM cannot forge
+    /// the signed commitment, so the only available attack is to **strip** the binding down to
+    /// `DTLS_FPR_ALG = 0x00`. This variant rejects that downgrade (ADR-0014 §3): a WebRTC session
+    /// must abort rather than fall back to an unpinned DTLS handshake.
+    #[error("WebRTC BindCert is missing its DTLS fingerprint commitment (downgrade rejected)")]
+    DtlsBindingMissing,
+
     /// The `BindCert`'s `NOT_AFTER` timestamp has passed.
     #[error("BindCert has expired")]
     BindCertExpired,
