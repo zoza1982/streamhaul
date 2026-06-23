@@ -20,6 +20,9 @@ x25519-dalek = { version = "2.0", default-features = false, features = ["static_
 [dependencies.sh-crypto]
 path = ".."
 
+[dependencies.sh-types]
+path = "../../sh-types"
+
 [[bin]]
 name = "sig_decode"
 path = "fuzz_targets/sig_decode.rs"
@@ -58,6 +61,13 @@ bench = false
 [[bin]]
 name = "pairing_code_parse"
 path = "fuzz_targets/pairing_code_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "channel_frame_open"
+path = "fuzz_targets/channel_frame_open.rs"
 test = false
 doc = false
 bench = false

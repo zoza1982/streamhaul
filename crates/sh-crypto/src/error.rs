@@ -136,4 +136,37 @@ pub enum CryptoError {
     /// available return channel.
     #[error("peer was previously revoked; explicit operator re-trust confirmation required")]
     ReTrustAfterRevoke,
+
+    // ── P3-4: channel crypto ────────────────────────────────────────────────
+    /// AEAD seal or open failed (authentication tag did not verify, or encryption failed).
+    ///
+    /// This covers both encryption and decryption AEAD failures. No key material in the message.
+    #[error("AEAD operation failed")]
+    AeadFailure,
+
+    /// A received frame's sequence number has already been seen (replay attack or duplicate).
+    #[error("replayed frame: seq already accepted")]
+    ReplayedFrame,
+
+    /// The received frame's epoch is more than 1 ahead of the current epoch.
+    ///
+    /// A well-behaved peer advances at most one epoch at a time. Drop the frame and log at warn
+    /// level; no teardown is required. A single occurrence may indicate packet reordering during a
+    /// rekey; repeated occurrences from the same peer are a sign of a misbehaving or malicious
+    /// peer and should be rate-limited.
+    #[error("epoch too far ahead")]
+    EpochTooFarAhead,
+
+    /// The sequence or generation counter would exceed its hard limit.
+    ///
+    /// This prevents nonce reuse. The caller must trigger a rekey before sealing more frames.
+    #[error("nonce counter exhausted: rekey required")]
+    NonceExhausted,
+
+    /// A channel frame header is structurally invalid.
+    #[error("malformed channel frame: {reason}")]
+    MalformedChannelFrame {
+        /// Description of the parse failure. No secret bytes.
+        reason: &'static str,
+    },
 }

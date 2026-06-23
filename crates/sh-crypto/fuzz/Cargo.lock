@@ -481,6 +481,7 @@ name = "sh-crypto"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "chacha20poly1305",
  "ed25519-dalek",
  "hkdf",
  "rand_core",
@@ -502,6 +503,7 @@ dependencies = [
  "libfuzzer-sys",
  "rand_core",
  "sh-crypto",
+ "sh-types",
  "tokio",
  "x25519-dalek",
 ]

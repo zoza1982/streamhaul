@@ -74,6 +74,11 @@ x25519-dalek = { version = "=2.0.1", default-features = false, features = ["stat
 # Exact-pinned per CLAUDE.md §7 (crypto deps). hkdf vendors its own hmac dependency.
 hkdf = { version = "=0.12.4", default-features = false }
 
+# chacha20poly1305 0.10.1: IETF ChaCha20-Poly1305 AEAD for per-channel frame encryption (P3-4).
+# Already present transitively via snow 0.9.6; pinned directly for explicit dep tracking.
+# Same aead v0.5.2 major version — no duplicate; confirmed by cargo tree.
+chacha20poly1305 = { version = "=0.10.1", default-features = false, features = ["alloc"] }
+
 # subtle 2.6.1: constant-time comparison for Noise static binding check.
 # Exact-pinned per CLAUDE.md §7 (crypto deps).
 subtle = { version = "=2.6.1", default-features = false }

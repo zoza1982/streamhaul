@@ -41,7 +41,7 @@
 use hkdf::Hkdf;
 use sha2::Sha256;
 use snow::Builder;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     bind_cert::{BindCert, BindCertBuilder, BIND_CERT_VALIDITY_SECS},
@@ -229,6 +229,19 @@ impl NoiseSession {
             .map_err(|_| CryptoError::HandshakeFailed {
                 reason: "AEAD decryption or authentication failed",
             })
+    }
+
+    /// Zeroizes the HKDF PRK in place.
+    ///
+    /// After this call, [`export_keying_material`](Self::export_keying_material) will fail.
+    /// Used by [`SessionKeys::zeroize_all`](crate::channel_crypto::SessionKeys::zeroize_all)
+    /// to ensure the root key-derivation material is erased as part of the kill-switch.
+    ///
+    /// # Panics
+    ///
+    /// Never panics.
+    pub fn zeroize_prk(&mut self) {
+        self.prk.zeroize();
     }
 
     /// Derives keying material from the session for use by P3-4 (channel subkeys).
