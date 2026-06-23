@@ -1069,6 +1069,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "x25519-dalek",
 ]
 
 [[package]]

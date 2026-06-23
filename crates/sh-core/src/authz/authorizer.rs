@@ -779,4 +779,103 @@ mod tests {
         // Must mention the action and caps (public info), not any key bytes
         assert!(msg.contains("InjectKey") || msg.contains("CONTROL") || msg.contains("denied"));
     }
+
+    /// Integration test: kill-switch zeroizes keys → real SessionKeys::seal/open then fails AEAD.
+    ///
+    /// This tests the P3-4/P3-5 integration seam: `SessionAuthorizer::kill` calls
+    /// `SessionKeys::zeroize_all()`, which wipes the AEAD keys and PRK, causing subsequent
+    /// seal/open operations to fail (ADR-0010 §4, ADR-0009).
+    #[tokio::test]
+    async fn kill_switch_then_aead_fails() {
+        use rand_core::SeedableRng;
+        use sh_crypto::{
+            channel_crypto::SessionKeys, clock::FixedClock, noise::NoiseHandshake, Keystore,
+            SoftwareKeystore,
+        };
+        use sh_types::ChannelId;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        // Build two keystores and run an XK handshake to get real SessionKeys.
+        let init_ks =
+            SoftwareKeystore::generate_with_rng(rand_chacha::ChaCha8Rng::seed_from_u64(1000));
+        let resp_ks =
+            SoftwareKeystore::generate_with_rng(rand_chacha::ChaCha8Rng::seed_from_u64(2000));
+
+        let init_id = init_ks.device_identity().await.unwrap();
+        let resp_id = resp_ks.device_identity().await.unwrap();
+
+        init_ks.trust_peer(&resp_id).await.unwrap();
+        resp_ks.trust_peer(&init_id).await.unwrap();
+
+        // Generate X25519 static key pairs using seeded RNG for determinism.
+        let init_static_secret =
+            StaticSecret::random_from_rng(rand_chacha::ChaCha8Rng::seed_from_u64(3000));
+        let _init_static_pub = PublicKey::from(&init_static_secret);
+        let resp_static_secret =
+            StaticSecret::random_from_rng(rand_chacha::ChaCha8Rng::seed_from_u64(4000));
+        let resp_static_pub = PublicKey::from(&resp_static_secret);
+
+        let now = 1_700_000_000_i64;
+        let clock = FixedClock(now);
+
+        let mut init = NoiseHandshake::initiator_xk(
+            &init_ks,
+            init_static_secret,
+            resp_static_pub.to_bytes(),
+            &[],
+            &clock,
+        )
+        .await
+        .unwrap();
+        let mut resp = NoiseHandshake::responder_xk(&resp_ks, resp_static_secret, &[], &clock)
+            .await
+            .unwrap();
+
+        let msg0 = init.write_message().unwrap();
+        resp.read_message(&msg0, &clock).unwrap();
+        let msg1 = resp.write_message().unwrap();
+        init.read_message(&msg1, &clock).unwrap();
+        let msg2 = init.write_message().unwrap();
+        resp.read_message(&msg2, &clock).unwrap();
+
+        let init_outcome = init.complete(&init_ks).await.unwrap();
+        let resp_outcome = resp.complete(&resp_ks).await.unwrap();
+
+        let mut init_keys =
+            SessionKeys::from_outcome(init_outcome, Box::new(FixedClock(now))).unwrap();
+        let mut resp_keys =
+            SessionKeys::from_outcome(resp_outcome, Box::new(FixedClock(now))).unwrap();
+
+        // Sanity: seal/open works before kill.
+        let plaintext = b"hello before kill";
+        let frame = init_keys.seal(ChannelId::Video, plaintext).unwrap();
+        let decrypted = resp_keys.open(ChannelId::Video, &frame).unwrap();
+        assert_eq!(decrypted, plaintext, "seal/open must work before kill");
+
+        // Create a SessionAuthorizer and kill it with the initiator's keys.
+        let store = InMemoryMinEpochStore::new(0);
+        let mut auth = SessionAuthorizer::seal(
+            Capabilities::all(),
+            Capabilities::all(),
+            Capabilities::all(),
+            Capabilities::all(),
+            store,
+        );
+        auth.kill(&mut init_keys);
+
+        // After kill: authorize returns Denied::Killed.
+        assert!(
+            matches!(
+                auth.authorize(&PrivilegedAction::ViewFrame),
+                Err(Denied::Killed)
+            ),
+            "authorize must return Killed after kill"
+        );
+
+        // After kill: seal fails because the AEAD keys are zeroized.
+        assert!(
+            init_keys.seal(ChannelId::Video, plaintext).is_err(),
+            "seal must fail after kill (keys zeroized)"
+        );
+    }
 }
