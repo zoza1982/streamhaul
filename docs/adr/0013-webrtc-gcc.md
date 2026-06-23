@@ -1,4 +1,4 @@
-# ADR 0012: WebRTC transport path via str0m + GCC congestion control
+# ADR 0013: WebRTC transport path via str0m + GCC congestion control
 
 - **Status:** Accepted
 - **Date:** 2026-06-23
