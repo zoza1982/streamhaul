@@ -294,16 +294,13 @@ impl StunMessage {
         // mi_offset + 24 = byte just past the MI value (4-byte TL + 20-byte HMAC).
         let mi_end = mi_offset.saturating_add(24);
         // Determine the end of the declared message body.
-        let msg_len = u16::from_be_bytes([
-            *raw.get(2).unwrap_or(&0),
-            *raw.get(3).unwrap_or(&0),
-        ]);
+        let msg_len = u16::from_be_bytes([*raw.get(2).unwrap_or(&0), *raw.get(3).unwrap_or(&0)]);
         let body_end = STUN_HEADER_LEN.saturating_add(usize::from(msg_len));
         if mi_end < body_end {
             // There are bytes after MI. The only legal trailer is a single FINGERPRINT attr.
             let trailer = raw.get(mi_end..body_end).unwrap_or(&[]);
-            let is_only_fp = trailer.len() == 8
-                && trailer.get(0..2) == Some(&0x8028u16.to_be_bytes());
+            let is_only_fp =
+                trailer.len() == 8 && trailer.get(0..2) == Some(&0x8028u16.to_be_bytes());
             if !is_only_fp {
                 return Err(IceError::AttrOrderingViolation("MESSAGE-INTEGRITY"));
             }
@@ -332,9 +329,7 @@ impl StunMessage {
             .get(value_start..value_end)
             .ok_or(IceError::IntegrityMismatch)?;
         // Use subtle::ConstantTimeEq to prevent timing side-channel on HMAC comparison.
-        let stored_arr: [u8; 20] = stored
-            .try_into()
-            .map_err(|_| IceError::IntegrityMismatch)?;
+        let stored_arr: [u8; 20] = stored.try_into().map_err(|_| IceError::IntegrityMismatch)?;
         if expected.ct_eq(&stored_arr).into() {
             Ok(())
         } else {
@@ -361,10 +356,7 @@ impl StunMessage {
         // RFC 8489 §15.5: FINGERPRINT must be the last attribute in the message.
         // fp_offset + 8 = byte just past the FINGERPRINT value (4-byte TL + 4-byte CRC).
         let fp_end = fp_offset.saturating_add(8);
-        let msg_len = u16::from_be_bytes([
-            *raw.get(2).unwrap_or(&0),
-            *raw.get(3).unwrap_or(&0),
-        ]);
+        let msg_len = u16::from_be_bytes([*raw.get(2).unwrap_or(&0), *raw.get(3).unwrap_or(&0)]);
         let body_end = STUN_HEADER_LEN.saturating_add(usize::from(msg_len));
         if fp_end != body_end {
             return Err(IceError::AttrOrderingViolation("FINGERPRINT"));
@@ -1032,10 +1024,7 @@ fn find_attr_offset(raw: &[u8], target_type: u16) -> Result<usize, IceError> {
         });
     }
     // Header length field is at bytes 2-3 (already validated len >= 20).
-    let msg_len = u16::from_be_bytes([
-        *raw.get(2).unwrap_or(&0),
-        *raw.get(3).unwrap_or(&0),
-    ]);
+    let msg_len = u16::from_be_bytes([*raw.get(2).unwrap_or(&0), *raw.get(3).unwrap_or(&0)]);
     let total = STUN_HEADER_LEN.saturating_add(usize::from(msg_len));
     let attr_bytes = raw
         .get(STUN_HEADER_LEN..total)
@@ -1067,7 +1056,9 @@ fn find_attr_offset(raw: &[u8], target_type: u16) -> Result<usize, IceError> {
         let padded = (l.saturating_add(3)) & !3;
         pos = pos.saturating_add(4).saturating_add(padded);
     }
-    Err(IceError::AttrNotFound { attr_type: target_type })
+    Err(IceError::AttrNotFound {
+        attr_type: target_type,
+    })
 }
 
 /// Compute HMAC-SHA1 over `data` with `key`.
@@ -1085,7 +1076,6 @@ fn compute_hmac_sha1(key: &[u8], data: &[u8]) -> Result<[u8; 20], IceError> {
     out.copy_from_slice(&result);
     Ok(out)
 }
-
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 

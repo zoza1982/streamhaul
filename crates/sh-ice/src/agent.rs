@@ -650,8 +650,10 @@ fn build_binding_request(
 ) -> Result<Vec<u8>, IceError> {
     let mut msg = StunMessage::new_binding_request(tid);
     // USERNAME = "<remote_ufrag>:<local_ufrag>" per RFC 8445 §7.2.2.
-    msg.attributes
-        .push(StunAttribute::Username(format!("{}:{}", creds.remote_ufrag, creds.local_ufrag)));
+    msg.attributes.push(StunAttribute::Username(format!(
+        "{}:{}",
+        creds.remote_ufrag, creds.local_ufrag
+    )));
     msg.attributes.push(StunAttribute::Priority(local_priority));
     match role {
         IceRole::Controlling => {
