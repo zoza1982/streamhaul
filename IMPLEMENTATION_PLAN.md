@@ -140,7 +140,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | ID | Task | Crates | Depends | Agent | Tests | Status | PR |
 |----|------|--------|---------|-------|-------|:------:|----|
 | P4-1 | `sh-signaling`: client + self-hostable signaling server (WSS, SDP/ICE exchange, trickle) | sh-signaling | P3 | network-engineer | signaling integration | ✅ | #34 |
-| P4-2 | `sh-ice`: ICE/STUN candidate gathering, connectivity checks, P2P-vs-relay nomination | sh-ice | P4-1 | network-engineer | NAT-sim matrix | 🟡 | |
+| P4-2 | `sh-ice`: ICE/STUN candidate gathering, connectivity checks, P2P-vs-relay nomination | sh-ice | P4-1 | network-engineer | NAT-sim matrix | 🟡 | #35 |
 | P4-3 | coturn deploy + short-lived HMAC TURN creds + **latency-probe relay steering** (LLD §4.3) | sh-ice, infra | P4-2 | network-engineer, devops-engineer | relay-fallback test | ☐ | |
 | P4-4 | `sh-transport`: WebRTC backend (`str0m`) + **GCC** congestion control | sh-transport | P4-1 | network-engineer | webrtc loopback | ☐ | |
 | P4-5 | Bind DTLS fingerprint to device identity via signed `BindCert` (kills signaling MITM, LLD §6.2) | sh-crypto, sh-transport | P3-2,P4-4 | security-engineer | fingerprint-swap rejection | ☐ | |
