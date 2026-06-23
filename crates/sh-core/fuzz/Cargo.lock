@@ -573,8 +573,18 @@ version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
- "rand_chacha",
+ "rand_chacha 0.9.0",
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -711,37 +721,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "sh-adaptive"
-version = "0.0.0"
-dependencies = [
- "sh-types",
- "thiserror",
-]
-
-[[package]]
-name = "sh-codec-hw"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "sh-adaptive",
- "sh-media",
- "sh-protocol",
- "sh-types",
- "thiserror",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "sh-core"
 version = "0.0.0"
 dependencies = [
  "bitflags",
  "bytes",
- "quinn",
- "sh-codec-hw",
  "sh-crypto",
- "sh-input",
  "sh-media",
  "sh-protocol",
  "sh-transport",
@@ -758,7 +743,10 @@ version = "0.0.0"
 dependencies = [
  "bytes",
  "libfuzzer-sys",
+ "rand_chacha 0.3.1",
  "sh-core",
+ "sh-crypto",
+ "tokio",
 ]
 
 [[package]]
@@ -779,14 +767,6 @@ dependencies = [
  "tracing",
  "x25519-dalek",
  "zeroize",
-]
-
-[[package]]
-name = "sh-input"
-version = "0.0.0"
-dependencies = [
- "sh-protocol",
- "thiserror",
 ]
 
 [[package]]

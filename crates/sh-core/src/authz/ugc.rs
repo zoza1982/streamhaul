@@ -113,11 +113,17 @@ impl Ugc {
     /// The TBS is constructed canonically per ADR-0010 §2.1 and signed via
     /// `keystore.sign()` (Ed25519, `verify_strict`-compatible).
     ///
+    /// The `GRANTEE_DEVICE_ID` field in the TBS is computed as `SHA-256(grantee.public_key_bytes())`
+    /// internally, matching exactly what [`Ugc::verify`] recomputes. Callers supply the
+    /// [`DeviceIdentity`] directly so it is impossible to pass a raw public key where the
+    /// digest is expected (which would always produce `UgcWrongGrantee` on verify with no
+    /// issuance-time diagnostic).
+    ///
     /// # Arguments
     ///
     /// - `keystore` — the **host** keystore that will sign the UGC.
-    /// - `grantee_device_id` — the 32-byte SHA-256 fingerprint digest of the grantee's
-    ///   Ed25519 public key (from `DeviceIdentity::public_key_bytes()` → SHA-256).
+    /// - `grantee` — the grantee's [`DeviceIdentity`]; the SHA-256 digest of its Ed25519
+    ///   public key bytes is computed here and embedded in the TBS.
     /// - `caps` — the capabilities to grant.
     /// - `epoch` — the revocation epoch for this UGC.
     /// - `not_after` — Unix-epoch-seconds expiry (must be > `issued_at`).
@@ -133,7 +139,7 @@ impl Ugc {
     /// Never panics.
     pub async fn encode<K: Keystore>(
         keystore: &K,
-        grantee_device_id: [u8; 32],
+        grantee: &DeviceIdentity,
         caps: Capabilities,
         epoch: u64,
         not_after: i64,
@@ -145,6 +151,10 @@ impl Ugc {
                 reason: "not_after must be strictly greater than issued_at",
             });
         }
+
+        // Compute the grantee device ID the same way verify() does, so
+        // encode/verify are always consistent and the wrong-bytes mistake is impossible.
+        let grantee_device_id: [u8; 32] = Sha256::digest(grantee.public_key_bytes()).into();
 
         let tbs_bytes = build_tbs(&grantee_device_id, caps.bits(), epoch, not_after, issued_at);
         let signature = keystore.sign(&tbs_bytes).await?;
@@ -430,10 +440,23 @@ impl Ugc {
         }
 
         // Check 4: Expiry — against the injected clock (NO SystemTime::now).
+        //
+        // The same CLOCK_SKEW_TOLERANCE_SECS is applied symmetrically to both edges:
+        //   - not_after: a verifier whose clock runs fast is given CLOCK_SKEW_TOLERANCE_SECS
+        //     of grace before declaring the UGC expired, matching the tolerance on issued_at.
+        //   - issued_at: a verifier whose clock runs slow accepts a UGC issued up to
+        //     CLOCK_SKEW_TOLERANCE_SECS in the "future" (normal pre-issuance skew).
         let now = clock.now_unix_secs();
-        if self.fields.not_after <= now {
+        // not_after check: expired if even the skew-adjusted not_after is in the past.
+        if self
+            .fields
+            .not_after
+            .saturating_add(CLOCK_SKEW_TOLERANCE_SECS)
+            <= now
+        {
             return Err(CryptoError::UgcExpired);
         }
+        // issued_at check: reject UGCs with an issued_at too far in the future.
         let skew_adjusted_now = now.saturating_add(CLOCK_SKEW_TOLERANCE_SECS);
         if self.fields.issued_at > skew_adjusted_now {
             return Err(CryptoError::UgcExpired);
@@ -495,8 +518,11 @@ fn build_tbs(
     tbs
 }
 
-/// Exposed for fuzz and conformance tests.
-#[doc(hidden)]
+/// Exposed for conformance tests only.
+///
+/// Gated `#[cfg(test)]` to prevent downstream production callers from constructing
+/// TBS bytes that bypass the `not_after > issued_at` guard enforced by [`Ugc::encode`].
+#[cfg(test)]
 pub fn build_tbs_for_test(
     grantee_device_id: &[u8; 32],
     caps_raw: u32,
@@ -526,17 +552,12 @@ mod tests {
         SoftwareKeystore::generate_with_rng(rng)
     }
 
-    /// Derives grantee_device_id from a DeviceIdentity (SHA-256 of pubkey bytes).
-    fn grantee_id_from_identity(id: &DeviceIdentity) -> [u8; 32] {
-        Sha256::digest(id.public_key_bytes()).into()
-    }
-
     /// Makes a valid UGC with default parameters.
-    async fn make_valid_ugc(host_ks: &SoftwareKeystore, grantee_id: [u8; 32], now: i64) -> Ugc {
+    async fn make_valid_ugc(host_ks: &SoftwareKeystore, grantee: &DeviceIdentity, now: i64) -> Ugc {
         let clock = FixedClock(now);
         Ugc::encode(
             host_ks,
-            grantee_id,
+            grantee,
             Capabilities::VIEW | Capabilities::CONTROL,
             /*epoch=*/ 1,
             /*not_after=*/ now + 3600,
@@ -552,13 +573,12 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
         let clock = FixedClock(now);
 
         let ugc = Ugc::encode(
             &host_ks,
-            grantee_id,
+            &grantee_id_pub,
             Capabilities::VIEW | Capabilities::CONTROL,
             1,
             now + 3600,
@@ -590,14 +610,13 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
         let clock = FixedClock(now);
 
         // Sign with attacker key, but verify against host
         let ugc = Ugc::encode(
             &attacker_ks,
-            grantee_id,
+            &grantee_id_pub,
             Capabilities::VIEW,
             1,
             now + 3600,
@@ -622,10 +641,9 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
 
-        let ugc = make_valid_ugc(&host_ks, grantee_id, now).await;
+        let ugc = make_valid_ugc(&host_ks, &grantee_id_pub, now).await;
         let mut wire = ugc.wire_bytes();
         // Flip a byte in CAPS field (offset 4 + 45 = 49 in wire)
         wire[4 + OFF_CAPS] ^= 0xFF;
@@ -651,10 +669,9 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
 
-        let ugc = make_valid_ugc(&host_ks, grantee_id, now).await;
+        let ugc = make_valid_ugc(&host_ks, &grantee_id_pub, now).await;
         let mut wire = ugc.wire_bytes();
         // Flip a byte in EPOCH field (offset 4 + 49)
         wire[4 + OFF_EPOCH] ^= 0x01;
@@ -674,10 +691,9 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
 
-        let ugc = make_valid_ugc(&host_ks, grantee_id, now).await;
+        let ugc = make_valid_ugc(&host_ks, &grantee_id_pub, now).await;
         let mut wire = ugc.wire_bytes();
         // Flip a byte in GRANTEE_DEVICE_ID (offset 4 + 13)
         wire[4 + OFF_GRANTEE_DEVICE_ID] ^= 0xFF;
@@ -699,10 +715,9 @@ mod tests {
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
         let wrong_grantee_id_pub = wrong_grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
 
-        let ugc = make_valid_ugc(&host_ks, grantee_id, now).await;
+        let ugc = make_valid_ugc(&host_ks, &grantee_id_pub, now).await;
         let wire = ugc.wire_bytes();
         let decoded = Ugc::decode(&wire).unwrap();
 
@@ -721,25 +736,36 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let issued_at = 1_700_000_000_i64;
         let not_after = issued_at + 3600;
 
-        let ugc = make_valid_ugc(&host_ks, grantee_id, issued_at).await;
+        let ugc = make_valid_ugc(&host_ks, &grantee_id_pub, issued_at).await;
         let wire = ugc.wire_bytes();
         let decoded = Ugc::decode(&wire).unwrap();
 
-        // At the exact not_after second → must be expired (not_after <= now).
-        // Guards the `<=` boundary: switching to `<` would make this case pass.
-        let at_boundary_clock = FixedClock(not_after);
+        // With symmetric skew tolerance, the UGC is considered expired when:
+        //   not_after + CLOCK_SKEW_TOLERANCE_SECS <= now
+        // i.e., at now == not_after + CLOCK_SKEW_TOLERANCE_SECS.
+
+        // One second before the tolerance boundary → still valid (fast-clock grace).
+        let just_before_clock = FixedClock(not_after + CLOCK_SKEW_TOLERANCE_SECS - 1);
+        let result_before = decoded.verify(&host_id, &grantee_id_pub, 0, &just_before_clock);
+        assert!(
+            result_before.is_ok(),
+            "UGC within skew tolerance of not_after must still be valid: {result_before:?}"
+        );
+
+        // At the tolerance boundary (not_after + CLOCK_SKEW_TOLERANCE_SECS) → expired.
+        // Guards the `<=` in `not_after.saturating_add(skew) <= now`.
+        let at_boundary_clock = FixedClock(not_after + CLOCK_SKEW_TOLERANCE_SECS);
         let result_boundary = decoded.verify(&host_id, &grantee_id_pub, 0, &at_boundary_clock);
         assert!(
             matches!(result_boundary, Err(CryptoError::UgcExpired)),
-            "UGC exactly at not_after must be expired (boundary): {result_boundary:?}"
+            "UGC at not_after + skew boundary must be expired: {result_boundary:?}"
         );
 
-        // One second past not_after → also expired
-        let verify_clock = FixedClock(not_after + 1);
+        // Well past not_after → also expired.
+        let verify_clock = FixedClock(not_after + CLOCK_SKEW_TOLERANCE_SECS + 3600);
         let result = decoded.verify(&host_id, &grantee_id_pub, 0, &verify_clock);
         assert!(
             matches!(result, Err(CryptoError::UgcExpired)),
@@ -753,11 +779,10 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         // issued_at is far in the future relative to our "now"
         let future_time = 2_000_000_000_i64;
 
-        let ugc = make_valid_ugc(&host_ks, grantee_id, future_time).await;
+        let ugc = make_valid_ugc(&host_ks, &grantee_id_pub, future_time).await;
         let wire = ugc.wire_bytes();
         let decoded = Ugc::decode(&wire).unwrap();
 
@@ -776,13 +801,12 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
         let clock = FixedClock(now);
 
         let ugc = Ugc::encode(
             &host_ks,
-            grantee_id,
+            &grantee_id_pub,
             Capabilities::VIEW,
             /*epoch=*/ 5,
             now + 3600,
@@ -826,11 +850,12 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
 
-        // Build TBS with all-bits-set caps (u32::MAX)
-        let tbs = build_tbs_for_test(&grantee_id, u32::MAX, 1, now + 3600, now);
+        // Build TBS with all-bits-set caps (u32::MAX); compute grantee_device_id the same
+        // way encode() does so verify() matches.
+        let grantee_device_id: [u8; 32] = Sha256::digest(grantee_id_pub.public_key_bytes()).into();
+        let tbs = build_tbs_for_test(&grantee_device_id, u32::MAX, 1, now + 3600, now);
         let sig = host_ks.sign(&tbs).await.unwrap();
         let mut wire = Vec::with_capacity(UGC_WIRE_LEN);
         wire.extend_from_slice(&UGC_TBS_LEN_U32.to_be_bytes());
@@ -916,14 +941,13 @@ mod tests {
         let grantee_ks = make_ks(2);
         let host_id = host_ks.device_identity().await.unwrap();
         let grantee_id_pub = grantee_ks.device_identity().await.unwrap();
-        let grantee_id = grantee_id_from_identity(&grantee_id_pub);
         let now = 1_700_000_000_i64;
         let clock = FixedClock(now);
 
         let store = InMemoryMinEpochStore::new(0);
         let ugc = Ugc::encode(
             &host_ks,
-            grantee_id,
+            &grantee_id_pub,
             Capabilities::VIEW,
             /*epoch=*/ 1,
             now + 3600,

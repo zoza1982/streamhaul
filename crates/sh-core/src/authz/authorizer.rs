@@ -257,22 +257,20 @@ impl<S: MinEpochStore> SessionAuthorizer<S> {
     /// Returns `Ok(())` if the action is permitted, or a [`Denied`] error describing why it
     /// was denied. Every privileged host-side operation MUST gate itself through this method.
     ///
-    /// # Warning: `ElevatedAction` requires a clock
+    /// # `ElevatedAction` is always denied on the no-clock path
     ///
-    /// When `action` is [`PrivilegedAction::ElevatedAction`], this method only checks that
-    /// a [`FreshPresence`] proof **exists** — it does **not** enforce the 10-minute freshness
-    /// window against a clock, because this overload has no `Clock` parameter. A very old
-    /// `FreshPresence` (e.g. one set hours ago) will pass this check.
-    ///
-    /// **In production code, always use [`authorize_with_clock`](Self::authorize_with_clock)
-    /// for `ElevatedAction`.** The no-clock overload is intended for non-elevation actions
-    /// and for test scenarios where clock injection is not available.
+    /// ADR-0010 §1.4 requires that `ELEVATION` can never be satisfied by a cached grant — the
+    /// freshness window MUST be validated against a real clock. Therefore when `action` is
+    /// [`PrivilegedAction::ElevatedAction`] this method unconditionally returns
+    /// [`Denied::ElevationRequiresFreshPresence`] regardless of whether a `FreshPresence`
+    /// token is set. All callers that need `ElevatedAction` MUST go through
+    /// [`authorize_with_clock`](Self::authorize_with_clock).
     ///
     /// # Errors
     ///
     /// - [`Denied::Killed`] — the session has been killed.
-    /// - [`Denied::ElevationRequiresFreshPresence`] — action is `ElevatedAction` but no
-    ///   presence proof has been set (freshness window is not checked — see warning above).
+    /// - [`Denied::ElevationRequiresFreshPresence`] — action is `ElevatedAction` (always
+    ///   denied on the no-clock path; use `authorize_with_clock` instead).
     /// - [`Denied::CapabilityMissing`] — the required capability bit is not in the sealed mask.
     ///
     /// # Panics
@@ -297,31 +295,24 @@ impl<S: MinEpochStore> SessionAuthorizer<S> {
     ///     auth.authorize(&PrivilegedAction::InjectKey),
     ///     Err(Denied::CapabilityMissing { .. })
     /// ));
+    /// // ElevatedAction is always denied without a clock, even with FreshPresence set.
+    /// assert!(matches!(
+    ///     auth.authorize(&PrivilegedAction::ElevatedAction),
+    ///     Err(Denied::ElevationRequiresFreshPresence)
+    /// ));
     /// ```
     pub fn authorize(&self, action: &PrivilegedAction) -> Result<(), Denied> {
         if self.killed {
             return Err(Denied::Killed);
         }
 
-        let required = action.required_cap();
-
-        // ELEVATION requires the bit AND fresh presence.
+        // ELEVATION can never be satisfied by a cached grant on the no-clock path
+        // (ADR-0010 §1.4). Force all elevation callers through authorize_with_clock.
         if matches!(action, PrivilegedAction::ElevatedAction) {
-            if !self.sealed_caps.contains(Capabilities::ELEVATION) {
-                return Err(Denied::CapabilityMissing {
-                    action: action.clone(),
-                    required,
-                    held: self.sealed_caps,
-                });
-            }
-            // Even if the ELEVATION bit is set, fresh presence is required.
-            // (Default-deny without it — ADR-0010 §1.4.)
-            if !self.has_fresh_presence_for_elevation() {
-                return Err(Denied::ElevationRequiresFreshPresence);
-            }
-            return Ok(());
+            return Err(Denied::ElevationRequiresFreshPresence);
         }
 
+        let required = action.required_cap();
         if !self.sealed_caps.contains(required) {
             return Err(Denied::CapabilityMissing {
                 action: action.clone(),
@@ -368,8 +359,15 @@ impl<S: MinEpochStore> SessionAuthorizer<S> {
                 });
             }
             // Check freshness against the clock.
+            // A future-dated token (granted_at > now) is always denied — it cannot have
+            // been "granted" yet from the verifier's perspective (clock-skew bypass defense).
             let now = clock.now_unix_secs();
             let is_fresh = self.fresh_presence.as_ref().is_some_and(|fp| {
+                // Explicit future-date guard before computing age.
+                if fp.granted_at > now {
+                    return false; // future-dated: reject regardless of window
+                }
+                // Now granted_at <= now, so age = now - granted_at is non-negative.
                 let age = now.saturating_sub(fp.granted_at);
                 age <= ELEVATION_FRESHNESS_WINDOW_SECS
             });
@@ -388,11 +386,6 @@ impl<S: MinEpochStore> SessionAuthorizer<S> {
         }
 
         Ok(())
-    }
-
-    /// Returns whether a currently-set `FreshPresence` exists (without clock validation).
-    fn has_fresh_presence_for_elevation(&self) -> bool {
-        self.fresh_presence.is_some()
     }
 
     /// Returns `true` if this session has been killed.
@@ -427,11 +420,12 @@ impl<S: MinEpochStore> SessionAuthorizer<S> {
     ///
     /// ```
     /// use sh_core::authz::{Capabilities, Denied, InMemoryMinEpochStore, PrivilegedAction, SessionAuthorizer};
+    /// use sh_crypto::channel_crypto::SessionKeys;
     ///
-    /// // Note: in a real session, you'd pass the actual SessionKeys here.
-    /// // This example only shows the Denied::Killed behavior post-kill.
+    /// // In a real session, pass the actual SessionKeys here to also zeroize them.
+    /// // This doctest is a compile-check only; see integration tests for real usage.
     /// let store = InMemoryMinEpochStore::new(0);
-    /// let mut auth = SessionAuthorizer::seal(
+    /// let auth = SessionAuthorizer::seal(
     ///     Capabilities::all(),
     ///     Capabilities::all(),
     ///     Capabilities::all(),
@@ -439,9 +433,6 @@ impl<S: MinEpochStore> SessionAuthorizer<S> {
     ///     store,
     /// );
     /// assert!(auth.authorize(&PrivilegedAction::ViewFrame).is_ok());
-    /// // Note: in real usage, pass &mut session_keys to kill()
-    /// auth.kill_without_keys();
-    /// assert!(matches!(auth.authorize(&PrivilegedAction::ViewFrame), Err(Denied::Killed)));
     /// ```
     pub fn kill(&mut self, keys: &mut SessionKeys) {
         // Idempotent: skip on second call.
@@ -462,9 +453,13 @@ impl<S: MinEpochStore> SessionAuthorizer<S> {
     /// available but the killed-state behavior must be tested. In production, always
     /// call [`kill`](Self::kill) with the actual `SessionKeys`.
     ///
+    /// Gated `#[cfg(test)]` to prevent production callers from accidentally bypassing
+    /// key zeroization (ADR-0010 §4 requires keys to be wiped on kill).
+    ///
     /// # Panics
     ///
     /// Never panics.
+    #[cfg(test)]
     pub fn kill_without_keys(&mut self) {
         if self.killed {
             return;
@@ -651,19 +646,68 @@ mod tests {
 
     #[test]
     fn elevation_denied_without_elevation_bit() {
-        // Missing the ELEVATION bit entirely
+        // Missing the ELEVATION bit entirely. The no-clock path denies ElevatedAction
+        // unconditionally with ElevationRequiresFreshPresence. The clock path checks the
+        // capability bit first and returns CapabilityMissing.
         let auth = make_authorizer(Capabilities::VIEW | Capabilities::CONTROL);
+        // No-clock path: always denied with ElevationRequiresFreshPresence.
         assert!(matches!(
             auth.authorize(&PrivilegedAction::ElevatedAction),
+            Err(Denied::ElevationRequiresFreshPresence)
+        ));
+        // Clock path: no ELEVATION bit → CapabilityMissing.
+        let clock = FixedClock(1_000_000);
+        assert!(matches!(
+            auth.authorize_with_clock(&PrivilegedAction::ElevatedAction, &clock),
             Err(Denied::CapabilityMissing { .. })
         ));
     }
 
     #[test]
-    fn elevation_allowed_with_fresh_presence() {
+    fn elevation_allowed_with_fresh_presence_and_clock() {
         let mut auth = make_authorizer(Capabilities::all());
+        let granted_at = 1_000_000_i64;
+        auth.set_fresh_presence(FreshPresence::new_for_testing(granted_at));
+        // Must use authorize_with_clock; the no-clock path always denies ElevatedAction.
+        let clock = FixedClock(granted_at + 60); // well within 10-minute window
+        assert!(auth
+            .authorize_with_clock(&PrivilegedAction::ElevatedAction, &clock)
+            .is_ok());
+    }
+
+    /// Regression test (fix #1): no-clock `authorize` must deny ElevatedAction
+    /// unconditionally, even when a FreshPresence token is set (ADR-0010 §1.4).
+    #[test]
+    fn no_clock_authorize_denies_elevation_unconditionally() {
+        let mut auth = make_authorizer(Capabilities::all());
+        // Set a FreshPresence token — the old code would pass this through.
         auth.set_fresh_presence(FreshPresence::new_for_testing(1_000_000));
-        assert!(auth.authorize(&PrivilegedAction::ElevatedAction).is_ok());
+        // Must still be denied; the no-clock path can never satisfy ELEVATION.
+        assert!(
+            matches!(
+                auth.authorize(&PrivilegedAction::ElevatedAction),
+                Err(Denied::ElevationRequiresFreshPresence)
+            ),
+            "no-clock authorize must deny ElevatedAction even with FreshPresence set"
+        );
+    }
+
+    /// Regression test (fix #2): a future-dated FreshPresence must be denied.
+    #[test]
+    fn future_dated_fresh_presence_denied() {
+        let mut auth = make_authorizer(Capabilities::all());
+        // granted_at is far in the future relative to our "now".
+        let granted_at = 2_000_000_000_i64;
+        auth.set_fresh_presence(FreshPresence::new_for_testing(granted_at));
+        // Clock is in the past relative to granted_at → future-dated token.
+        let clock = FixedClock(1_000_000_000_i64);
+        assert!(
+            matches!(
+                auth.authorize_with_clock(&PrivilegedAction::ElevatedAction, &clock),
+                Err(Denied::ElevationRequiresFreshPresence)
+            ),
+            "future-dated FreshPresence must be denied"
+        );
     }
 
     #[test]
