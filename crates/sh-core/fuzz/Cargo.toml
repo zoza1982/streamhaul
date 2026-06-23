@@ -12,6 +12,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+bytes = "1"
 
 [dependencies.sh-core]
 path = ".."
@@ -20,6 +21,13 @@ features = ["harness"]
 [[bin]]
 name = "fuzz_reassembler_ingest"
 path = "fuzz_targets/fuzz_reassembler_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ugc_decode"
+path = "fuzz_targets/ugc_decode.rs"
 test = false
 doc = false
 bench = false

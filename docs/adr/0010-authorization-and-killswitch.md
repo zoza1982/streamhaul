@@ -1,6 +1,6 @@
 # ADR 0010: Authorization (sealed capability mask), UGC, epoch-floor revocation, and kill-switch
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-06-22
 - **Deciders:** security-engineer, rust-staff-engineer, software-architect, code-reviewer
 - **Resolves:** LLD §6.4 (authorization / kill-switch / revocation), §6.1 (UGC custody),
