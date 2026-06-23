@@ -154,10 +154,17 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 
 | ID | Task | Crates | Depends | Agent | Tests | Status | PR |
 |----|------|--------|---------|-------|-------|:------:|----|
-| P5-1 | `sh-protocol` → WASM (wire parity) + browser client over native `RTCPeerConnection` (`web-sys`) | sh-wasm | P4 | ui-engineer, network-engineer | browser e2e | ☐ | |
+| P5-1 | `sh-protocol` → WASM wire-parity bridge (`sh-wasm`, `wasm-bindgen`): `CommonHeader`/`VideoHeader`/`InputEvent`/`NackFeedback`/`CodecCaps`/`TransportCaps` + `negotiate` exposed to JS; 41 `#[wasm_bindgen_test]` golden-vector + round-trip + hostile-input tests all pass under `wasm-pack test --node`; `wasm-pack build --target web` succeeds; native workspace unaffected (excluded); CI `wasm` job added. ADR-0019. **Live `RTCPeerConnection`/DataChannel browser client deferred → R-BROWSER-INTEROP (no WebDriver here).** | sh-wasm | P4 | network-engineer | 41 wasm-bindgen-test wire-parity + hostile-input (all ✅ `wasm-pack test --node`) | 🟡 | |
 | P5-2 | Browser viewer/control UI + H.264 codec negotiation + input capture | sh-wasm (TS app) | P5-1 | ui-engineer, ux-engineer | Chrome/FF/Safari matrix | ☐ | |
 
-**Gate P5:** ☐ Chrome/Firefox/Safari view + control · ☐ H.264 negotiated for browser · ☐ same relay path as native.
+**Gate P5:** ☐ Chrome/Firefox/Safari view + control · ☐ H.264 negotiated for browser · ☐ same relay path as native. *(Gate items remain ☐ — browser-matrix verification is environment-gated, same posture as Gate P0 hardware items. Wire-parity slice delivered: 🟡 P5-1.)*
+
+**Risk Register additions (P5-1):**
+
+| ID | Description | Blocks | Owner |
+|----|-------------|--------|-------|
+| R-BROWSER-INTEROP | **Live `RTCPeerConnection` ↔ native DataChannel e2e is deferred from P5-1.** The wire-parity codec bridge is complete and verified (`wasm-pack test --node`, 41 tests). The live browser client — `web-sys` `RTCPeerConnection`/`DataChannel`, SDP offer/answer via `sh-signaling`, H.264 decode+render, input capture → `encode_input_event` → host — requires a browser with WebDriver (chromedriver/geckodriver) which is not available in this environment. Unblocked when a browser-equipped session is available. The `PinnedWebRtcTransportBuilder` MUST be used (ADR-0017 invariant). ADR-0019. | P5-1 live, P5-2 | network-engineer, ui-engineer |
+| R-BROWSER-MATRIX | **Chrome / Firefox / Safari compatibility matrix is deferred from P5-2.** Once the live browser client exists (R-BROWSER-INTEROP), it must be verified across all three browsers including Safari/WKWebView constraints (no AV1 encode, H.264 MSE profile restrictions). Requires the three-browser CI matrix from P5-2. ADR-0019. | P5-2 Gate P5 | ui-engineer, qa-engineer |
 
 ---
 

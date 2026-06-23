@@ -1,0 +1,40 @@
+[package]
+name = "sh-wasm"
+description = "WebAssembly wire-parity bridge: exposes the SHP codec to browser clients via wasm-bindgen."
+# Not in the workspace (wasm32-only target) — all fields are explicit, not inherited.
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zoza1982/streamhaul"
+rust-version = "1.82"
+
+# cdylib  = the .wasm binary loaded by wasm-bindgen / bundlers
+# rlib    = enables `wasm-pack test --node` to link test harness code
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sh-protocol = { path = "../sh-protocol" }
+sh-types = { path = "../sh-types" }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# Mirror the workspace lint settings so this excluded crate obeys the same quality gates.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"

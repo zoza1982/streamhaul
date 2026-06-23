@@ -3,6 +3,8 @@
 
 # Rust build artifacts
 /target/
+# nested target/ dirs for workspace-excluded crates (e.g. crates/sh-wasm) — never commit
+**/target/
 **/*.rs.bk
 
 # cargo-fuzz build dirs + generated corpora/artifacts (never commit — they are
