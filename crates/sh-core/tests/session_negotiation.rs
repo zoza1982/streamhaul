@@ -41,7 +41,7 @@ use sh_crypto::{HandshakeOutcome, Keystore, NoiseHandshake, SoftwareKeystore};
 use sh_protocol::transport_caps::TransportCaps;
 use sh_signaling::{MessageKind, SessionId, SignalingEnvelope};
 use sh_transport::channel::{Channel, ChannelSpec, Transport};
-use sh_transport::{TransportError, WebRtcTransport};
+use sh_transport::{PinnedWebRtcTransport, TransportError, WebRtcTransportBuilder};
 use sh_types::TransportKind;
 use str0m::crypto::Fingerprint;
 use str0m::{Candidate, Rtc};
@@ -362,10 +362,10 @@ fn make_establisher<S: SignalingChannel, F: TransportFactory>(
 
 // ─── WebRTC drive helper ──────────────────────────────────────────────────────
 
-/// Drive two `WebRtcTransport`s through ICE+DTLS+SCTP and return `true` if they connected.
+/// Drive two `PinnedWebRtcTransport`s through ICE+DTLS+SCTP and return `true` if they connected.
 async fn drive_and_check_connection(
-    ta: Arc<WebRtcTransport>,
-    tb: Arc<WebRtcTransport>,
+    ta: Arc<PinnedWebRtcTransport>,
+    tb: Arc<PinnedWebRtcTransport>,
     start: Instant,
 ) -> bool {
     let mut channel_a = match ta.open_channel(ChannelSpec::input()).await {
@@ -663,17 +663,14 @@ async fn session_symmetric_exchange() {
 async fn session_mitm_dtls_cert_swap_rejected() {
     let now = sim_base();
 
-    // ── Build real WebRtcTransports for the HONEST path ───────────────────────
+    // ── Build raw Rtcs for the HONEST path; read fingerprints before wrapping ─
     let mut rtc_a_real = make_rtc(ADDR_A, ADDR_B, true, now);
     let mut rtc_b_real = make_rtc(ADDR_B, ADDR_A, false, now);
     exchange_ice_credentials(&mut rtc_a_real, &mut rtc_b_real);
 
-    let ta_real = Arc::new(WebRtcTransport::new(rtc_a_real, ADDR_A, ADDR_B));
-    let tb_real = Arc::new(WebRtcTransport::new(rtc_b_real, ADDR_B, ADDR_A));
-
-    // Capture REAL fingerprints to use as DTLS commitments in the Noise handshake.
-    let fp_a_honest = ta_real.local_dtls_fingerprint();
-    let fp_b_real = tb_real.local_dtls_fingerprint();
+    // Capture REAL fingerprints from the raw Rtcs BEFORE handing them to the builder.
+    let fp_a_honest = rtc_a_real.direct_api().local_dtls_fingerprint().clone();
+    let fp_b_real = rtc_b_real.direct_api().local_dtls_fingerprint().clone();
 
     let fp_a_bytes: [u8; 32] = fp_a_honest
         .bytes
@@ -703,9 +700,17 @@ async fn session_mitm_dtls_cert_swap_rejected() {
     assert_eq!(pin_for_a, fp_b_bytes, "A must pin B's fingerprint");
     assert_eq!(pin_for_b, fp_a_bytes, "B must pin A's honest fingerprint");
 
-    // ── Honest path: apply correct pins → DTLS must connect ──────────────────
-    ta_real.set_remote_dtls_fingerprint(sha256_fingerprint(pin_for_a));
-    tb_real.set_remote_dtls_fingerprint(sha256_fingerprint(pin_for_b));
+    // ── Honest path: use builder to apply pins structurally → DTLS must connect ─
+    // The builder applies set_remote_fingerprint BEFORE constructing WebRtcTransport,
+    // ensuring the pin is in place before any DTLS traffic can flow.
+    let ta_real = Arc::new(
+        WebRtcTransportBuilder::new(rtc_a_real, ADDR_A, ADDR_B)
+            .pin_remote_dtls(sha256_fingerprint(pin_for_a)),
+    );
+    let tb_real = Arc::new(
+        WebRtcTransportBuilder::new(rtc_b_real, ADDR_B, ADDR_A)
+            .pin_remote_dtls(sha256_fingerprint(pin_for_b)),
+    );
 
     let honest_connected =
         drive_and_check_connection(Arc::clone(&ta_real), Arc::clone(&tb_real), now).await;
@@ -720,13 +725,16 @@ async fn session_mitm_dtls_cert_swap_rejected() {
     let mut rtc_b_mitm = make_rtc(ADDR_B, ADDR_A, false, now);
     exchange_ice_credentials(&mut rtc_a_mitm, &mut rtc_b_mitm);
 
-    let ta_mitm = Arc::new(WebRtcTransport::new(rtc_a_mitm, ADDR_MITM, ADDR_B));
-    let tb_mitm = Arc::new(WebRtcTransport::new(rtc_b_mitm, ADDR_B, ADDR_A));
-
-    // A (MITM) pins B's real fingerprint — fine for A.
-    ta_mitm.set_remote_dtls_fingerprint(sha256_fingerprint(pin_for_a));
-    // B pins A's *committed* (honest) fingerprint — but MITM presents a different cert.
-    tb_mitm.set_remote_dtls_fingerprint(sha256_fingerprint(pin_for_b));
+    // A (MITM) pins B's real fingerprint — fine for A. B pins A's *committed* (honest)
+    // fingerprint — but MITM presents a different cert, so str0m will fail-close.
+    let ta_mitm = Arc::new(
+        WebRtcTransportBuilder::new(rtc_a_mitm, ADDR_MITM, ADDR_B)
+            .pin_remote_dtls(sha256_fingerprint(pin_for_a)),
+    );
+    let tb_mitm = Arc::new(
+        WebRtcTransportBuilder::new(rtc_b_mitm, ADDR_B, ADDR_A)
+            .pin_remote_dtls(sha256_fingerprint(pin_for_b)),
+    );
 
     let mitm_connected =
         drive_and_check_connection(Arc::clone(&ta_mitm), Arc::clone(&tb_mitm), now).await;

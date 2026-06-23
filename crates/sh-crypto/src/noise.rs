@@ -373,7 +373,7 @@ impl HandshakeOutcome {
     /// Thin forwarder to
     /// [`BindCert::require_webrtc_dtls_pin`](crate::bind_cert::BindCert::require_webrtc_dtls_pin).
     /// Call this on the WebRTC pin path *before* the DTLS handshake; feed the returned bytes to
-    /// `WebRtcTransport::set_remote_dtls_fingerprint`. A peer BindCert that carries
+    /// `WebRtcTransportBuilder::pin_remote_dtls`. A peer BindCert that carries
     /// `DTLS_FPR_ALG = NONE` (a stripped binding) or an all-zero commit is rejected.
     ///
     /// # Errors

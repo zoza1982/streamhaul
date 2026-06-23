@@ -36,7 +36,7 @@ pub use channel::{Channel, ChannelSpec, QuicTransport, Reliability, Transport, M
 pub use connection::Connection;
 pub use endpoint::{ClientEndpoint, ServerEndpoint};
 pub use error::TransportError;
-pub use webrtc::{WebRtcChannel, WebRtcTransport};
+pub use webrtc::{PinnedWebRtcTransport, WebRtcChannel, WebRtcTransportBuilder};
 
 #[cfg(feature = "insecure-lan")]
 pub use insecure::{

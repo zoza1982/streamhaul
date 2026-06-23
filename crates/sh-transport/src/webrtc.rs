@@ -1,21 +1,60 @@
 //! WebRTC transport backed by the [`str0m`] sans-IO WebRTC engine.
 //!
-//! This module provides [`WebRtcTransport`] and [`WebRtcChannel`], which implement the
-//! [`Transport`] and [`Channel`] traits using WebRTC data channels. The underlying engine is
-//! `str0m 0.20` — a sans-IO library that leaves network I/O, timers, and threading to the caller.
+//! This module provides [`PinnedWebRtcTransport`], [`WebRtcTransportBuilder`], and
+//! [`WebRtcChannel`], which together implement the [`Transport`] and [`Channel`] traits using
+//! WebRTC data channels. The underlying engine is `str0m 0.20` — a sans-IO library that leaves
+//! network I/O, timers, and threading to the caller.
+//!
+//! # Construction (builder pattern — DTLS pin is structurally required)
+//!
+//! The only public path to a [`Transport`]-implementing WebRTC type goes through
+//! [`WebRtcTransportBuilder`]. The builder applies the remote DTLS fingerprint pin **before**
+//! wrapping the inner engine, making it structurally impossible to forget the pin:
+//!
+//! ```rust,no_run
+//! use std::net::{Ipv4Addr, SocketAddr};
+//! use std::time::Instant;
+//! use str0m::Rtc;
+//! use str0m::crypto::Fingerprint;
+//! use sh_transport::{WebRtcTransportBuilder, PinnedWebRtcTransport};
+//!
+//! # fn example(fp: Fingerprint) -> PinnedWebRtcTransport {
+//! let now = Instant::now();
+//! let rtc = Rtc::new(now);
+//! let local: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 4000).into();
+//! let remote: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 4001).into();
+//! // pin_remote_dtls applies the fingerprint pin before DTLS starts and returns
+//! // a PinnedWebRtcTransport — the only type that implements Transport.
+//! let transport: PinnedWebRtcTransport =
+//!     WebRtcTransportBuilder::new(rtc, local, remote).pin_remote_dtls(fp);
+//! # transport
+//! # }
+//! ```
+//!
+//! [`WebRtcTransport`] is `pub(crate)` — external callers cannot construct or name it.
+//! This means a production `TransportFactory` (defined in `sh-core`) implementation
+//! CANNOT return a `Box<dyn Transport>` for WebRTC without going through
+//! [`WebRtcTransportBuilder::pin_remote_dtls`], because `PinnedWebRtcTransport` is the
+//! **only** type that `impl Transport` and is publicly constructible.
 //!
 //! # Architecture
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────┐
-//! │  WebRtcTransport  (Arc<Mutex<WebRtcInner>>)     │
-//! │                                                 │
-//! │  drive(now)        ← call from timer task       │
-//! │  handle_receive()  ← call on UDP socket recv    │
-//! │                                                 │
-//! │  open_channel()   → WebRtcChannel               │
-//! │  accept_channel() → WebRtcChannel               │
-//! └─────────────────────────────────────────────────┘
+//! ┌──────────────────────────────────────────────────────────┐
+//! │  PinnedWebRtcTransport  (newtype over WebRtcTransport)   │
+//! │  impl Transport  ← the ONLY public Transport impl        │
+//! │                                                          │
+//! │  drive(now)        ← call from timer task                │
+//! │  handle_receive()  ← call on UDP socket recv             │
+//! │                                                          │
+//! │  open_channel()   → WebRtcChannel                        │
+//! │  accept_channel() → WebRtcChannel                        │
+//! └──────────────────────────────────────────────────────────┘
+//!          │  delegates to
+//!          ▼
+//! ┌──────────────────────────────────────────────────────────┐
+//! │  WebRtcTransport (pub(crate))  Arc<Mutex<WebRtcInner>>   │
+//! └──────────────────────────────────────────────────────────┘
 //!          │
 //!          ▼
 //!  std::sync::Mutex<WebRtcInner>
@@ -30,19 +69,19 @@
 //!
 //! # Drive loop
 //!
-//! The str0m engine is driven by calling [`WebRtcTransport::drive`] periodically and after each
-//! received packet. The caller is responsible for:
+//! The str0m engine is driven by calling [`PinnedWebRtcTransport::drive`] periodically and after
+//! each received packet. The caller is responsible for:
 //! 1. Dispatching outbound [`str0m::net::Transmit`] datagrams to the network socket.
-//! 2. Feeding inbound datagrams via [`WebRtcTransport::handle_receive`].
+//! 2. Feeding inbound datagrams via [`PinnedWebRtcTransport::handle_receive`].
 //! 3. Scheduling the next `drive` call at the `Instant` returned by
-//!    [`WebRtcTransport::next_drive_at`] after each drive or receive.
+//!    [`PinnedWebRtcTransport::next_drive_at`] after each drive or receive.
 //!
 //! In tests, this is done synchronously in the test body. In production, a tokio background task
 //! will own the drive loop (deferred to P5 when the signaling path is wired up).
 //!
 //! # RTT
 //!
-//! [`WebRtcTransport::rtt`] currently returns [`Duration::ZERO`] for the lifetime of a
+//! [`PinnedWebRtcTransport::rtt`] currently returns [`Duration::ZERO`] for the lifetime of a
 //! data-only connection. str0m 0.20 derives RTT from TWCC (Transport-Wide Congestion Control)
 //! RTCP feedback, which is a **media-plane** mechanism. Data-only connections (no audio/video
 //! tracks) never exchange RTCP packets, so the TWCC register never accumulates an RTT sample.
@@ -81,7 +120,7 @@ use crate::error::TransportError;
 /// **Unreliable channels:** silent drop is acceptable (lossy by contract).
 const MAX_RECV_QUEUE_DEPTH: usize = 512;
 
-/// How long [`WebRtcTransport::accept_channel`] will wait for an incoming channel before
+/// How long `accept_channel` will wait for an incoming channel before
 /// returning [`TransportError::StreamClosed`].
 ///
 /// A dead or disconnected peer will never fire a `ChannelOpen` event, so without this bound
@@ -106,7 +145,7 @@ struct WebRtcInner {
     rtc: Rtc,
 
     /// Per-channel receive queues. Data arriving from the remote peer is pushed here by
-    /// [`WebRtcTransport::drive`] and consumed by [`WebRtcChannel::recv`].
+    /// [`PinnedWebRtcTransport::drive`] and consumed by [`WebRtcChannel::recv`].
     recv_queues: HashMap<Str0mChannelId, VecDeque<Bytes>>,
 
     /// Per-channel notifiers signalled by `handle_event` when new data is pushed to the
@@ -294,35 +333,12 @@ impl WebRtcInner {
 
 // ── WebRtcTransport ───────────────────────────────────────────────────────────
 
-/// A [`Transport`] implementation backed by the str0m WebRTC sans-IO engine.
+/// The internal str0m-backed WebRTC transport engine.
 ///
-/// # Construction
-///
-/// ```rust,no_run
-/// use std::time::Instant;
-/// use str0m::Rtc;
-/// use sh_transport::webrtc::WebRtcTransport;
-/// use std::net::{Ipv4Addr, SocketAddr};
-///
-/// let now = Instant::now();
-/// let rtc = Rtc::new(now);
-/// let local_addr: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 4000).into();
-/// let remote_addr: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 4001).into();
-/// let transport = WebRtcTransport::new(rtc, local_addr, remote_addr);
-/// ```
-///
-/// # Drive loop
-///
-/// The transport must be driven externally. Call [`drive`](Self::drive) periodically and after
-/// every inbound datagram ([`handle_receive`](Self::handle_receive)). After each call to either,
-/// check [`next_drive_at`](Self::next_drive_at) to schedule the next drive tick. Collect the
-/// returned transmits and send them on the network socket.
-///
-/// # RTT note
-///
-/// [`rtt`](Self::rtt) returns [`Duration::ZERO`] for data-only connections. See the
-/// [module-level docs](self) for a full explanation.
-pub struct WebRtcTransport {
+/// This type is `pub(crate)`: external callers cannot name or construct it. The only public
+/// path to a [`Transport`]-implementing WebRTC type is through [`WebRtcTransportBuilder`],
+/// which applies the remote DTLS fingerprint pin before wrapping in [`PinnedWebRtcTransport`].
+pub(crate) struct WebRtcTransport {
     inner: Arc<Mutex<WebRtcInner>>,
     /// Local socket address (used by the P5 drive task to bind the UDP socket).
     #[allow(dead_code)]
@@ -338,9 +354,10 @@ impl WebRtcTransport {
     /// Wrap an already-configured [`str0m::Rtc`] in a `WebRtcTransport`.
     ///
     /// The `local_addr` / `remote_addr` must match the ICE candidates added to the `Rtc`
-    /// before construction.
+    /// before construction. This constructor is `pub(crate)`: callers outside this crate must
+    /// use [`WebRtcTransportBuilder`] instead, which requires the DTLS pin to be applied first.
     #[must_use]
-    pub fn new(rtc: Rtc, local_addr: SocketAddr, remote_addr: SocketAddr) -> Self {
+    pub(crate) fn new(rtc: Rtc, local_addr: SocketAddr, remote_addr: SocketAddr) -> Self {
         let accept_notify = Arc::new(Notify::new());
         Self {
             inner: Arc::new(Mutex::new(WebRtcInner::new(
@@ -415,34 +432,12 @@ impl WebRtcTransport {
             .clone()
     }
 
-    /// Set the remote peer's DTLS fingerprint for certificate pinning.
-    ///
-    /// This **must** be called before the DTLS handshake begins (i.e., before the first
-    /// `Output::Transmit` that carries DTLS traffic). If not set, the DTLS layer will not
-    /// verify the remote certificate, opening the connection to MITM attacks.
-    ///
-    /// The fingerprint is obtained from the remote peer via the signaling channel. This is the
-    /// seam used by the P4-5 pairing/pin path.
-    pub fn set_remote_dtls_fingerprint(&self, fingerprint: Fingerprint) {
-        self.lock()
-            .rtc
-            .direct_api()
-            .set_remote_fingerprint(fingerprint);
-    }
-
     /// The remote peer's DTLS fingerprint **as derived from its certificate after the DTLS
-    /// handshake verifies that certificate** — *not* the value pinned via
-    /// [`set_remote_dtls_fingerprint`](Self::set_remote_dtls_fingerprint).
+    /// handshake verifies that certificate**.
     ///
-    /// These are two distinct str0m fields: `set_remote_dtls_fingerprint` writes the *expected*
-    /// fingerprint (the pin), while this getter reads the fingerprint str0m computed from the
-    /// *presented peer certificate*, which is populated only once DTLS completes and the cert is
-    /// verified. Returns `None` until then. Because str0m fail-closes any mismatch against the
-    /// pin, once this returns `Some` its value necessarily equals the pin — which makes it useful
-    /// for a post-handshake assertion that the peer cert matched the `BindCert`-committed
-    /// fingerprint. [`Fingerprint`]'s `PartialEq` compares `hash_func` with ordinary string
-    /// equality and only the `bytes` with a constant-time compare; in this codebase `hash_func`
-    /// is always `"sha-256"`, so the `bytes` compare is what runs.
+    /// Returns `None` until DTLS completes and the peer cert is verified. Because str0m
+    /// fail-closes any mismatch against the pin, once this returns `Some` its value necessarily
+    /// equals the pin applied via [`WebRtcTransportBuilder::pin_remote_dtls`].
     ///
     /// # Security
     ///
@@ -459,17 +454,9 @@ impl WebRtcTransport {
 
     /// The last-known RTT for this connection.
     ///
-    /// **For data-only connections this always returns [`Duration::ZERO`].** str0m 0.20 derives
-    /// RTT from TWCC (Transport-Wide Congestion Control) RTCP feedback, which is only exchanged
-    /// when at least one media track is active. Data-only (DataChannel-only) connections never
-    /// send or receive RTCP, so the TWCC register never accumulates a sample.
-    ///
-    /// Live RTT measurement for data-only paths (e.g. via SCTP heartbeat timing) is deferred to
-    /// the P5 drive loop. Until then, treat zero as "not yet available" rather than as a true
-    /// round-trip measurement.
+    /// **For data-only connections this always returns [`Duration::ZERO`].** See module docs.
     #[must_use]
     pub fn rtt(&self) -> Duration {
-        // Always Duration::ZERO for data-only connections; see doc comment above.
         Duration::ZERO
     }
 
@@ -494,21 +481,203 @@ impl WebRtcTransport {
     }
 }
 
-#[async_trait]
-impl Transport for WebRtcTransport {
-    /// Open an outgoing data channel with the given [`ChannelSpec`].
+// ── WebRtcTransportBuilder ────────────────────────────────────────────────────
+
+/// Builder for [`PinnedWebRtcTransport`].
+///
+/// The only public finisher is [`pin_remote_dtls`](Self::pin_remote_dtls), which applies the
+/// remote DTLS fingerprint pin to the [`str0m::Rtc`] engine **before** wrapping it in a
+/// [`PinnedWebRtcTransport`]. This ordering is required: the pin must be set before the DTLS
+/// handshake begins, and the builder enforces that structurally — you cannot obtain a
+/// [`PinnedWebRtcTransport`] (or any type that [`impl Transport`](crate::channel::Transport))
+/// without going through this finisher.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::net::{Ipv4Addr, SocketAddr};
+/// use std::time::Instant;
+/// use str0m::Rtc;
+/// use str0m::crypto::Fingerprint;
+/// use sh_transport::{WebRtcTransportBuilder, PinnedWebRtcTransport};
+///
+/// # fn example(fp: Fingerprint) -> PinnedWebRtcTransport {
+/// let now = Instant::now();
+/// let rtc = Rtc::new(now);
+/// let local: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 4000).into();
+/// let remote: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 4001).into();
+/// let transport: PinnedWebRtcTransport =
+///     WebRtcTransportBuilder::new(rtc, local, remote).pin_remote_dtls(fp);
+/// # transport
+/// # }
+/// ```
+pub struct WebRtcTransportBuilder {
+    rtc: Rtc,
+    local_addr: SocketAddr,
+    remote_addr: SocketAddr,
+}
+
+impl WebRtcTransportBuilder {
+    /// Create a builder wrapping an already-configured [`str0m::Rtc`].
     ///
-    /// The channel type, priority, and reliability are encoded in the SCTP label as
-    /// `"{channel_u8}:{priority}:{ordered_u8}"` so the accepting side can reconstruct the
-    /// full [`ChannelSpec`] without out-of-band signaling.
+    /// The `local_addr` / `remote_addr` must match the ICE candidates added to the `Rtc`
+    /// before calling this constructor. The remote DTLS fingerprint must be set via
+    /// [`pin_remote_dtls`](Self::pin_remote_dtls) before the transport is usable.
+    #[must_use]
+    pub fn new(rtc: Rtc, local_addr: SocketAddr, remote_addr: SocketAddr) -> Self {
+        Self {
+            rtc,
+            local_addr,
+            remote_addr,
+        }
+    }
+
+    /// Apply the remote peer's DTLS fingerprint pin and return a [`PinnedWebRtcTransport`].
     ///
-    /// Maps [`Reliability::Reliable`] to an ordered SCTP stream and
-    /// [`Reliability::Unreliable`] to an unordered SCTP stream.
+    /// This is the **only** public finisher. It calls `rtc.direct_api().set_remote_fingerprint`
+    /// **before** wrapping the engine in [`WebRtcTransport`], ensuring the pin is in place
+    /// before any DTLS traffic can be exchanged.
+    ///
+    /// The `fingerprint` is obtained from the remote peer via the identity-signed `BindCert`
+    /// delivered by the Noise handshake (see `sh-crypto`). Call
+    /// [`HandshakeOutcome::require_webrtc_dtls_pin`] to extract it, then convert it to a
+    /// `Fingerprint` and pass it here.
+    ///
+    /// # Security
+    ///
+    /// The fingerprint is security-sensitive pairing material; do not log it at `info` or
+    /// higher.
+    #[must_use]
+    pub fn pin_remote_dtls(mut self, fingerprint: Fingerprint) -> PinnedWebRtcTransport {
+        self.rtc.direct_api().set_remote_fingerprint(fingerprint);
+        PinnedWebRtcTransport(WebRtcTransport::new(
+            self.rtc,
+            self.local_addr,
+            self.remote_addr,
+        ))
+    }
+}
+
+// ── PinnedWebRtcTransport ─────────────────────────────────────────────────────
+
+/// A WebRTC transport with a structurally-enforced DTLS fingerprint pin.
+///
+/// This is the **only** publicly constructible type that implements [`Transport`] for WebRTC.
+/// It is a newtype over [`WebRtcTransport`] (which is `pub(crate)`) and can only be obtained
+/// through [`WebRtcTransportBuilder::pin_remote_dtls`].
+///
+/// This structural enforcement closes the security gap identified in the P4-6 review: a
+/// production `TransportFactory` (defined in `sh-core`) implementation cannot return a
+/// `Box<dyn Transport>` for WebRTC without going through the builder, because
+/// `WebRtcTransport` itself is not exported and does not implement `Transport` in production
+/// builds.
+///
+/// # Drive loop
+///
+/// The transport must be driven externally. Call [`drive`](Self::drive) periodically and after
+/// every inbound datagram ([`handle_receive`](Self::handle_receive)). After each call to either,
+/// check [`next_drive_at`](Self::next_drive_at) to schedule the next drive tick. Collect the
+/// returned transmits and send them on the network socket.
+///
+/// # RTT note
+///
+/// [`rtt`](Self::rtt) returns [`Duration::ZERO`] for data-only connections. See the
+/// [module-level docs](self) for a full explanation.
+pub struct PinnedWebRtcTransport(WebRtcTransport);
+
+impl PinnedWebRtcTransport {
+    /// Feed a timeout tick into the engine and drain all output.
+    ///
+    /// Returns outbound datagrams to be sent on the network socket.
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Webrtc`] if the channel cannot be created.
-    async fn open_channel(&self, spec: ChannelSpec) -> Result<Box<dyn Channel>, TransportError> {
+    /// Returns [`TransportError::Webrtc`] if the str0m engine reports an error.
+    pub fn drive(&self, now: Instant) -> Result<Vec<str0m::net::Transmit>, TransportError> {
+        self.0.drive(now)
+    }
+
+    /// Feed an inbound datagram received from `from`, addressed to `to`, at wall-clock time `now`.
+    ///
+    /// The caller supplies `now` so that production code can use an injected clock and tests can
+    /// use a deterministic `Instant` — no internal `Instant::now()` call is made.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Webrtc`] if the datagram cannot be parsed or the engine errors.
+    pub fn handle_receive(
+        &self,
+        from: SocketAddr,
+        to: SocketAddr,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<(), TransportError> {
+        self.0.handle_receive(from, to, data, now)
+    }
+
+    /// The next `Instant` at which [`drive`](Self::drive) should be called.
+    ///
+    /// Returns `None` if the engine has not yet emitted a timeout (i.e., `drive` has not been
+    /// called yet). Call this after every [`drive`](Self::drive) or
+    /// [`handle_receive`](Self::handle_receive) and schedule the next wakeup accordingly.
+    #[must_use]
+    pub fn next_drive_at(&self) -> Option<Instant> {
+        self.0.next_drive_at()
+    }
+
+    /// The local DTLS fingerprint for this peer connection.
+    ///
+    /// This value must be communicated to the remote peer out-of-band (e.g., via the signaling
+    /// channel) so they can authenticate the DTLS handshake.
+    ///
+    /// # Security
+    ///
+    /// Do not log the returned value at `info` or higher. Use `tracing::trace!` if you must
+    /// record it for debugging.
+    #[must_use]
+    pub fn local_dtls_fingerprint(&self) -> Fingerprint {
+        self.0.local_dtls_fingerprint()
+    }
+
+    /// The remote peer's DTLS fingerprint as verified by str0m after the DTLS handshake.
+    ///
+    /// Returns `None` until DTLS completes and the peer cert is verified. Because str0m
+    /// fail-closes any mismatch against the pin applied in
+    /// [`WebRtcTransportBuilder::pin_remote_dtls`], once this returns `Some` its value
+    /// necessarily equals the pin.
+    ///
+    /// # Security
+    ///
+    /// The returned value is security-sensitive pairing material; do not log it at `info` or
+    /// higher (use `tracing::trace!` if you must).
+    #[must_use]
+    pub fn remote_dtls_fingerprint(&self) -> Option<Fingerprint> {
+        self.0.remote_dtls_fingerprint()
+    }
+
+    /// The last-known RTT for this connection.
+    ///
+    /// **For data-only connections this always returns [`Duration::ZERO`].** See module docs.
+    #[must_use]
+    pub fn rtt(&self) -> Duration {
+        self.0.rtt()
+    }
+
+    /// Loss fraction (0.0 if not yet known).
+    ///
+    /// Currently returns 0.0; per-packet loss tracking from TWCC is deferred to P5.
+    #[must_use]
+    pub fn packet_loss(&self) -> f64 {
+        self.0.packet_loss()
+    }
+}
+
+/// Internal open-channel logic shared by `WebRtcTransport` and delegated from `PinnedWebRtcTransport`.
+impl WebRtcTransport {
+    async fn open_channel_impl(
+        &self,
+        spec: ChannelSpec,
+    ) -> Result<Box<dyn Channel>, TransportError> {
         let ordered = matches!(spec.reliability, Reliability::Reliable);
         let ordered_u8: u8 = if ordered { 1 } else { 0 };
         let label = format!(
@@ -544,18 +713,7 @@ impl Transport for WebRtcTransport {
         }))
     }
 
-    /// Accept the next incoming data channel opened by the remote peer.
-    ///
-    /// Blocks asynchronously until a channel arrives or [`ACCEPT_CHANNEL_TIMEOUT`] elapses.
-    /// The accept queue is populated by the drive loop when a `ChannelOpen` event arrives from
-    /// the str0m engine for a channel NOT opened locally.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TransportError::StreamClosed`] if no channel arrives within the timeout (the
-    /// peer is presumed dead or disconnected). Returns [`TransportError::Webrtc`] if the channel
-    /// label cannot be parsed (falls back to sane defaults in that case).
-    async fn accept_channel(&self) -> Result<Box<dyn Channel>, TransportError> {
+    async fn accept_channel_impl(&self) -> Result<Box<dyn Channel>, TransportError> {
         // Standard tokio Notify pattern: create the future BEFORE checking the queue so any
         // notify() that fires between the check and the await is not lost.
         let deadline = tokio::time::sleep(ACCEPT_CHANNEL_TIMEOUT);
@@ -590,13 +748,66 @@ impl Transport for WebRtcTransport {
             }
         }
     }
+}
+
+// `impl Transport for WebRtcTransport` is gated to test builds only.
+// In production, `PinnedWebRtcTransport` is the sole type that impls `Transport`.
+// In tests (same module), `WebRtcTransport` is accessible via `pub(crate)` and its
+// `impl Transport` is available for internal unit tests that test the engine directly.
+#[cfg(test)]
+#[async_trait]
+impl Transport for WebRtcTransport {
+    async fn open_channel(&self, spec: ChannelSpec) -> Result<Box<dyn Channel>, TransportError> {
+        self.open_channel_impl(spec).await
+    }
+
+    async fn accept_channel(&self) -> Result<Box<dyn Channel>, TransportError> {
+        self.accept_channel_impl().await
+    }
+
+    fn rtt(&self) -> Duration {
+        Duration::ZERO
+    }
+}
+
+#[async_trait]
+impl Transport for PinnedWebRtcTransport {
+    /// Open an outgoing data channel with the given [`ChannelSpec`].
+    ///
+    /// The channel type, priority, and reliability are encoded in the SCTP label as
+    /// `"{channel_u8}:{priority}:{ordered_u8}"` so the accepting side can reconstruct the
+    /// full [`ChannelSpec`] without out-of-band signaling.
+    ///
+    /// Maps [`Reliability::Reliable`] to an ordered SCTP stream and
+    /// [`Reliability::Unreliable`] to an unordered SCTP stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::Webrtc`] if the channel cannot be created.
+    async fn open_channel(&self, spec: ChannelSpec) -> Result<Box<dyn Channel>, TransportError> {
+        self.0.open_channel_impl(spec).await
+    }
+
+    /// Accept the next incoming data channel opened by the remote peer.
+    ///
+    /// Blocks asynchronously until a channel arrives or the internal timeout elapses.
+    /// The accept queue is populated by the drive loop when a `ChannelOpen` event arrives from
+    /// the str0m engine for a channel NOT opened locally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::StreamClosed`] if no channel arrives within the timeout (the
+    /// peer is presumed dead or disconnected).
+    async fn accept_channel(&self) -> Result<Box<dyn Channel>, TransportError> {
+        self.0.accept_channel_impl().await
+    }
 
     /// The current RTT to the peer.
     ///
-    /// Always returns [`Duration::ZERO`] for data-only connections. See [`WebRtcTransport::rtt`]
-    /// for the full explanation.
+    /// Always returns [`Duration::ZERO`] for data-only connections. See module docs for the
+    /// full explanation.
     fn rtt(&self) -> Duration {
-        Duration::ZERO
+        self.0.rtt()
     }
 }
 
@@ -1456,5 +1667,62 @@ mod tests {
             assert_eq!(final_len, MAX_RECV_QUEUE_DEPTH, "queue must not exceed cap");
             assert_eq!(counter_val, 1, "drop counter must be 1");
         }
+    }
+
+    /// Verify that `WebRtcTransportBuilder::pin_remote_dtls` returns a `PinnedWebRtcTransport`
+    /// with sane post-construction state.
+    ///
+    /// This test asserts the builder pattern is structurally correct:
+    /// 1. `pin_remote_dtls` returns a `PinnedWebRtcTransport` (not a bare unpinned transport).
+    /// 2. `remote_dtls_fingerprint()` returns `None` before DTLS completes — the pin is the
+    ///    *expected* value, not the *verified* cert fingerprint (populated only post-handshake).
+    /// 3. `rtt()` returns `Duration::ZERO` before any drive.
+    /// 4. `local_dtls_fingerprint()` returns a non-empty fingerprint (the Rtc is ready).
+    #[test]
+    fn builder_pin_applied_before_handshake() {
+        let local: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 20000).into();
+        let remote: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 20001).into();
+
+        #[allow(clippy::disallowed_methods)]
+        let now = Instant::now();
+
+        let rtc = Rtc::new(now);
+        let fp = Fingerprint {
+            hash_func: "sha-256".to_owned(),
+            bytes: vec![0xABu8; 32],
+        };
+        // The builder is the only public path; pin_remote_dtls applies the fingerprint before
+        // the inner WebRtcTransport is created, then wraps in PinnedWebRtcTransport.
+        let transport: PinnedWebRtcTransport =
+            WebRtcTransportBuilder::new(rtc, local, remote).pin_remote_dtls(fp);
+
+        // remote_dtls_fingerprint() reads the VERIFIED cert fp (populated only after DTLS
+        // completes), not the pin → must be None before the handshake.
+        assert!(
+            transport.remote_dtls_fingerprint().is_none(),
+            "remote_dtls_fingerprint() must be None before DTLS verifies the peer cert"
+        );
+        // RTT is zero before any drive.
+        assert_eq!(
+            transport.rtt(),
+            Duration::ZERO,
+            "rtt() must be Duration::ZERO before drive"
+        );
+        // The local fingerprint is available immediately (derived from the Rtc at construction).
+        assert!(
+            !transport.local_dtls_fingerprint().bytes.is_empty(),
+            "local_dtls_fingerprint() must be non-empty"
+        );
+        // next_drive_at is None before the first drive.
+        assert!(
+            transport.next_drive_at().is_none(),
+            "next_drive_at() must be None before first drive"
+        );
+        // packet_loss is 0.0 before any data flows.
+        assert_eq!(
+            transport.packet_loss(),
+            0.0,
+            "packet_loss() must be 0.0 initially"
+        );
     }
 }

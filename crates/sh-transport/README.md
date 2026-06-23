@@ -13,12 +13,17 @@ codec-agnostic `Transport`/`Channel` trait abstraction (LLD §2) is **not** here
 - `ClientEndpoint::bind(quinn::ClientConfig)` → `connect(addr, server_name).await` → `Connection`
 - `Connection`: `send_datagram(Bytes)`, `read_datagram().await`, `max_datagram_size()`, `remote_address()`
 - `TransportError` — typed errors wrapping quinn's connect/connection/datagram/io failures
-- `WebRtcTransport` (str0m backend): `local_dtls_fingerprint()`, `set_remote_dtls_fingerprint(fp)`,
-  and `remote_dtls_fingerprint()` — the P4-5 DTLS-fingerprint pinning seam. The remote fingerprint
-  is pinned from the identity-signed `BindCert` (via `sh-crypto`) **before** the DTLS handshake;
-  str0m fail-closes any peer cert that does not match. See ADR-0014 and the
-  `tests/dtls_identity_binding.rs` integration test (dev-only `sh-crypto` dep; no production
-  coupling).
+- `WebRtcTransportBuilder` + `PinnedWebRtcTransport` (str0m backend, P4-5/P4-6):
+  - `WebRtcTransportBuilder::new(rtc, local, remote).pin_remote_dtls(fp)` → `PinnedWebRtcTransport`
+    — the **only** public path to a `Transport`-implementing WebRTC type. The builder applies
+    `set_remote_fingerprint` **before** constructing the inner engine, making it structurally
+    impossible to forget the DTLS pin (closes the P4-6 API footgun identified in code review).
+  - `PinnedWebRtcTransport`: `drive(now)`, `handle_receive(...)`, `next_drive_at()`,
+    `local_dtls_fingerprint()`, `remote_dtls_fingerprint()`, `rtt()`, `packet_loss()`.
+  - The bare `WebRtcTransport` is `pub(crate)` — external callers cannot name or construct it.
+  - See ADR-0014 (DTLS identity binding) and ADR-0017 (structural pin enforcement), plus the
+    `tests/dtls_identity_binding.rs` integration test (dev-only `sh-crypto` dep; no production
+    coupling).
 
 ## ⚠️ `insecure-lan` feature (LAN lab only)
 

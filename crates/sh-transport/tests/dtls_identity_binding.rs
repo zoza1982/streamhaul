@@ -11,13 +11,14 @@
 //!
 //! 1. Two devices run a real Noise XK handshake over an in-memory channel, exchanging
 //!    identity-signed `BindCert`s. Each `BindCert` commits the device's REAL
-//!    [`WebRtcTransport::local_dtls_fingerprint()`].
+//!    [`PinnedWebRtcTransport::local_dtls_fingerprint()`].
 //! 2. Each side extracts the peer's committed fingerprint from the *verified* handshake outcome
-//!    ([`HandshakeOutcome::require_webrtc_dtls_pin`]) and pins it via
-//!    [`WebRtcTransport::set_remote_dtls_fingerprint`] BEFORE the DTLS handshake runs.
+//!    ([`HandshakeOutcome::require_webrtc_dtls_pin`]) and pins it structurally via
+//!    [`WebRtcTransportBuilder::pin_remote_dtls`] — the ONLY public path to a
+//!    `Transport`-implementing WebRTC type. The builder applies the pin BEFORE the DTLS handshake.
 //! 3. **Matching path:** the cert each transport presents matches its committed fingerprint →
 //!    str0m completes DTLS → a DataChannel opens and a frame round-trips. The pinned value equals
-//!    what str0m reports via [`WebRtcTransport::remote_dtls_fingerprint`].
+//!    what str0m reports via [`PinnedWebRtcTransport::remote_dtls_fingerprint`].
 //! 4. **MITM path:** an attacker substitutes one side's DTLS certificate (a different `Rtc` with a
 //!    different fingerprint) while the *committed* fingerprint stays the legitimate one. str0m
 //!    fail-closes: DTLS never completes and no data flows. The swap is rejected.
@@ -43,7 +44,7 @@ use std::time::{Duration, Instant};
 use sh_crypto::bind_cert::DtlsCommitment;
 use sh_crypto::clock::FixedClock;
 use sh_crypto::{HandshakeOutcome, Keystore, NoiseHandshake, SoftwareKeystore};
-use sh_transport::{ChannelSpec, Transport, WebRtcTransport};
+use sh_transport::{ChannelSpec, PinnedWebRtcTransport, Transport, WebRtcTransportBuilder};
 use str0m::crypto::Fingerprint;
 use str0m::{Candidate, Rtc};
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -175,16 +176,16 @@ async fn run_noise_with_dtls(
     (init_outcome, resp_outcome)
 }
 
-/// Drive two already-pinned `WebRtcTransport`s through ICE + DTLS + SCTP and attempt a single
-/// DataChannel round-trip. Returns `true` if a frame was delivered (DTLS connected), `false` if it
-/// never connected within the deadline (str0m fail-closed on a fingerprint mismatch).
+/// Drive two already-pinned `PinnedWebRtcTransport`s through ICE + DTLS + SCTP and attempt a
+/// single DataChannel round-trip. Returns `true` if a frame was delivered (DTLS connected),
+/// `false` if it never connected within the deadline (str0m fail-closed on a fingerprint mismatch).
 ///
 /// On a successful connection, asserts that each side's `remote_dtls_fingerprint()` (the value
 /// str0m actually verified against the peer cert) equals the fingerprint that was pinned — i.e.
 /// str0m enforced exactly the identity-bound commitment.
 async fn try_round_trip(
-    ta: Arc<WebRtcTransport>,
-    tb: Arc<WebRtcTransport>,
+    ta: Arc<PinnedWebRtcTransport>,
+    tb: Arc<PinnedWebRtcTransport>,
     expect_a_pins: Fingerprint,
     expect_b_pins: Fingerprint,
     start: Instant,
@@ -317,6 +318,9 @@ enum Mitm {
 
 /// Set up two devices, run the Noise handshake to derive identity-bound DTLS pins, pin them on the
 /// transports per `mitm`, then attempt a DataChannel round-trip. Returns whether it connected.
+///
+/// The flow uses [`WebRtcTransportBuilder::pin_remote_dtls`] — the only public path to a
+/// [`Transport`]-implementing type — so the pin is applied structurally before DTLS starts.
 async fn run_dtls_session(mitm: Mitm) -> bool {
     let a_addr: SocketAddr = (Ipv4Addr::new(10, 0, 0, 1), 4000).into();
     let b_addr: SocketAddr = (Ipv4Addr::new(10, 0, 0, 2), 4001).into();
@@ -355,11 +359,11 @@ async fn run_dtls_session(mitm: Mitm) -> bool {
 
     let fp_b = rtc_b.direct_api().local_dtls_fingerprint().clone();
 
+    // Read the fingerprint A actually presents (needed for the SubstituteACertButPinIt branch).
+    let fp_a_present = rtc_a_present.direct_api().local_dtls_fingerprint().clone();
+
     // ICE credentials are exchanged between the certs that will actually run DTLS.
     exchange_ice_credentials(&mut rtc_a_present, &mut rtc_b);
-
-    let ta = Arc::new(WebRtcTransport::new(rtc_a_present, a_addr, b_addr));
-    let tb = Arc::new(WebRtcTransport::new(rtc_b, b_addr, a_addr));
 
     // Sanity: the committed A-fingerprint and B-fingerprint are the values fed into the BindCerts.
     let init_dtls: [u8; 32] = fp_a_committed
@@ -373,7 +377,8 @@ async fn run_dtls_session(mitm: Mitm) -> bool {
         .try_into()
         .expect("B fingerprint must be 32 bytes (SHA-256)");
 
-    // Run the identity handshake: A commits its (legitimate) fingerprint; B commits its own.
+    // Run the identity handshake BEFORE wrapping the Rtcs: fingerprints are already captured
+    // from the raw Rtcs above, so there is no ordering dependency.
     let init_ks = SoftwareKeystore::generate();
     let resp_ks = SoftwareKeystore::generate();
     let (a_outcome, b_outcome) =
@@ -387,9 +392,6 @@ async fn run_dtls_session(mitm: Mitm) -> bool {
         .require_webrtc_dtls_pin()
         .expect("B must obtain A's committed pin");
 
-    // A pins B's committed fingerprint (always honest in this test).
-    ta.set_remote_dtls_fingerprint(sha256_fingerprint(a_pins_b));
-
     // B pins A. In the honest/MITM cases B pins the COMMITTED (legitimate) A fingerprint. In the
     // control case B pins the ATTACKER's actual cert (bypassing the binding) to show the
     // substitution would otherwise succeed.
@@ -397,13 +399,26 @@ async fn run_dtls_session(mitm: Mitm) -> bool {
         Mitm::None | Mitm::SubstituteACert => b_pins_a, // == fp_a_committed (legitimate)
         Mitm::SubstituteACertButPinIt => {
             // Pin the attacker cert that A actually presents.
-            ta.local_dtls_fingerprint()
+            fp_a_present
                 .bytes
                 .try_into()
                 .expect("A presented fingerprint 32 bytes")
         }
     };
-    tb.set_remote_dtls_fingerprint(sha256_fingerprint(b_pin_for_a));
+
+    // Use the builder — the ONLY public path to a Transport-implementing type. The builder
+    // applies the pin (set_remote_fingerprint) BEFORE creating the inner WebRtcTransport, so
+    // the pin is in place before any DTLS traffic flows.
+    //
+    // A pins B's committed fingerprint (always honest in this test).
+    let ta = Arc::new(
+        WebRtcTransportBuilder::new(rtc_a_present, a_addr, b_addr)
+            .pin_remote_dtls(sha256_fingerprint(a_pins_b)),
+    );
+    let tb = Arc::new(
+        WebRtcTransportBuilder::new(rtc_b, b_addr, a_addr)
+            .pin_remote_dtls(sha256_fingerprint(b_pin_for_a)),
+    );
 
     // Before DTLS completes, str0m does not yet expose a *verified* remote fingerprint on either
     // side (the getter reads the peer-cert-derived value, populated only post-handshake).
