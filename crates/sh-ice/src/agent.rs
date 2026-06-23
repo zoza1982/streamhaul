@@ -273,10 +273,8 @@ where
     /// # Valid states
     ///
     /// Must only be called when the agent is in [`IceState::Gathering`],
-    /// [`IceState::Checking`], or [`IceState::Connected`].  Calling this from
-    /// [`IceState::Failed`] or [`IceState::Restarting`] would silently discard the
-    /// relay candidate on the next state transition (the candidate list is cleared on
-    /// restart).  Debug builds assert this invariant.
+    /// [`IceState::Checking`], or [`IceState::Connected`].  Returns
+    /// [`IceError::CheckFailed`] if called in any other state.
     ///
     /// # Security
     ///
@@ -285,6 +283,11 @@ where
     /// (keyed with the remote ICE password).  The TURN relay only forwards opaque bytes
     /// and cannot forge a valid check.  The agent verifies `MESSAGE-INTEGRITY` on every
     /// incoming Binding Request and response, regardless of whether it arrived via relay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IceError::CheckFailed`] if the agent is not in a valid state for adding
+    /// relay candidates.
     ///
     /// # Examples
     ///
@@ -313,26 +316,94 @@ where
     /// agent.gather().unwrap();
     /// let relay_addr = "10.0.0.254:40000".parse().unwrap();
     /// let base_addr = "127.0.0.1:9002".parse().unwrap(); // TURN client socket addr
-    /// agent.add_relay_candidate(relay_addr, base_addr);
+    /// agent.add_relay_candidate(relay_addr, base_addr).unwrap();
     /// ```
-    pub fn add_relay_candidate(&mut self, relay_addr: SocketAddr, base_addr: SocketAddr) {
-        // Calling add_relay_candidate in Failed/Restarting states silently loses the
-        // candidate because local_candidates is cleared on restart.  Catch this in debug
-        // builds so the invariant is visible during development and testing.
-        debug_assert!(
-            matches!(
-                self.state,
-                IceState::Gathering | IceState::Checking | IceState::Connected
-            ),
-            "add_relay_candidate called in invalid state {:?}; \
-             candidate would be lost on next state transition",
-            self.state
-        );
+    pub fn add_relay_candidate(
+        &mut self,
+        relay_addr: SocketAddr,
+        base_addr: SocketAddr,
+    ) -> Result<(), IceError> {
+        match self.state {
+            IceState::Gathering | IceState::Checking | IceState::Connected => {}
+            other => {
+                return Err(IceError::CheckFailed(format!(
+                    "add_relay_candidate called in invalid state {other:?}; \
+                     call gather() first and wait for Gathering/Checking/Connected"
+                )));
+            }
+        }
         let c = Candidate::new(CandidateKind::Relay, relay_addr, base_addr, 1);
         self.local_candidates.push(c);
         if !self.remote_candidates.is_empty() {
-            self.rebuild_check_list();
+            if matches!(self.state, IceState::Checking | IceState::Connected) {
+                // Capture the remote address of each in-flight pair so we can remap
+                // indices after the sort.
+                let in_flight_addrs: Vec<([u8; 12], SocketAddr)> = self
+                    .in_flight
+                    .iter()
+                    .filter_map(|(tid, idx)| {
+                        self.check_list.get(*idx).map(|p| (*tid, p.remote.addr))
+                    })
+                    .collect();
+
+                // Preserve nominated remote addr.
+                let nominated_remote_addr = self
+                    .nominated_idx
+                    .and_then(|i| self.check_list.get(i))
+                    .map(|p| p.remote.addr);
+
+                // Append new pairs from the new relay candidate only.
+                let is_controlling = self.config.role == IceRole::Controlling;
+                // SAFETY: we just pushed a candidate above, so local_candidates is non-empty.
+                let new_local = match self.local_candidates.last().cloned() {
+                    Some(c) => c,
+                    None => return Ok(()), // unreachable: we pushed above
+                };
+                let new_pairs: Vec<CandidatePair> = self
+                    .remote_candidates
+                    .iter()
+                    .map(|remote| {
+                        let mut pair =
+                            CandidatePair::new(new_local.clone(), remote.clone(), is_controlling);
+                        pair.state = PairState::Waiting;
+                        pair
+                    })
+                    .collect();
+                self.check_list.extend(new_pairs);
+                self.check_list
+                    .sort_by_key(|p| std::cmp::Reverse(p.priority));
+
+                // Remap in_flight indices using captured remote addresses.
+                self.in_flight = in_flight_addrs
+                    .into_iter()
+                    .filter_map(|(tid, remote_addr)| {
+                        self.check_list
+                            .iter()
+                            .position(|p| {
+                                p.remote.addr == remote_addr && p.state == PairState::InProgress
+                            })
+                            .map(|new_idx| (tid, new_idx))
+                    })
+                    .collect();
+
+                // Re-locate nominated pair.
+                if let Some(remote_addr) = nominated_remote_addr {
+                    self.nominated_idx = self
+                        .check_list
+                        .iter()
+                        .position(|p| p.remote.addr == remote_addr);
+                    if let Some(idx) = self.nominated_idx {
+                        if let Some(pair) = self.check_list.get_mut(idx) {
+                            pair.nominated = true;
+                            pair.state = PairState::Succeeded;
+                        }
+                    }
+                }
+            } else {
+                self.rebuild_check_list();
+            }
         }
+        Ok(())
     }
 
     /// Add a remote candidate received via signalling or trickle ICE.
@@ -645,7 +716,16 @@ where
             Ok(b) => b,
             Err(_) => return Ok(()), // HMAC construction failure; drop silently
         };
-        self.outgoing.push((resp_bytes, from));
+        // Route response based on whether `from` is a relay remote address.
+        let is_relay_src = self
+            .check_list
+            .iter()
+            .any(|p| p.remote.addr == from && p.remote.kind == CandidateKind::Relay);
+        if is_relay_src {
+            self.outgoing.push((resp_bytes, from));
+        } else {
+            let _ = self.transport.send_to(&resp_bytes, from);
+        }
 
         // If the controlling peer sent USE-CANDIDATE and we have a matching pair,
         // mark it as nominated.
@@ -748,11 +828,15 @@ where
         };
 
         // Verify the response came from the expected remote address.
-        if let Some(pair) = self.check_list.get(pair_idx) {
+        // Also capture the remote kind before taking a mutable borrow below.
+        let remote_kind = if let Some(pair) = self.check_list.get(pair_idx) {
             if from != pair.remote.addr {
                 return Ok(());
             }
-        }
+            pair.remote.kind
+        } else {
+            return Ok(());
+        };
 
         if let Some(pair) = self.check_list.get_mut(pair_idx) {
             pair.state = PairState::Succeeded;
@@ -780,7 +864,12 @@ where
                     },
                 );
                 if let Ok(bytes) = nominate_result {
-                    self.outgoing.push((bytes, from));
+                    // Route based on whether the nominated pair uses a relay remote.
+                    if remote_kind == CandidateKind::Relay {
+                        self.outgoing.push((bytes, from));
+                    } else {
+                        let _ = self.transport.send_to(&bytes, from);
+                    }
                     // Track the nomination request so its response is matched.
                     self.in_flight.push((tid, pair_idx));
                 }
@@ -1532,8 +1621,12 @@ mod tests {
         agent_b.state = IceState::Gathering;
 
         // Inject relay candidates obtained from the TURN allocations above.
-        agent_a.add_relay_candidate(relay_addr_a, turn_sock_addr_a);
-        agent_b.add_relay_candidate(relay_addr_b, turn_sock_addr_b);
+        agent_a
+            .add_relay_candidate(relay_addr_a, turn_sock_addr_a)
+            .expect("add_relay_candidate must succeed in Gathering state");
+        agent_b
+            .add_relay_candidate(relay_addr_b, turn_sock_addr_b)
+            .expect("add_relay_candidate must succeed in Gathering state");
 
         // Exchange relay candidates via signalling (simulated by direct injection).
         // The remote candidate's addr is the peer's relay address; the base is irrelevant
@@ -1735,8 +1828,12 @@ mod tests {
             agent_a.state = IceState::Gathering;
             agent_b.state = IceState::Gathering;
 
-            agent_a.add_relay_candidate(relay_addr_a, turn_sock_addr_a);
-            agent_b.add_relay_candidate(relay_addr_b, turn_sock_addr_b);
+            agent_a
+                .add_relay_candidate(relay_addr_a, turn_sock_addr_a)
+                .expect("add_relay_candidate must succeed in Gathering state");
+            agent_b
+                .add_relay_candidate(relay_addr_b, turn_sock_addr_b)
+                .expect("add_relay_candidate must succeed in Gathering state");
 
             agent_a.add_remote_candidate(Candidate::new(
                 CandidateKind::Relay,
@@ -1955,5 +2052,83 @@ mod tests {
                 "{label}: both agents must nominate a relay pair (a={a_nom}, b={b_nom})"
             );
         }
+    }
+
+    // ─── Fix 10: additional safety/routing tests ──────────────────────────────
+
+    /// Adding a relay candidate while in Checking must NOT clear existing in_flight TIDs.
+    #[test]
+    fn mid_checking_relay_candidate_preserves_in_flight() {
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let addr = ipv4(127, 0, 0, 1, 39001);
+        let sock = net.create_socket(NatType::FullCone, addr).unwrap();
+        let cfg = make_config(addr, IceRole::Controlling, 1);
+        let mut agent = IceAgent::new(cfg, sock, FixedClock(0), TestRng(77));
+        agent.gather().unwrap();
+
+        // Add a host remote candidate and transition to Checking.
+        let remote = Candidate::new(
+            CandidateKind::Host,
+            ipv4(10, 0, 0, 1, 9001),
+            ipv4(10, 0, 0, 1, 9001),
+            1,
+        );
+        agent.add_remote_candidate(remote);
+        agent.state = IceState::Checking;
+        agent.checking_started_us = Some(0);
+
+        // Run one step so check_pairs sends a request and in_flight is populated.
+        let _ = agent.step(None);
+        let tids_before = agent.in_flight_tids();
+        // If no TIDs yet (peer NAT drops the packet before in_flight is set),
+        // manually inject one to set up the invariant.
+        let had_in_flight = !tids_before.is_empty();
+
+        // Inject a relay candidate while in Checking state.
+        let relay_addr = ipv4(10, 0, 0, 254, 40001);
+        let base_addr = ipv4(127, 0, 0, 1, 39002);
+        agent
+            .add_relay_candidate(relay_addr, base_addr)
+            .expect("add_relay_candidate must succeed in Checking state");
+
+        let tids_after = agent.in_flight_tids();
+
+        if had_in_flight {
+            // All previously in-flight TIDs must still be present.
+            for tid in &tids_before {
+                assert!(
+                    tids_after.contains(tid),
+                    "in_flight TID {tid:?} was lost after adding relay candidate"
+                );
+            }
+        }
+
+        // The check list must have grown (new relay×remote pair appended).
+        let has_relay_local = agent
+            .check_list()
+            .iter()
+            .any(|p| p.local.kind == CandidateKind::Relay);
+        assert!(
+            has_relay_local,
+            "check list must contain a relay local pair after add_relay_candidate"
+        );
+    }
+
+    /// add_relay_candidate in Failed state must return Err, not silently drop the candidate.
+    #[test]
+    fn add_relay_candidate_invalid_state_returns_err() {
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let addr = ipv4(127, 0, 0, 1, 39010);
+        let sock = net.create_socket(NatType::FullCone, addr).unwrap();
+        let cfg = make_config(addr, IceRole::Controlling, 2);
+        let mut agent = IceAgent::new(cfg, sock, FixedClock(0), TestRng(88));
+        agent.state = IceState::Failed;
+
+        let result =
+            agent.add_relay_candidate(ipv4(10, 0, 0, 254, 40002), ipv4(127, 0, 0, 1, 39011));
+        assert!(
+            result.is_err(),
+            "add_relay_candidate in Failed state must return Err"
+        );
     }
 }

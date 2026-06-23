@@ -411,6 +411,18 @@ impl TurnMessage {
     /// ```
     pub fn verify_integrity(raw: &[u8], lt_key: &[u8]) -> Result<(), IceError> {
         let mi_off = find_attr(raw, ATTR_MESSAGE_INTEGRITY)?;
+        // RFC 8489 §15.4: MI must be the last attribute, or followed only by FINGERPRINT (8 bytes, type 0x8028).
+        let mi_end = mi_off.saturating_add(24);
+        let msg_len = u16::from_be_bytes([*raw.get(2).unwrap_or(&0), *raw.get(3).unwrap_or(&0)]);
+        let body_end = STUN_HDR.saturating_add(usize::from(msg_len));
+        if mi_end < body_end {
+            let trailer = raw.get(mi_end..body_end).unwrap_or(&[]);
+            let is_only_fp =
+                trailer.len() == 8 && trailer.get(0..2) == Some(&0x8028u16.to_be_bytes());
+            if !is_only_fp {
+                return Err(IceError::AttrOrderingViolation("MESSAGE-INTEGRITY"));
+            }
+        }
         let prefix = raw.get(..mi_off).ok_or(IceError::StunTruncated {
             needed: mi_off,
             have: raw.len(),
@@ -582,8 +594,9 @@ where
     /// RFC 8489 §9.2 long-term credential key (MD5 of username:realm:password).
     lt_key: Option<Vec<u8>>,
     expires_at: Option<i64>,
-    #[allow(dead_code)]
     pending_tid: Option<[u8; 12]>,
+    /// Number of 401/438 auth retries attempted (capped at 2 per RFC 8489 §9.2).
+    auth_attempts: u8,
 }
 
 impl<T, C, R> TurnClient<T, C, R>
@@ -627,6 +640,7 @@ where
             lt_key: None,
             expires_at: None,
             pending_tid: None,
+            auth_attempts: 0,
         }
     }
 
@@ -977,6 +991,28 @@ where
             Err(_) => return Ok(None), // not a STUN/TURN message
         };
 
+        // Verify transaction ID for responses to prevent replay/stale-response acceptance.
+        if msg.class == 2 || msg.class == 3 {
+            if let Some(expected_tid) = self.pending_tid {
+                if msg.transaction_id != expected_tid {
+                    return Ok(None); // stale/replayed response — drop
+                }
+            }
+        }
+
+        // RFC 8489 §9.2: verify MESSAGE-INTEGRITY on authenticated responses.
+        // 401/438 error responses are auth challenges — they never carry MI per spec.
+        // Indications (class 1) are not request/response transactions and are not signed.
+        let is_auth_challenge = msg.class == 3 && matches!(msg.error_code(), Some(401) | Some(438));
+        let is_indication = msg.class == 1;
+        if !is_auth_challenge && !is_indication {
+            if let Some(ref key) = self.lt_key.clone() {
+                if TurnMessage::verify_integrity(raw, key).is_err() {
+                    return Ok(None); // forged/invalid — drop silently
+                }
+            }
+        }
+
         match (msg.method, msg.class) {
             (METHOD_ALLOCATE, 2) => {
                 // Allocate Success.
@@ -993,6 +1029,18 @@ where
             }
             (METHOD_ALLOCATE, 3) => {
                 let code = msg.error_code().unwrap_or(0);
+                if code == 401 || code == 438 {
+                    // Cap auth attempts to prevent infinite retry loops (RFC 8489 §9.2).
+                    // Allow exactly one retry: the first 401 (to the unauthenticated request)
+                    // is expected; a second 401 (to the authenticated retry) means bad creds.
+                    if self.auth_attempts >= 1 {
+                        self.state = TurnState::Expired;
+                        return Err(IceError::CheckFailed(
+                            "TURN auth failed: too many retries".into(),
+                        ));
+                    }
+                    self.auth_attempts = self.auth_attempts.saturating_add(1);
+                }
                 if code == 401 {
                     if let Some(r) = msg.realm() {
                         self.realm = Some(r.to_owned());
@@ -1456,10 +1504,22 @@ pub mod sim_turn {
     }
 
     impl Inner {
+        #[allow(clippy::panic)]
         fn next_relay(&mut self) -> SocketAddr {
-            let p = self.next_relay_port;
-            self.next_relay_port = self.next_relay_port.wrapping_add(1).max(40_000);
-            SocketAddr::new(self.relay_ip, p)
+            loop {
+                let p = self.next_relay_port;
+                // Advance, clamping below 40_000 back up to 40_000 on wrap.
+                self.next_relay_port = self.next_relay_port.wrapping_add(1).max(40_000);
+                let addr = SocketAddr::new(self.relay_ip, p);
+                // Skip ports already allocated to active relay addresses.
+                if !self.allocations.values().any(|a| a.relay_addr == addr) {
+                    return addr;
+                }
+                // If next_relay_port wraps all the way back to current p, all ports exhausted.
+                if self.next_relay_port == p {
+                    panic!("SimTurnServer: relay port space exhausted");
+                }
+            }
         }
 
         fn process(&mut self, raw: &[u8], src: SocketAddr) {
@@ -1564,7 +1624,11 @@ pub mod sim_turn {
                     TurnAttr::Lifetime(600),
                 ],
             };
-            self.outbox.push_back((resp.encode(), src));
+            // Sign the success response with MESSAGE-INTEGRITY so the client can verify it.
+            let resp_bytes = resp
+                .encode_with_integrity(&lt_key)
+                .unwrap_or_else(|_| resp.encode());
+            self.outbox.push_back((resp_bytes, src));
         }
 
         fn do_refresh(&mut self, msg: &TurnMessage, src: SocketAddr) {
@@ -2060,15 +2124,20 @@ mod tests {
         client.send_refresh().unwrap();
         assert_eq!(client.state(), TurnState::Refreshing);
 
-        // Deliver success (from the server's internal inbox; we already consumed it above,
-        // so simulate the Refresh success directly).
+        // Deliver success (simulated directly since the server socket was consumed).
+        // Must use the actual pending_tid (set by send_refresh) so the TID check passes,
+        // and must sign with MESSAGE-INTEGRITY so the MI check passes.
+        let tid = client.pending_tid.unwrap();
+        let lt_key = client.lt_key.clone().unwrap();
         let refresh_success = TurnMessage {
             method: METHOD_REFRESH,
             class: 2,
-            transaction_id: [0u8; 12],
+            transaction_id: tid,
             attrs: vec![TurnAttr::Lifetime(600)],
         };
-        client.handle_incoming(&refresh_success.encode()).unwrap();
+        client
+            .handle_incoming(&refresh_success.encode_with_integrity(&lt_key).unwrap())
+            .unwrap();
         assert_eq!(client.state(), TurnState::Allocated);
     }
 
@@ -2202,6 +2271,181 @@ mod tests {
         assert!(
             sel.standby.is_none(),
             "r2 is far from r1, no standby expected"
+        );
+    }
+
+    // ─── Fix 6: Security regression tests ────────────────────────────────────
+
+    /// A forged Allocate Success (no MESSAGE-INTEGRITY, or wrong key) must be dropped
+    /// when lt_key is set (i.e. after the initial 401 challenge has derived the key).
+    #[test]
+    fn forged_allocate_success_rejected() {
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let server_addr = ipv4(10, 0, 0, 254, 33478);
+        let client_addr = ipv4(127, 0, 0, 1, 35001);
+        let sock = net.create_socket(NatType::FullCone, client_addr).unwrap();
+        let cfg = TurnConfig {
+            server_addr,
+            username: "u".into(),
+            password: "p".into(),
+            lifetime_secs: 600,
+        };
+        let mut client = TurnClient::new(cfg, sock, FixedClock(0), OsRng);
+
+        // Manually set lt_key (simulates having completed the 401 exchange).
+        client.lt_key = Some(long_term_key("u", "streamhaul.test", "p"));
+        client.state = TurnState::AllocatingAuthenticated;
+        let pending = [0xAAu8; 12];
+        client.pending_tid = Some(pending);
+
+        // Craft a forged Allocate Success with matching TID but NO MESSAGE-INTEGRITY.
+        let forged = TurnMessage {
+            method: METHOD_ALLOCATE,
+            class: 2,
+            transaction_id: pending,
+            attrs: vec![TurnAttr::XorRelayedAddress(ipv4(10, 0, 0, 254, 50000))],
+        };
+        let _ = client.handle_incoming(&forged.encode());
+
+        // Must be dropped: state stays AllocatingAuthenticated, relay_addr stays None.
+        assert_eq!(
+            client.state(),
+            TurnState::AllocatingAuthenticated,
+            "forged Allocate Success must not change state"
+        );
+        assert!(
+            client.relay_addr().is_none(),
+            "forged Allocate Success must not set relay_addr"
+        );
+    }
+
+    /// Appending an attribute after the MESSAGE-INTEGRITY must be rejected.
+    #[test]
+    fn turn_mi_trailing_attr_injection_blocked() {
+        let key = long_term_key("u", "r", "p");
+        let msg = TurnMessage {
+            method: METHOD_ALLOCATE,
+            class: 2,
+            transaction_id: [1u8; 12],
+            attrs: vec![TurnAttr::Lifetime(600)],
+        };
+        let mut legit = msg.encode_with_integrity(&key).unwrap();
+
+        // Append a spurious LIFETIME attribute after the MI — this is the injection.
+        // LIFETIME TLV: type=0x000D, len=0x0004, value=0x00000258 (=600)
+        let trailing: &[u8] = &[0x00, 0x0D, 0x00, 0x04, 0x00, 0x00, 0x02, 0x58];
+        let orig_len = u16::from_be_bytes([legit[2], legit[3]]);
+        #[allow(clippy::cast_possible_truncation)]
+        let new_len = orig_len + trailing.len() as u16;
+        legit[2] = (new_len >> 8) as u8;
+        legit[3] = (new_len & 0xFF) as u8;
+        legit.extend_from_slice(trailing);
+
+        assert!(
+            TurnMessage::verify_integrity(&legit, &key).is_err(),
+            "trailing attribute after MI must be rejected"
+        );
+    }
+
+    /// A response with a mismatched transaction ID must be silently dropped.
+    #[test]
+    fn turn_tid_mismatch_dropped() {
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let server_addr = ipv4(10, 0, 0, 254, 33479);
+        let client_addr = ipv4(127, 0, 0, 1, 35002);
+        let sock = net.create_socket(NatType::FullCone, client_addr).unwrap();
+        let cfg = TurnConfig {
+            server_addr,
+            username: "u".into(),
+            password: "p".into(),
+            lifetime_secs: 600,
+        };
+        let mut client = TurnClient::new(cfg, sock, FixedClock(0), OsRng);
+        client.state = TurnState::AllocatingAuthenticated;
+        client.pending_tid = Some([0xBBu8; 12]);
+
+        // Send a response with a DIFFERENT transaction ID.
+        let stale = TurnMessage {
+            method: METHOD_ALLOCATE,
+            class: 2,
+            transaction_id: [0xCCu8; 12], // wrong TID
+            attrs: vec![TurnAttr::XorRelayedAddress(ipv4(10, 0, 0, 254, 50001))],
+        };
+        let _ = client.handle_incoming(&stale.encode());
+
+        assert_eq!(
+            client.state(),
+            TurnState::AllocatingAuthenticated,
+            "stale TID must not change state"
+        );
+        assert!(
+            client.relay_addr().is_none(),
+            "stale TID must not set relay_addr"
+        );
+    }
+
+    /// After two 401 responses the client must enter Expired and stop retrying.
+    #[test]
+    fn turn_repeated_401_bounded() {
+        let net = NatSimNetwork::new("10.0.0.254".parse().unwrap());
+        let server_addr = ipv4(10, 0, 0, 254, 33480);
+        let client_addr = ipv4(127, 0, 0, 1, 35003);
+        let sock = net.create_socket(NatType::FullCone, client_addr).unwrap();
+        let cfg = TurnConfig {
+            server_addr,
+            username: "u".into(),
+            password: "p".into(),
+            lifetime_secs: 600,
+        };
+        let mut client = TurnClient::new(cfg, sock, FixedClock(0), OsRng);
+        client.state = TurnState::Allocating;
+        let tid = [0x01u8; 12];
+        client.pending_tid = Some(tid);
+
+        // First 401: normal — client derives key, sends authenticated Allocate.
+        let challenge = TurnMessage {
+            method: METHOD_ALLOCATE,
+            class: 3,
+            transaction_id: tid,
+            attrs: vec![
+                TurnAttr::ErrorCode {
+                    code: 401,
+                    reason: "Unauthorized".into(),
+                },
+                TurnAttr::Realm("streamhaul.test".into()),
+                TurnAttr::Nonce(b"nonce1".to_vec()),
+            ],
+        };
+        let r1 = client.handle_incoming(&challenge.encode());
+        assert!(r1.is_ok(), "first 401 should be processed: {r1:?}");
+
+        // After the first 401 the client sent an authenticated Allocate; grab the new TID.
+        let tid2 = client.pending_tid.unwrap_or([0x02u8; 12]);
+
+        // Second 401: should hit the cap and return Err.
+        let challenge2 = TurnMessage {
+            method: METHOD_ALLOCATE,
+            class: 3,
+            transaction_id: tid2,
+            attrs: vec![
+                TurnAttr::ErrorCode {
+                    code: 401,
+                    reason: "Unauthorized".into(),
+                },
+                TurnAttr::Realm("streamhaul.test".into()),
+                TurnAttr::Nonce(b"nonce2".to_vec()),
+            ],
+        };
+        let r2 = client.handle_incoming(&challenge2.encode());
+        assert!(
+            r2.is_err() || client.state() == TurnState::Expired,
+            "second 401 should hit auth cap: state={:?} result={r2:?}",
+            client.state()
+        );
+        assert_eq!(
+            client.state(),
+            TurnState::Expired,
+            "state must be Expired after auth cap"
         );
     }
 }
