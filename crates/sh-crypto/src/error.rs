@@ -169,4 +169,36 @@ pub enum CryptoError {
         /// Description of the parse failure. No secret bytes.
         reason: &'static str,
     },
+
+    // ── P3-5: authorization / UGC ──────────────────────────────────────────────
+    /// A received UGC is structurally invalid (bad domain tag, bad length, trailing garbage, etc.).
+    #[error("malformed UGC: {reason}")]
+    MalformedUgc {
+        /// Human-readable description (no secret bytes).
+        reason: &'static str,
+    },
+
+    /// The UGC signature did not verify against the pinned host identity.
+    ///
+    /// Treat as a forgery attempt. Do not log the UGC payload.
+    #[error("UGC signature verification failed")]
+    UgcBadSignature,
+
+    /// The UGC's GRANTEE_DEVICE_ID does not match the authenticated peer identity.
+    ///
+    /// This blocks stolen-UGC replay: a valid UGC for device A is useless to device B
+    /// because it cannot become the authenticated Noise peer_identity without A's key.
+    #[error("UGC grantee does not match authenticated peer identity")]
+    UgcWrongGrantee,
+
+    /// The UGC has expired or its ISSUED_AT is in the future.
+    #[error("UGC is expired or not yet valid")]
+    UgcExpired,
+
+    /// The UGC's epoch is below the host's minimum-epoch floor (revoked).
+    ///
+    /// The host operator has bumped `min_epoch` above this UGC's epoch. A re-issued UGC
+    /// with a higher epoch is required for unattended access.
+    #[error("UGC epoch is below the minimum-epoch floor (revoked)")]
+    UgcRevoked,
 }

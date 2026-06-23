@@ -33,7 +33,10 @@ rust-version = "1.82"
 [workspace.dependencies]
 thiserror = "2"
 proptest = "1"
-bitflags = "2"
+# bitflags 2.13.0: exact-pinned per security-dep policy (CLAUDE.md §7) — bitflags
+# is the backing type for the Capabilities mask; a silent upgrade could change
+# bit semantics. Pinned to match the version already resolved in Cargo.lock.
+bitflags = "=2.13.0"
 bytes = "1"
 tokio = { version = "1", features = ["net", "rt", "sync"] }
 tracing = "0.1"

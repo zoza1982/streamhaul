@@ -15,9 +15,13 @@ sh-types = { path = "../sh-types" }
 sh-media = { path = "../sh-media" }
 sh-transport = { path = "../sh-transport" }
 sh-protocol = { path = "../sh-protocol" }
+sh-crypto = { path = "../sh-crypto" }
 bytes.workspace = true
 tokio = { version = "1", features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 thiserror.workspace = true
+bitflags.workspace = true
+sha2.workspace = true
+subtle.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"], optional = true }
 sh-codec-hw = { path = "../sh-codec-hw", optional = true }
 sh-input = { path = "../sh-input", optional = true }
@@ -27,6 +31,9 @@ sh-transport = { path = "../sh-transport", features = ["insecure-lan"] }
 sh-media = { path = "../sh-media" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 proptest.workspace = true
+rand_core.workspace = true
+rand_chacha = "=0.3.1"
+x25519-dalek.workspace = true
 
 [[test]]
 name = "loopback_harness"

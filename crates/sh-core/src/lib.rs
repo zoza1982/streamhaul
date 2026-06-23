@@ -6,8 +6,14 @@
 //! - [`run_loopback_harness`] — Phase-0 video one-way latency (unreliable datagrams).
 //! - [`run_input_rtt_harness`] — Phase-1 input round-trip latency (reliable Input channel).
 
+pub mod authz;
 pub mod packetize;
 pub mod pipeline;
+
+pub use authz::{
+    Capabilities, Denied, FreshPresence, InMemoryMinEpochStore, MinEpochStore, PrivilegedAction,
+    SessionAuthorizer, Ugc,
+};
 
 #[cfg(feature = "harness")]
 pub mod harness;

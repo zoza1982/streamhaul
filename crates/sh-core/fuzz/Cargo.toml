@@ -12,14 +12,33 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+bytes = "1"
+rand_chacha = "0.3"
+tokio = { version = "1", features = ["rt"] }
 
 [dependencies.sh-core]
 path = ".."
-features = ["harness"]
+
+[dependencies.sh-crypto]
+path = "../../sh-crypto"
 
 [[bin]]
 name = "fuzz_reassembler_ingest"
 path = "fuzz_targets/fuzz_reassembler_ingest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ugc_decode"
+path = "fuzz_targets/ugc_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ugc_verify"
+path = "fuzz_targets/ugc_verify.rs"
 test = false
 doc = false
 bench = false
