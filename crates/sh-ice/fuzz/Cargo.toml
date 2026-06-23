@@ -20,4 +20,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "turn_decode"
+path = "fuzz_targets/turn_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

@@ -89,6 +89,11 @@ sha1 = { version = "=0.10.6", default-features = false, features = ["std"] }
 # Exact-pinned per CLAUDE.md §7.
 crc32fast = { version = "=1.4.2", default-features = false }
 
+# md-5 0.10.6: MD5 used exclusively to derive the RFC 8489 §9.2 TURN long-term credential key
+# (MD5(username:realm:password)).  This is mandated by the STUN/TURN RFCs; MD5 is NOT used for
+# any security-sensitive comparison.  Exact-pinned per CLAUDE.md §7.
+"md-5" = { version = "=0.10.6", default-features = false }
+
 # base64 0.22.1: standard base64 encoding for TURN credential password (sh-ice, P4-2).
 # Exact-pinned per CLAUDE.md §7.
 base64 = { version = "=0.22.1", default-features = false, features = ["std"] }
