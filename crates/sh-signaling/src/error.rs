@@ -40,8 +40,8 @@ pub enum SignalingError {
         available: usize,
     },
 
-    /// A fingerprint field in the envelope header is not valid 64-character ASCII hex.
-    #[error("invalid fingerprint: must be 64 ASCII hex characters")]
+    /// A fingerprint field in the envelope header is not valid 64-character lowercase hex.
+    #[error("invalid fingerprint: must be 64 lowercase hex characters [0-9a-f]")]
     InvalidFingerprint,
 
     /// An underlying WebSocket protocol error.
@@ -72,7 +72,7 @@ pub enum SignalingError {
     ///
     /// This is a spoof-rejection: the server assigns each connection a single `from_fp` on
     /// `Hello` and rejects any subsequent message with a different `from_fp`.
-    #[error("fingerprint mismatch: registered {registered}, attempted {attempted}")]
+    #[error("fingerprint mismatch")]
     FingerprintSpoofAttempt {
         /// The fingerprint the server recorded when the client sent `Hello`.
         registered: String,
@@ -84,6 +84,13 @@ pub enum SignalingError {
     #[error("session table full (max {max} sessions)")]
     SessionTableFull {
         /// Maximum number of concurrent sessions supported.
+        max: usize,
+    },
+
+    /// A session has reached the maximum number of registered peers.
+    #[error("session full (max {max} peers)")]
+    SessionFull {
+        /// Maximum number of peers per session.
         max: usize,
     },
 
@@ -101,6 +108,14 @@ pub enum SignalingError {
     /// A WebSocket message arrived with an unexpected type (e.g., Text when Binary expected).
     #[error("unexpected WebSocket message type")]
     UnexpectedMessageType,
+
+    /// A connection tried to send a second `Hello` on an already-registered connection.
+    #[error("connection already registered")]
+    AlreadyRegistered,
+
+    /// The peer's fingerprint was not accepted by the server's authenticator.
+    #[error("authentication failed")]
+    AuthenticationFailed,
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for SignalingError {

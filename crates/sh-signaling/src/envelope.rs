@@ -160,13 +160,12 @@ pub struct SignalingEnvelope {
     pub payload: Bytes,
 }
 
-/// Validates that a fingerprint string is exactly 64 ASCII characters.
+/// Validates that a fingerprint string is exactly 64 lowercase hex characters `[0-9a-f]`.
 ///
-/// We do not validate hex content here because the relay does not interpret fingerprints
-/// beyond using them as routing keys. Full validation (hex chars, valid public key) is
-/// the caller's responsibility before constructing a `DeviceIdentity`.
+/// Uppercase hex, NUL bytes, and non-hex ASCII are all rejected. This ensures fingerprints
+/// used as routing keys are in a canonical form and cannot be trivially confused via case.
 fn validate_fp(fp: &str) -> Result<(), SignalingError> {
-    if fp.len() != FP_LEN || !fp.is_ascii() {
+    if fp.len() != FP_LEN || !fp.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
         return Err(SignalingError::InvalidFingerprint);
     }
     Ok(())
@@ -217,7 +216,7 @@ pub fn encode(env: &SignalingEnvelope) -> Result<Bytes, SignalingError> {
 /// Decode a [`SignalingEnvelope`] from raw bytes.
 ///
 /// Treats the input as hostile: checks bounds at every step, rejects unknown kind bytes,
-/// oversized payloads, and non-ASCII fingerprints. Never panics.
+/// oversized payloads, and non-lowercase-hex fingerprints. Never panics.
 ///
 /// # Errors
 ///
@@ -225,7 +224,7 @@ pub fn encode(env: &SignalingEnvelope) -> Result<Bytes, SignalingError> {
 /// - [`SignalingError::UnknownMessageKind`] — kind byte not in 0–6
 /// - [`SignalingError::PayloadTooLarge`] — declared `payload_len > MAX_PAYLOAD_LEN`
 /// - [`SignalingError::TruncatedPayload`] — buf is shorter than header + `payload_len`
-/// - [`SignalingError::InvalidFingerprint`] — fingerprint bytes are not valid ASCII
+/// - [`SignalingError::InvalidFingerprint`] — fingerprint bytes are not valid lowercase hex `[0-9a-f]`
 pub fn decode(buf: &[u8]) -> Result<SignalingEnvelope, SignalingError> {
     if buf.len() < ENVELOPE_HEADER_LEN {
         return Err(SignalingError::EnvelopeTooShort { actual: buf.len() });
@@ -449,5 +448,37 @@ mod tests {
         let _ = fuzz_decode_envelope(&[0xFF; 200]);
         let _ = fuzz_decode_envelope(&[]);
         let _ = fuzz_decode_envelope(b"garbage");
+    }
+
+    #[test]
+    fn validate_fp_rejects_uppercase_hex() {
+        // 'A'..='F' are not in the allowed set [0-9a-f].
+        let env = make_env(MessageKind::Hello, b"");
+        let mut bad_env = env.clone();
+        bad_env.from_fp = "A".repeat(64); // uppercase — rejected
+        let err = encode(&bad_env).unwrap_err();
+        assert!(matches!(err, SignalingError::InvalidFingerprint));
+    }
+
+    #[test]
+    fn validate_fp_rejects_nul_bytes() {
+        // Build a 149-byte buffer with NUL in the from_fp field.
+        let env = make_env(MessageKind::Hello, b"");
+        let mut encoded = encode(&env).unwrap().to_vec();
+        // Overwrite first byte of from_fp (offset 17) with NUL.
+        encoded[FROM_FP_OFFSET] = 0x00;
+        let err = decode(&encoded).unwrap_err();
+        assert!(matches!(err, SignalingError::InvalidFingerprint));
+    }
+
+    #[test]
+    fn validate_fp_accepts_lowercase_hex() {
+        // '0'-'9' and 'a'-'f' are all valid; 'a' and 'b' (used in make_fp) should pass.
+        let env = make_env(MessageKind::Hello, b"");
+        assert!(encode(&env).is_ok());
+        // Check boundary: '0' and 'f' are valid.
+        let mut boundary = env.clone();
+        boundary.from_fp = format!("{}{}", "0".repeat(32), "f".repeat(32));
+        assert!(encode(&boundary).is_ok());
     }
 }

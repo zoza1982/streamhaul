@@ -12,21 +12,32 @@
 //!
 //! ## Graceful shutdown
 //!
-//! Call [`close`](SignalingClient::close) to send a `Bye` envelope and close the connection.
+//! Call [`close`](SignalingClient::close) to close the connection cleanly. The server's
+//! disconnect handler will send a synthetic `Bye` to the remaining peer.
 //! [`recv`](SignalingClient::recv) returns `Ok(None)` when a `Bye` is received from the peer
 //! or when the connection is closed cleanly.
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::connect_async_with_config;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
 use crate::backoff::BackoffStrategy;
-use crate::envelope::{self, MessageKind, SessionId, SignalingEnvelope};
+use crate::envelope::{
+    self, MessageKind, SessionId, SignalingEnvelope, ENVELOPE_HEADER_LEN, MAX_PAYLOAD_LEN,
+};
 use crate::error::SignalingError;
 
-/// Type alias for the WS stream returned by `connect_async` over TCP.
+/// Maximum WebSocket message/frame size used by the client.
+///
+/// Pre-computed to avoid arithmetic at runtime and to satisfy the `arithmetic_side_effects` lint.
+/// Equals `ENVELOPE_HEADER_LEN + MAX_PAYLOAD_LEN` (149 + 65536 = 65685).
+const MAX_WS_MESSAGE_SIZE: usize = ENVELOPE_HEADER_LEN + MAX_PAYLOAD_LEN as usize;
+
+/// Type alias for the WS stream returned by `connect_async_with_config` over TCP.
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// A connected signaling client.
@@ -65,7 +76,7 @@ impl SignalingClient {
     ///
     /// - `url` — WebSocket URL of the signaling server (e.g. `ws://127.0.0.1:8765`).
     /// - `session_id` — The session this client belongs to.
-    /// - `my_fp` — This client's fingerprint (64-char hex); used as `from_fp` in `Hello`.
+    /// - `my_fp` — This client's fingerprint (64-char lowercase hex); used as `from_fp` in `Hello`.
     /// - `backoff` — Reconnect delay strategy.
     ///
     /// # Errors
@@ -136,7 +147,7 @@ impl SignalingClient {
                         Ok(ws) => {
                             self.ws = ws;
                             self.backoff.reset();
-                            // Skip the Hello ack from the server and continue reading.
+                            // Hello ack was consumed in try_connect; loop to read next message.
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -157,12 +168,11 @@ impl SignalingClient {
                             self.backoff.reset();
                             continue;
                         }
-                        Err(_) => return Err(SignalingError::NotConnected),
+                        Err(e) => return Err(e),
                     }
                 }
                 Some(Ok(Message::Binary(bytes))) => {
                     let env = envelope::decode(&bytes)?;
-                    // The server's Hello ack confirms registration — surface it to the caller.
                     if env.kind == MessageKind::Bye {
                         return Ok(None);
                     }
@@ -185,24 +195,18 @@ impl SignalingClient {
         }
     }
 
-    /// Sends a `Bye` envelope and closes the WebSocket connection.
+    /// Closes the WebSocket connection cleanly.
+    ///
+    /// Closing the socket triggers the server's disconnect handler, which sends a synthetic
+    /// `Bye` to the remaining peer in the session. Callers do not need to send an explicit
+    /// `Bye` envelope; the server handles peer notification automatically.
     ///
     /// # Errors
     ///
-    /// Returns [`SignalingError::WebSocket`] if the send or close fails. The connection is
+    /// Returns [`SignalingError::WebSocket`] if the close handshake fails. The connection is
     /// considered closed regardless of the error.
     pub async fn close(mut self) -> Result<(), SignalingError> {
-        let bye = SignalingEnvelope {
-            kind: MessageKind::Bye,
-            session_id: self.session_id,
-            from_fp: self.my_fp.clone(),
-            to_fp: self.my_fp.clone(), // server uses from_fp for routing
-            payload: Bytes::new(),
-        };
-        // Best-effort Bye send; ignore errors.
-        if let Ok(encoded) = envelope::encode(&bye) {
-            let _ = self.ws.send(Message::Binary(encoded.to_vec())).await;
-        }
+        // Closing the socket triggers the server's disconnect-Bye to the remaining peer.
         self.ws.close(None).await?;
         Ok(())
     }
@@ -238,13 +242,21 @@ async fn connect_with_retry(
     }
 }
 
-/// Single connection attempt: TCP + WS upgrade + `Hello` send.
+/// Single connection attempt: TCP + WS upgrade + `Hello` send + Hello ack consume.
+///
+/// Consuming the Hello ack here ensures that after reconnect, the first message returned
+/// by [`SignalingClient::recv`] is a real application message, not a spurious Hello ack.
 async fn try_connect(
     url: &str,
     session_id: &SessionId,
     my_fp: &str,
 ) -> Result<WsStream, SignalingError> {
-    let (mut ws, _response) = connect_async(url).await?;
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_WS_MESSAGE_SIZE),
+        max_frame_size: Some(MAX_WS_MESSAGE_SIZE),
+        ..Default::default()
+    };
+    let (mut ws, _response) = connect_async_with_config(url, Some(ws_config), false).await?;
 
     // Send Hello to register this peer in the session.
     // `to_fp` is all-zeros for Hello; the server ignores it.
@@ -258,6 +270,29 @@ async fn try_connect(
     let encoded = envelope::encode(&hello)?;
     ws.send(Message::Binary(encoded.to_vec())).await?;
 
-    debug!(url = %url, "Hello sent");
+    // Consume the server's Hello ack so post-reconnect recv() doesn't surface it.
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let env = envelope::decode(&bytes)?;
+                if env.kind == MessageKind::Hello {
+                    // Ack consumed; connection is registered and ready.
+                    break;
+                }
+                // Any other message before the ack is unexpected.
+                return Err(SignalingError::UnexpectedMessageType);
+            }
+            Some(Ok(Message::Ping(data))) => {
+                ws.send(Message::Pong(data)).await?;
+            }
+            Some(Ok(_)) => {
+                return Err(SignalingError::UnexpectedMessageType);
+            }
+            Some(Err(e)) => return Err(SignalingError::from(e)),
+            None => return Err(SignalingError::NotConnected),
+        }
+    }
+
+    debug!(url = %url, "Hello sent and acked");
     Ok(ws)
 }

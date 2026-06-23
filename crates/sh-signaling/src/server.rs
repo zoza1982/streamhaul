@@ -22,6 +22,16 @@
 //! - When a peer disconnects → remove from registry; if the other peer is still connected,
 //!   send it a synthetic `Bye`.
 //! - `MAX_SESSIONS` caps the number of concurrent sessions to prevent resource exhaustion.
+//! - `MAX_CONNECTIONS` caps the number of concurrent WS connections (including pre-Hello).
+//!
+//! ## Security limitations
+//!
+//! - Until R-SIG-AUTH lands, `from_fp` is NOT bound to a verified identity. With `AcceptAll`
+//!   (test-only), any peer can claim any fingerprint. Production deployments MUST supply a
+//!   real [`PeerAuthenticator`] that ties the `from_fp` to a cryptographically verified identity.
+//! - Plain-WS signaling is vulnerable to MITM (candidate injection, session interference).
+//!   End-to-end integrity depends on P4-5 BindCert/DTLS-fingerprint binding which P4-1 does
+//!   NOT provide.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,20 +40,43 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
-use tokio_tungstenite::accept_async;
+use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::time::{timeout, Duration};
+use tokio_tungstenite::accept_async_with_config;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::auth::PeerAuthenticator;
-use crate::envelope::{self, MessageKind, SessionId, SignalingEnvelope};
+use crate::envelope::{
+    self, MessageKind, SessionId, SignalingEnvelope, ENVELOPE_HEADER_LEN, MAX_PAYLOAD_LEN,
+};
 use crate::error::SignalingError;
 
 /// Maximum number of concurrent sessions the server will track.
 ///
-/// Each session holds up to two peers. When this limit is reached, new `Hello` messages
-/// that would start a new session are rejected with [`SignalingError::SessionTableFull`].
+/// Each session holds up to [`MAX_PEERS_PER_SESSION`] peers. When this limit is reached, new
+/// `Hello` messages that would start a new session are rejected with
+/// [`SignalingError::SessionTableFull`].
 pub const MAX_SESSIONS: usize = 10_000;
+
+/// Maximum number of peers per session (host + one guest = 2).
+pub const MAX_PEERS_PER_SESSION: usize = 2;
+
+/// Maximum number of concurrent WebSocket connections (including pre-Hello).
+pub const MAX_CONNECTIONS: usize = 20_000;
+
+/// Timeout for the WebSocket handshake (TLS/HTTP upgrade).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for receiving the first Hello after WS handshake completes.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum WebSocket message/frame size accepted by the server.
+///
+/// Pre-computed to avoid arithmetic at runtime and to satisfy the `arithmetic_side_effects` lint.
+/// Equals `ENVELOPE_HEADER_LEN + MAX_PAYLOAD_LEN` (149 + 65536 = 65685).
+const MAX_WS_MESSAGE_SIZE: usize = ENVELOPE_HEADER_LEN + MAX_PAYLOAD_LEN as usize;
 
 /// Sender half for routing envelopes to a connected peer.
 type PeerTx = mpsc::Sender<SignalingEnvelope>;
@@ -57,6 +90,12 @@ type SessionRegistry = HashMap<SessionId, HashMap<String, PeerTx>>;
 ///
 /// The server routes [`SignalingEnvelope`] messages between peers using only `session_id`
 /// and `to_fp`. It never inspects the payload (zero-knowledge relay, LLD §6.3).
+///
+/// # Security
+///
+/// See the [module-level documentation](self) for current security limitations. Until
+/// R-SIG-AUTH and P4-5 are implemented, `from_fp` is not verified and plain-WS connections
+/// are susceptible to MITM in the signaling layer.
 ///
 /// # Examples
 ///
@@ -118,15 +157,25 @@ impl SignalingServer {
     pub async fn run(self) -> Result<(), SignalingError> {
         let registry: Arc<RwLock<SessionRegistry>> = Arc::new(RwLock::new(HashMap::new()));
         let auth = self.auth;
+        let conn_semaphore: Arc<Semaphore> = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
         loop {
             let (stream, peer_addr) = self.listener.accept().await?;
             debug!(peer = %peer_addr, "new TCP connection");
 
+            let permit = match conn_semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!("connection limit reached, dropping new connection");
+                    continue;
+                }
+            };
+
             let registry = Arc::clone(&registry);
             let auth = Arc::clone(&auth);
 
             tokio::spawn(async move {
+                let _permit = permit; // released on drop
                 if let Err(e) = handle_connection(stream, registry, auth).await {
                     warn!(error = %e, "connection handler error");
                 }
@@ -141,7 +190,24 @@ async fn handle_connection(
     registry: Arc<RwLock<SessionRegistry>>,
     auth: Arc<dyn PeerAuthenticator>,
 ) -> Result<(), SignalingError> {
-    let ws = accept_async(stream).await?;
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(MAX_WS_MESSAGE_SIZE),
+        max_frame_size: Some(MAX_WS_MESSAGE_SIZE),
+        ..Default::default()
+    };
+
+    let ws = timeout(
+        HANDSHAKE_TIMEOUT,
+        accept_async_with_config(stream, Some(ws_config)),
+    )
+    .await
+    .map_err(|_| {
+        SignalingError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "WS handshake timeout",
+        ))
+    })??;
+
     let (mut ws_sink, mut ws_stream) = ws.split();
 
     // Channel for inbound routed envelopes (other peers routing to this connection).
@@ -152,6 +218,11 @@ async fn handle_connection(
     let mut registered_session: Option<SessionId> = None;
     // Whether to exit the loop on the next iteration.
     let mut should_exit = false;
+
+    // Hello idle timeout: close the connection if no Hello is received within the deadline.
+    let hello_deadline = tokio::time::sleep(HELLO_TIMEOUT);
+    tokio::pin!(hello_deadline);
+    let mut hello_received = false;
 
     loop {
         if should_exit {
@@ -180,6 +251,11 @@ async fn handle_connection(
                             &tx,
                         ).await;
 
+                        // Update hello_received after a successful message dispatch.
+                        if registered_fp.is_some() {
+                            hello_received = true;
+                        }
+
                         match result {
                             Ok(Some(reply)) => {
                                 // Encode and send the reply.
@@ -197,16 +273,27 @@ async fn handle_connection(
                             }
                             Ok(None) => {} // normal, no reply needed
                             Err(e) => {
-                                // Send an error envelope back.
+                                // Sanitise the error reason before sending to the client.
+                                // FingerprintSpoofAttempt must never leak the registered fp on the wire.
+                                let reason = match &e {
+                                    SignalingError::FingerprintSpoofAttempt { .. } => {
+                                        "fingerprint mismatch".to_owned()
+                                    }
+                                    _ => e.to_string(),
+                                };
                                 let err_env = make_error_envelope(
                                     registered_session,
                                     registered_fp.as_deref().unwrap_or(""),
-                                    &e.to_string(),
+                                    &reason,
                                 );
                                 if let Ok(encoded) = envelope::encode(&err_env) {
                                     let _ = ws_sink.send(Message::Binary(encoded.to_vec())).await;
                                 }
-                                if matches!(e, SignalingError::FingerprintSpoofAttempt { .. }) {
+                                if matches!(
+                                    e,
+                                    SignalingError::FingerprintSpoofAttempt { .. }
+                                        | SignalingError::AuthenticationFailed
+                                ) {
                                     should_exit = true;
                                 }
                             }
@@ -250,6 +337,12 @@ async fn handle_connection(
                         }
                     }
                 }
+            }
+
+            // Idle/Hello timeout: close if no Hello received within the deadline.
+            _ = &mut hello_deadline, if !hello_received => {
+                warn!("no Hello received within timeout, dropping connection");
+                should_exit = true;
             }
         }
     }
@@ -327,10 +420,13 @@ async fn handle_message(
         MessageKind::Offer
         | MessageKind::Answer
         | MessageKind::Candidate
-        | MessageKind::EndOfCandidates
-        | MessageKind::Error => {
+        | MessageKind::EndOfCandidates => {
             forward_to_peer(&env, registry).await?;
             Ok(None)
+        }
+        MessageKind::Error => {
+            // Error is server→client only; a client sending Error is a protocol violation.
+            Err(SignalingError::UnexpectedMessageType)
         }
     }
 }
@@ -344,12 +440,14 @@ async fn handle_hello(
     auth: &Arc<dyn PeerAuthenticator>,
     tx: &PeerTx,
 ) -> Result<Option<SignalingEnvelope>, SignalingError> {
+    // Reject a second Hello on an already-registered connection.
+    if registered_fp.is_some() {
+        return Err(SignalingError::AlreadyRegistered);
+    }
+
     // Authenticate the peer.
     if !auth.authenticate(&env.from_fp) {
-        return Err(SignalingError::FingerprintSpoofAttempt {
-            registered: String::new(),
-            attempted: env.from_fp.clone(),
-        });
+        return Err(SignalingError::AuthenticationFailed);
     }
 
     {
@@ -361,6 +459,14 @@ async fn handle_hello(
         }
 
         let session = reg.entry(env.session_id).or_insert_with(HashMap::new);
+
+        // Enforce per-session peer cap.
+        if session.len() >= MAX_PEERS_PER_SESSION && !session.contains_key(&env.from_fp) {
+            return Err(SignalingError::SessionFull {
+                max: MAX_PEERS_PER_SESSION,
+            });
+        }
+
         // Register (or replace) this peer's sender.
         session.insert(env.from_fp.clone(), tx.clone());
     }
@@ -404,10 +510,9 @@ async fn forward_to_peer(
             .clone()
     };
 
-    // send() is async; a closed receiver means the peer disconnected.
+    // Use try_send to avoid blocking the server task on a slow or unresponsive peer.
     peer_tx
-        .send(env.clone())
-        .await
+        .try_send(env.clone())
         .map_err(|_| SignalingError::PeerNotFound {
             fp: env.to_fp.clone(),
         })?;
@@ -427,7 +532,7 @@ fn make_error_envelope(
     let payload_end = payload_bytes
         .len()
         .min(crate::envelope::MAX_PAYLOAD_LEN as usize);
-    // SAFETY: payload_end is computed with .min() so it is always <= payload_bytes.len().
+    // Note: payload_end is computed with .min() so it is always <= payload_bytes.len().
     let payload_slice = if payload_end > 0 {
         payload_bytes.get(..payload_end).unwrap_or(b"error")
     } else {

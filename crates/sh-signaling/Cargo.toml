@@ -21,8 +21,6 @@ async-trait.workspace = true
 sh-crypto = { path = "../sh-crypto" }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake", "connect", "stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-dashmap = { version = "6", default-features = false }
-
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }

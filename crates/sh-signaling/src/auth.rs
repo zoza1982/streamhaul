@@ -15,6 +15,14 @@
 //! active. Integration tests use these types to start an unauthenticated signaling server on
 //! loopback.
 
+// Prevent `insecure-lan` from being compiled into release builds.
+// This feature skips all peer authentication and exists solely for local integration tests.
+#[cfg(all(feature = "insecure-lan", not(debug_assertions)))]
+compile_error!(
+    "`insecure-lan` must not be enabled in release builds. \
+     This feature skips all peer authentication and is for local integration tests only."
+);
+
 /// Decides whether a connecting peer (identified by its fingerprint) is allowed to register.
 ///
 /// The server calls this once per `Hello` envelope. Returning `false` causes the connection to
