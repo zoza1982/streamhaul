@@ -1616,6 +1616,7 @@ dependencies = [
 name = "sh-core"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "bitflags",
  "bytes",
  "proptest",
@@ -1624,12 +1625,15 @@ dependencies = [
  "rand_core 0.6.4",
  "sh-codec-hw",
  "sh-crypto",
+ "sh-ice",
  "sh-input",
  "sh-media",
  "sh-protocol",
+ "sh-signaling",
  "sh-transport",
  "sh-types",
  "sha2",
+ "str0m",
  "subtle",
  "thiserror 2.0.18",
  "tokio",

@@ -19,6 +19,7 @@ mod control;
 mod error;
 mod feedback;
 mod input;
+pub mod transport_caps;
 mod video;
 
 pub use common::{CommonHeader, Flags};
@@ -26,6 +27,10 @@ pub use control::{decode_control, encode_control, ControlFrame, CONTROL_HEADER_L
 pub use error::ProtocolError;
 pub use feedback::{NackFeedback, MAX_CUMULATIVE_LOST, NACK_FEEDBACK_LEN};
 pub use input::{EventType, InputEvent, Modifiers};
+pub use transport_caps::{
+    decode_transport_caps, encode_transport_caps, negotiate, NegotiationError, TransportCaps,
+    KIND_TRANSPORT_CAPS_ANSWER, KIND_TRANSPORT_CAPS_OFFER, TRANSPORT_CAPS_LEN,
+};
 pub use video::{Codec, FrameType, Priority, VideoHeader};
 
 /// Current SHP protocol version, carried in the top two bits of byte 0 of every packet.
