@@ -28,7 +28,7 @@ completes a task (one task ≈ one PR). It is the source of truth for "what's do
 | **P2** | Adaptivity (Game/Work) | Smooth adapt under loss/bandwidth caps; mode switch no flapping; loss recovery works | 🟡 |
 | **P3** | Security & pairing | First-pair TOFU pins key; unpinned MITM rejected; all channels E2E; rotation tested | 🟡 |
 | **P4** | Connectivity (WebRTC+relay) | Connects across symmetric NAT via relay; relay carries only opaque ciphertext | ✅ |
-| **P5** | Browser client | Chrome/FF/Safari view+control via H.264; same signaling/relay path | ☐ |
+| **P5** | Browser client | Chrome/FF/Safari view+control via H.264; same signaling/relay path | 🟡 |
 | **P6** | Cross-OS hosts | macOS + Linux hosts zero-copy capture→encode; host↔client matrix green | ☐ |
 | **P7** | File transfer | Large transfer doesn't degrade video QoE; resumable; integrity-verified | ☐ |
 | **P8** | QUIC promotion + mobile | Native↔native auto-selects QUIC, survives network change; mobile thin clients | ☐ |
