@@ -1,11 +1,30 @@
 [package]
 name = "sh-signaling"
-description = "Signaling client: SDP/ICE exchange, pairing transport, and reconnection."
+description = "Signaling client: SDP/ICE exchange, pairing transport, and reconnection over WebSocket."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+
+[features]
+# Enables the InsecureLanLab witness type and AcceptAll authenticator for loopback tests.
+# Production deployments must NOT enable this feature — use a real PeerAuthenticator.
+insecure-lan = []
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
+tracing.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+sh-crypto = { path = "../sh-crypto" }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake", "connect", "stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+sh-crypto = { path = "../sh-crypto" }
 
 [lints]
 workspace = true
