@@ -155,6 +155,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "md-5"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
+dependencies = [
+ "cfg-if",
+ "digest",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,6 +216,7 @@ dependencies = [
  "base64",
  "crc32fast",
  "hmac",
+ "md-5",
  "rand_core",
  "sh-types",
  "sha1",
@@ -219,7 +230,9 @@ name = "sh-ice-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "rand_core",
  "sh-ice",
+ "sh-types",
 ]
 
 [[package]]

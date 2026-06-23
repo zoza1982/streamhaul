@@ -9,13 +9,24 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+rand_core = "=0.6.4"
 
 [dependencies.sh-ice]
 path = ".."
 
+[dependencies.sh-types]
+path = "../../sh-types"
+
 [[bin]]
 name = "stun_decode"
 path = "fuzz_targets/stun_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "turn_decode"
+path = "fuzz_targets/turn_decode.rs"
 test = false
 doc = false
 bench = false

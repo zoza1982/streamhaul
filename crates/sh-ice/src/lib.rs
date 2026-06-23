@@ -14,20 +14,27 @@
 //! - **NAT simulator**: an in-process network fabric with Full Cone, Restricted Cone,
 //!   Port-Restricted, and Symmetric NAT models for hermetic integration tests.
 //!
+//! - **TURN client** (RFC 8656, P4-3): `TurnMessage` codec (Allocate/Refresh/
+//!   CreatePermission/ChannelBind/Send/Data), long-term credential authentication
+//!   (RFC 8489 §9.2), ChannelData framing, and a simulated TURN server for hermetic
+//!   relay tests.
+//!
 //! # Feature completeness
 //!
-//! P4-2 ships a synchronous, test-driven implementation.  Items deferred to P4-3:
-//! - Live STUN/TURN server communication.
-//! - TURN Allocate / Refresh / CreatePermission / ChannelBind message sequences.
-//! - Coturn deployment and REST credential endpoint integration.
+//! P4-3 ships the TURN client codec and state machine with full in-sim test coverage.
+//! Items deferred (R-COTURN-DEPLOY):
+//! - Live coturn server deployment and REST credential endpoint integration.
+//! - TURNS-on-443 configuration and TLS wrapping.
+//! - ICE agent relay candidate gathering wired to a real TURN server.
 //! - Live NAT traversal on real internet paths.
 //!
 //! # Security
 //!
-//! All untrusted wire input enters only through [`stun::StunMessage::decode`], which
-//! bounds-checks every field before reading.  The fuzz target
-//! `crates/sh-ice/fuzz/fuzz_targets/stun_decode.rs` exercises this path with
-//! libFuzzer.
+//! All untrusted wire input enters through [`stun::StunMessage::decode`] or
+//! [`turn::TurnMessage::decode`], both of which bounds-check every field before
+//! reading.  Fuzz targets:
+//! - `crates/sh-ice/fuzz/fuzz_targets/stun_decode.rs` — STUN codec.
+//! - `crates/sh-ice/fuzz/fuzz_targets/turn_decode.rs` — TURN codec + ChannelData.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -38,5 +45,6 @@ pub mod error;
 pub mod steering;
 pub mod stun;
 pub mod transport;
+pub mod turn;
 
 pub use error::IceError;
