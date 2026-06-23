@@ -60,9 +60,17 @@ async fn raw_connect(
        + futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
        + Unpin {
     let url = format!("ws://{addr}");
-    let (ws, _) = connect_async_with_config(&url, Some(ws_config()), false)
+    let (mut ws, _) = connect_async_with_config(&url, Some(ws_config()), false)
         .await
         .expect("raw WS connect");
+    // R-SIG-AUTH: the server sends a Challenge envelope immediately on connect. Drain it so the
+    // raw-protocol tests below see the Hello ack / Error as their first interesting message.
+    let challenge = raw_recv(&mut ws).await;
+    assert_eq!(
+        challenge.kind,
+        MessageKind::Challenge,
+        "first server message must be the auth Challenge"
+    );
     ws
 }
 

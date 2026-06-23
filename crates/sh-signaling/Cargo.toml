@@ -17,14 +17,17 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "sync", "time", "macros"] }
 tracing.workspace = true
 bytes.workspace = true
-async-trait.workspace = true
 sh-crypto = { path = "../sh-crypto" }
+# CSPRNG (OsRng/getrandom) for the per-connection R-SIG-AUTH challenge nonce.
+rand_core.workspace = true
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake", "connect", "stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 sh-crypto = { path = "../sh-crypto" }
+# `block_on` helper for async doc-tests in auth.rs.
+tokio-test = "=0.4.5"
 
 [lints]
 workspace = true

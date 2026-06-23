@@ -24,14 +24,25 @@
 //! - `MAX_SESSIONS` caps the number of concurrent sessions to prevent resource exhaustion.
 //! - `MAX_CONNECTIONS` caps the number of concurrent WS connections (including pre-Hello).
 //!
+//! ## Peer authentication (R-SIG-AUTH)
+//!
+//! On connect, the server issues a fresh random 32-byte challenge (via an injected
+//! [`ChallengeSource`]) in a `Challenge` envelope. The peer's `Hello` must carry a
+//! possession-of-identity-key proof in its opaque payload; the server verifies it through the
+//! injected [`PeerAuthenticator`] ([`IdentityProofAuthenticator`](crate::auth::IdentityProofAuthenticator)
+//! in production). This binds `from_fp` to a key the peer demonstrably controls, over a fresh
+//! challenge — defeating fingerprint spoofing, impersonation, and replay at the relay. The
+//! challenge bytes never leave the connection task, and routing is still keyed only on
+//! `(session_id, to_fp)` (zero-knowledge invariant intact).
+//!
+//! Server-side auth proves *ownership*, not *trust*: end-to-end peer trust remains the endpoints'
+//! job via Noise/BindCert/TOFU (P3). See [`crate::auth`].
+//!
 //! ## Security limitations
 //!
-//! - Until R-SIG-AUTH lands, `from_fp` is NOT bound to a verified identity. With `AcceptAll`
-//!   (test-only), any peer can claim any fingerprint. Production deployments MUST supply a
-//!   real [`PeerAuthenticator`] that ties the `from_fp` to a cryptographically verified identity.
 //! - Plain-WS signaling is vulnerable to MITM (candidate injection, session interference).
-//!   End-to-end integrity depends on P4-5 BindCert/DTLS-fingerprint binding which P4-1 does
-//!   NOT provide.
+//!   End-to-end integrity depends on P4-5 BindCert/DTLS-fingerprint binding which the signaling
+//!   layer does NOT provide.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -47,7 +58,10 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
-use crate::auth::PeerAuthenticator;
+use sh_crypto::peer_auth::PEER_AUTH_CHALLENGE_LEN;
+
+use crate::auth::{AuthContext, PeerAuthenticator};
+use crate::challenge::{ChallengeSource, OsChallengeSource};
 use crate::envelope::{
     self, MessageKind, SessionId, SignalingEnvelope, ENVELOPE_HEADER_LEN, MAX_PAYLOAD_LEN,
 };
@@ -120,10 +134,15 @@ type SessionRegistry = HashMap<SessionId, HashMap<String, PeerTx>>;
 pub struct SignalingServer {
     listener: TcpListener,
     auth: Arc<dyn PeerAuthenticator>,
+    challenge: Arc<dyn ChallengeSource>,
 }
 
 impl SignalingServer {
-    /// Binds the signaling server to the given address.
+    /// Binds the signaling server to the given address using the OS CSPRNG for challenges.
+    ///
+    /// This is the production entry point: it uses [`OsChallengeSource`] so every connection gets
+    /// a cryptographically random challenge nonce. To inject a deterministic challenge source
+    /// (tests), use [`bind_with_challenge_source`](Self::bind_with_challenge_source).
     ///
     /// # Errors
     ///
@@ -132,9 +151,26 @@ impl SignalingServer {
         addr: SocketAddr,
         auth: Arc<dyn PeerAuthenticator>,
     ) -> Result<Self, SignalingError> {
+        Self::bind_with_challenge_source(addr, auth, Arc::new(OsChallengeSource)).await
+    }
+
+    /// Binds the signaling server with an explicit [`ChallengeSource`] (for deterministic tests).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SignalingError::Io`] if the TCP bind fails.
+    pub async fn bind_with_challenge_source(
+        addr: SocketAddr,
+        auth: Arc<dyn PeerAuthenticator>,
+        challenge: Arc<dyn ChallengeSource>,
+    ) -> Result<Self, SignalingError> {
         let listener = TcpListener::bind(addr).await?;
         info!(local_addr = %listener.local_addr()?, "signaling server bound");
-        Ok(Self { listener, auth })
+        Ok(Self {
+            listener,
+            auth,
+            challenge,
+        })
     }
 
     /// Returns the local socket address the server is bound to.
@@ -157,6 +193,7 @@ impl SignalingServer {
     pub async fn run(self) -> Result<(), SignalingError> {
         let registry: Arc<RwLock<SessionRegistry>> = Arc::new(RwLock::new(HashMap::new()));
         let auth = self.auth;
+        let challenge_source = self.challenge;
         let conn_semaphore: Arc<Semaphore> = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
         loop {
@@ -173,10 +210,11 @@ impl SignalingServer {
 
             let registry = Arc::clone(&registry);
             let auth = Arc::clone(&auth);
+            let challenge_source = Arc::clone(&challenge_source);
 
             tokio::spawn(async move {
                 let _permit = permit; // released on drop
-                if let Err(e) = handle_connection(stream, registry, auth).await {
+                if let Err(e) = handle_connection(stream, registry, auth, challenge_source).await {
                     warn!(error = %e, "connection handler error");
                 }
             });
@@ -189,6 +227,7 @@ async fn handle_connection(
     stream: TcpStream,
     registry: Arc<RwLock<SessionRegistry>>,
     auth: Arc<dyn PeerAuthenticator>,
+    challenge_source: Arc<dyn ChallengeSource>,
 ) -> Result<(), SignalingError> {
     let ws_config = WebSocketConfig {
         max_message_size: Some(MAX_WS_MESSAGE_SIZE),
@@ -209,6 +248,30 @@ async fn handle_connection(
     })??;
 
     let (mut ws_sink, mut ws_stream) = ws.split();
+
+    // R-SIG-AUTH: issue a fresh per-connection challenge nonce. The peer must sign it in its
+    // `Hello` identity proof; this is what defeats proof replay. The challenge stays local to this
+    // connection task and is never persisted or routed.
+    let mut challenge = [0u8; PEER_AUTH_CHALLENGE_LEN];
+    challenge_source.fill_challenge(&mut challenge);
+    let challenge_env = make_challenge_envelope(&challenge);
+    match envelope::encode(&challenge_env) {
+        Ok(encoded) => {
+            if ws_sink
+                .send(Message::Binary(encoded.to_vec()))
+                .await
+                .is_err()
+            {
+                debug!("failed to send challenge; dropping connection");
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            // Should never happen (placeholder fingerprints are valid 64-hex), but never panic.
+            warn!(error = %e, "failed to encode challenge envelope");
+            return Ok(());
+        }
+    }
 
     // Channel for inbound routed envelopes (other peers routing to this connection).
     let (tx, mut rx) = mpsc::channel::<SignalingEnvelope>(64);
@@ -248,6 +311,7 @@ async fn handle_connection(
                             &mut registered_session,
                             &registry,
                             &auth,
+                            &challenge,
                             &tx,
                         ).await;
 
@@ -394,6 +458,7 @@ async fn handle_message(
     registered_session: &mut Option<SessionId>,
     registry: &Arc<RwLock<SessionRegistry>>,
     auth: &Arc<dyn PeerAuthenticator>,
+    challenge: &[u8; PEER_AUTH_CHALLENGE_LEN],
     tx: &PeerTx,
 ) -> Result<Option<SignalingEnvelope>, SignalingError> {
     let env = envelope::decode(bytes)?;
@@ -410,7 +475,16 @@ async fn handle_message(
 
     match env.kind {
         MessageKind::Hello => {
-            handle_hello(env, registered_fp, registered_session, registry, auth, tx).await
+            handle_hello(
+                env,
+                registered_fp,
+                registered_session,
+                registry,
+                auth,
+                challenge,
+                tx,
+            )
+            .await
         }
         MessageKind::Bye => {
             // Best-effort forward; peer may not be connected yet.
@@ -424,8 +498,9 @@ async fn handle_message(
             forward_to_peer(&env, registry).await?;
             Ok(None)
         }
-        MessageKind::Error => {
-            // Error is server→client only; a client sending Error is a protocol violation.
+        MessageKind::Error | MessageKind::Challenge => {
+            // Error and Challenge are server→client only; a client sending either is a protocol
+            // violation.
             Err(SignalingError::UnexpectedMessageType)
         }
     }
@@ -438,6 +513,7 @@ async fn handle_hello(
     registered_session: &mut Option<SessionId>,
     registry: &Arc<RwLock<SessionRegistry>>,
     auth: &Arc<dyn PeerAuthenticator>,
+    challenge: &[u8; PEER_AUTH_CHALLENGE_LEN],
     tx: &PeerTx,
 ) -> Result<Option<SignalingEnvelope>, SignalingError> {
     // Reject a second Hello on an already-registered connection.
@@ -445,9 +521,19 @@ async fn handle_hello(
         return Err(SignalingError::AlreadyRegistered);
     }
 
-    // Authenticate the peer.
-    if !auth.authenticate(&env.from_fp) {
-        return Err(SignalingError::AuthenticationFailed);
+    // Authenticate the peer (R-SIG-AUTH): verify the possession-of-identity-key proof carried in
+    // the opaque `Hello` payload against the claimed fingerprint, the session, and the challenge
+    // this connection issued. `env.payload` is hostile input; the authenticator parses it
+    // panic-free. Any rejection collapses to the sanitized `AuthenticationFailed` (no oracle).
+    let ctx = AuthContext {
+        claimed_fp: &env.from_fp,
+        session_id: env.session_id,
+        challenge,
+        proof: &env.payload,
+    };
+    if let Err(auth_err) = auth.authenticate(&ctx) {
+        debug!(reason = %auth_err, "peer authentication rejected");
+        return Err(SignalingError::from(auth_err));
     }
 
     {
@@ -518,6 +604,22 @@ async fn forward_to_peer(
         })?;
 
     Ok(())
+}
+
+/// Constructs the server-generated `Challenge` envelope carrying the 32-byte nonce.
+///
+/// The routing-header fingerprints are not meaningful for a server→client control message, so
+/// they are all-zero hex placeholders (valid 64-char lowercase hex, accepted by `encode`). The
+/// challenge nonce rides in the opaque payload — the routing header is unchanged.
+fn make_challenge_envelope(challenge: &[u8; PEER_AUTH_CHALLENGE_LEN]) -> SignalingEnvelope {
+    SignalingEnvelope {
+        kind: MessageKind::Challenge,
+        // SessionId is not yet known for this connection (Hello has not arrived); zeros.
+        session_id: SessionId([0u8; 16]),
+        from_fp: "0".repeat(64),
+        to_fp: "0".repeat(64),
+        payload: Bytes::copy_from_slice(challenge),
+    }
 }
 
 /// Constructs a server-generated `Error` envelope.

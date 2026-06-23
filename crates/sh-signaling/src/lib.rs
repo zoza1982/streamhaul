@@ -17,14 +17,19 @@
 //! [`SignalingServer`] binds plain WebSocket (no in-process TLS). Production deployments
 //! terminate TLS at a reverse proxy (nginx, Caddy). Tests use plain `ws://` on loopback.
 //!
-//! Authentication is delegated to [`PeerAuthenticator`]. The default [`AcceptAll`] (available
-//! with the `insecure-lan` feature) admits every peer; production code must supply a real
-//! implementation.
+//! Authentication is delegated to [`PeerAuthenticator`] (R-SIG-AUTH, ADR-0016). The server issues
+//! a fresh challenge on connect; the production [`IdentityProofAuthenticator`] verifies an Ed25519
+//! possession-of-identity-key proof carried in the opaque `Hello` payload, binding `from_fp` to a
+//! key the peer controls. The test-only [`AcceptAll`] (available with the `insecure-lan` feature)
+//! admits every peer. Server-side auth proves *ownership*, not end-to-end *trust* (which the peers
+//! establish via Noise/BindCert/TOFU, P3).
 //!
 //! ## Client
 //!
-//! [`SignalingClient`] connects over plain WS, sends a `Hello` envelope on connection, and
-//! then drives a send/recv loop. Reconnection uses an injectable [`BackoffStrategy`].
+//! [`SignalingClient`] connects over plain WS. On connect it receives the server `Challenge`,
+//! signs it with its [`Keystore`](sh_crypto::Keystore) (via
+//! [`connect_authenticated`](SignalingClient::connect_authenticated)), and sends a `Hello` carrying
+//! the proof, then drives a send/recv loop. Reconnection uses an injectable [`BackoffStrategy`].
 //!
 //! ## Zero-knowledge invariant
 //!
@@ -40,13 +45,15 @@
 
 pub mod auth;
 pub mod backoff;
+pub mod challenge;
 pub mod client;
 pub mod envelope;
 pub mod error;
 pub mod server;
 
-pub use auth::PeerAuthenticator;
+pub use auth::{AuthContext, AuthError, IdentityProofAuthenticator, PeerAuthenticator};
 pub use backoff::{BackoffStrategy, ExponentialBackoff};
+pub use challenge::{ChallengeSource, OsChallengeSource};
 pub use client::SignalingClient;
 pub use envelope::{
     MessageKind, SessionId, SignalingEnvelope, ENVELOPE_HEADER_LEN, MAX_PAYLOAD_LEN,

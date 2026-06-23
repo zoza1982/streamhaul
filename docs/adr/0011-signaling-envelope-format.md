@@ -60,6 +60,10 @@ structural enforcement of the zero-knowledge invariant.
   - P4-5 (BindCert) will carry the DTLS fingerprint in the `payload` field of an `Offer` envelope.
   - P4-6 (transport capability negotiation) will add a `Candidate`-style envelope for codec caps,
     reusing this same envelope format.
+  - **R-SIG-AUTH (ADR-0016)** added `MessageKind::Challenge` (kind = 7) and carries the
+    possession-of-identity-key proof in the opaque `payload` of `Hello`. The 149-byte routing
+    header is unchanged; the server still routes only on `(session_id, to_fp)` and the payload
+    remains opaque to routing (zero-knowledge invariant preserved).
 
 ## Alternatives considered
 

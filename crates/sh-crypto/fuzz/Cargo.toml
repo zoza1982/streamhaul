@@ -72,4 +72,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "peer_auth_decode"
+path = "fuzz_targets/peer_auth_decode.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

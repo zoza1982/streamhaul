@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! Offset  Len   Field
-//! 0       1     kind: u8   (0=Hello … 6=Error)
+//! 0       1     kind: u8   (0=Hello … 6=Error, 7=Challenge)
 //! 1       16    session_id: [u8; 16]
 //! 17      64    from_fp:   [u8; 64]  (UTF-8 ASCII hex fingerprint, 64 chars)
 //! 81      64    to_fp:     [u8; 64]  (same)
@@ -43,11 +43,12 @@ const FP_LEN: usize = 64;
 
 /// Kind discriminant for a [`SignalingEnvelope`].
 ///
-/// Values 0–6 are defined; all other byte values are rejected at decode time.
+/// Values 0–7 are defined; all other byte values are rejected at decode time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageKind {
-    /// Client registration — sent immediately after connecting to announce `(session_id, from_fp)`.
+    /// Client registration — sent after receiving the server's `Challenge`, carrying the
+    /// possession-of-identity-key proof (R-SIG-AUTH) in the opaque payload.
     Hello = 0,
     /// Initiator's SDP offer; payload is an opaque blob (SDP text, BindCert, etc.).
     Offer = 1,
@@ -61,6 +62,9 @@ pub enum MessageKind {
     Bye = 5,
     /// Server-to-client error; payload is a UTF-8 ASCII error string.
     Error = 6,
+    /// Server-to-client challenge — sent immediately on connect; payload is a random 32-byte
+    /// nonce the client must sign in its `Hello` identity proof (R-SIG-AUTH, ADR-0016).
+    Challenge = 7,
 }
 
 impl MessageKind {
@@ -68,7 +72,7 @@ impl MessageKind {
     ///
     /// # Errors
     ///
-    /// Returns [`SignalingError::UnknownMessageKind`] if `byte` is not in 0–6.
+    /// Returns [`SignalingError::UnknownMessageKind`] if `byte` is not in 0–7.
     pub(crate) fn from_u8(byte: u8) -> Result<Self, SignalingError> {
         match byte {
             0 => Ok(Self::Hello),
@@ -78,6 +82,7 @@ impl MessageKind {
             4 => Ok(Self::EndOfCandidates),
             5 => Ok(Self::Bye),
             6 => Ok(Self::Error),
+            7 => Ok(Self::Challenge),
             other => Err(SignalingError::UnknownMessageKind { byte: other }),
         }
     }
@@ -221,7 +226,7 @@ pub fn encode(env: &SignalingEnvelope) -> Result<Bytes, SignalingError> {
 /// # Errors
 ///
 /// - [`SignalingError::EnvelopeTooShort`] — `buf.len() < ENVELOPE_HEADER_LEN`
-/// - [`SignalingError::UnknownMessageKind`] — kind byte not in 0–6
+/// - [`SignalingError::UnknownMessageKind`] — kind byte not in 0–7
 /// - [`SignalingError::PayloadTooLarge`] — declared `payload_len > MAX_PAYLOAD_LEN`
 /// - [`SignalingError::TruncatedPayload`] — buf is shorter than header + `payload_len`
 /// - [`SignalingError::InvalidFingerprint`] — fingerprint bytes are not valid lowercase hex `[0-9a-f]`
@@ -426,6 +431,7 @@ mod tests {
             MessageKind::EndOfCandidates,
             MessageKind::Bye,
             MessageKind::Error,
+            MessageKind::Challenge,
         ];
         for kind in kinds {
             let env = make_env(kind, b"test payload");
