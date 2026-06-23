@@ -14,9 +14,9 @@ insecure-lan = ["dep:rcgen", "dep:rustls"]
 thiserror.workspace = true
 bytes.workspace = true
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio = { workspace = true, features = ["macros", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "sync", "time"] }
 tracing.workspace = true
-async-trait = "0.1"
+async-trait.workspace = true
 sh-types = { path = "../sh-types" }
 
 # Optional: only compiled when `insecure-lan` feature is active.
@@ -36,7 +36,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"], opti
 str0m = { version = "=0.20.0", default-features = false, features = ["rust-crypto"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 # P4-5 integration test only (dev-only — NO production sh-transport → sh-crypto coupling).
 # The test drives a real Noise XK handshake (sh-crypto) that exchanges BindCerts committing the
 # real `WebRtcTransport::local_dtls_fingerprint()`, pins the peer's committed fingerprint, then

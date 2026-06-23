@@ -21,9 +21,17 @@ codec-agnostic `Transport`/`Channel` trait abstraction (LLD §2) is **not** here
   - `PinnedWebRtcTransport`: `drive(now)`, `handle_receive(...)`, `next_drive_at()`,
     `local_dtls_fingerprint()`, `remote_dtls_fingerprint()`, `rtt()`, `packet_loss()`.
   - The bare `WebRtcTransport` is `pub(crate)` — external callers cannot name or construct it.
-  - See ADR-0014 (DTLS identity binding) and ADR-0017 (structural pin enforcement), plus the
-    `tests/dtls_identity_binding.rs` integration test (dev-only `sh-crypto` dep; no production
-    coupling).
+  - See ADR-0014 (DTLS identity binding), ADR-0017 (structural pin enforcement), ADR-0018
+    (async drive loop), and the `tests/dtls_identity_binding.rs` integration test (dev-only
+    `sh-crypto` dep; no production coupling).
+- **Async drive loop** (`sh_transport::driver`, ADR-0018):
+  - `AsyncUdpSocket` — injectable async socket seam (`Send + Sync + 'static`).
+  - `TokioUdpSocket::bind(addr)` — production wrapper around `tokio::net::UdpSocket`.
+  - `SimNetwork` / `SimUdpSocket` — deterministic in-memory socket pair for tests; compatible
+    with `tokio::time::pause()` because delivery uses mpsc channels, not the timer.
+  - `spawn_webrtc_driver(transport, socket, std_base)` → `DriverHandle` — spawns the tokio
+    task that runs the `drive()`/`handle_receive()` loop with `next_drive_at()` scheduling.
+    Shutdown via `handle.shutdown().await`.
 
 ## ⚠️ `insecure-lan` feature (LAN lab only)
 
@@ -52,3 +60,18 @@ Integration tests live in `tests/loopback.rs` and require the feature:
 ```bash
 cargo test -p sh-transport --features insecure-lan
 ```
+
+The async drive-loop tests live in `tests/webrtc_driver.rs` and run without any extra feature flag:
+
+```bash
+# Deterministic suite (sim sockets + tokio::time::pause, no real network):
+cargo test -p sh-transport --test webrtc_driver
+
+# Real UDP loopback proof (requires real OS sockets; excluded from default CI):
+cargo test -p sh-transport --test webrtc_driver -- --include-ignored webrtc_driver_real_udp_loopback
+```
+
+The `webrtc_driver_sim_handshake_deterministic` test drives a full ICE+DTLS+SCTP+DataChannel
+handshake between two in-memory `SimUdpSocket`s under `tokio::time::pause()`. It is the CI gate
+for the async driver and is non-vacuous: the assertion fails if transmits are not actually pumped
+between the two transports.
