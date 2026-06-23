@@ -1721,12 +1721,13 @@ dependencies = [
 name = "sh-signaling"
 version = "0.0.0"
 dependencies = [
- "async-trait",
  "bytes",
  "futures-util",
+ "rand_core 0.6.4",
  "sh-crypto",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-test",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",

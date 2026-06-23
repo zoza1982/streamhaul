@@ -113,9 +113,32 @@ pub enum SignalingError {
     #[error("connection already registered")]
     AlreadyRegistered,
 
-    /// The peer's fingerprint was not accepted by the server's authenticator.
+    /// The server's `Challenge` envelope did not carry a valid 32-byte challenge nonce.
+    #[error("invalid challenge from server")]
+    InvalidChallenge,
+
+    /// A cryptographic operation failed while building the identity proof (R-SIG-AUTH).
+    ///
+    /// Wraps a [`sh_crypto::CryptoError`] from reading the device identity or signing the
+    /// challenge. No key material is included.
+    #[error("crypto error: {0}")]
+    Crypto(#[source] sh_crypto::CryptoError),
+
+    /// The peer's identity proof was not accepted by the server's authenticator.
+    ///
+    /// This is the **uniform, sanitized** failure surfaced to the client for *every* auth
+    /// rejection (malformed proof, fingerprint mismatch, replayed/expired challenge, bad
+    /// signature). The specific [`crate::auth::AuthError`] is logged server-side only — never sent
+    /// — so a probing peer gets no enumeration oracle.
     #[error("authentication failed")]
     AuthenticationFailed,
+}
+
+impl From<crate::auth::AuthError> for SignalingError {
+    fn from(_e: crate::auth::AuthError) -> Self {
+        // Collapse every auth-rejection reason to a single sanitized variant (no oracle).
+        Self::AuthenticationFailed
+    }
 }
 
 impl From<tokio_tungstenite::tungstenite::Error> for SignalingError {

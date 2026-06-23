@@ -15,6 +15,7 @@ Device identity, key management, and end-to-end session/channel keys for Streamh
 | [`SoftwareKeystore`] | Portable in-memory `Keystore` backed by an Ed25519 signing key. |
 | [`SessionKeys`] | Per-session AEAD key set; created from a completed Noise handshake. |
 | [`ChannelFrameHeader`] | Parsed 24-byte frame header (channel, direction, epoch, generation, seq). |
+| [`peer_auth::IdentityProof`] | Server-challenged Ed25519 possession-of-identity-key proof for signaling peer auth (R-SIG-AUTH, ADR-0016). Proves *ownership* of a fingerprint, not peer trust. |
 | [`CryptoError`] | Typed error enum for all `sh-crypto` failures. |
 
 ## Quick start
@@ -73,9 +74,9 @@ are available and wired in.
 
 See `crates/sh-crypto/fuzz/README.md`. Targets cover `Signature::decode`,
 `DeviceIdentity::from_public_key_bytes`, `NoiseHandshake::read_message`, PAKE message parsing,
-and `SessionKeys::open` — all accept untrusted network bytes. The `channel_frame_open` target
-hoists the Noise handshake into a `OnceLock`-backed `Mutex<SessionKeys>` so only `open()` is on
-the fuzzer's hot path.
+`SessionKeys::open`, and `IdentityProof::decode` (`peer_auth_decode`, R-SIG-AUTH) — all accept
+untrusted network bytes. The `channel_frame_open` target hoists the Noise handshake into a
+`OnceLock`-backed `Mutex<SessionKeys>` so only `open()` is on the fuzzer's hot path.
 
 ## Phase roadmap
 

@@ -4,11 +4,20 @@
 //! to register itself, and then provides [`send`](SignalingClient::send) /
 //! [`recv`](SignalingClient::recv) primitives for exchanging [`SignalingEnvelope`] messages.
 //!
+//! ## Authentication (R-SIG-AUTH)
+//!
+//! On every (re)connect the server sends a `Challenge` envelope first. An authenticated client
+//! (constructed via [`SignalingClient::connect_authenticated`]) signs the challenge with its
+//! [`Keystore`](sh_crypto::Keystore) and carries the resulting possession-of-identity-key proof in
+//! the opaque `Hello` payload, proving it owns the fingerprint it claims. The
+//! [`connect`](SignalingClient::connect) constructor (test/`insecure-lan` path) sends an empty
+//! proof and only works against a server using a permissive authenticator.
+//!
 //! ## Reconnection
 //!
 //! If the underlying WebSocket connection is lost, the client re-connects using the injected
-//! [`BackoffStrategy`]. After each successful reconnect, the client re-sends `Hello` to
-//! re-register in the session.
+//! [`BackoffStrategy`]. After each successful reconnect, the client receives a fresh `Challenge`
+//! and re-sends a freshly-signed `Hello` to re-register in the session.
 //!
 //! ## Graceful shutdown
 //!
@@ -17,8 +26,12 @@
 //! [`recv`](SignalingClient::recv) returns `Ok(None)` when a `Bye` is received from the peer
 //! or when the connection is closed cleanly.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use sh_crypto::peer_auth::{IdentityProof, PEER_AUTH_CHALLENGE_LEN};
+use sh_crypto::Keystore;
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
@@ -66,6 +79,9 @@ pub struct SignalingClient {
     url: String,
     session_id: SessionId,
     my_fp: String,
+    /// The signer used to build the R-SIG-AUTH identity proof. `None` on the test/`insecure-lan`
+    /// path (an empty proof is sent, accepted only by a permissive server authenticator).
+    keystore: Option<Arc<dyn Keystore>>,
     backoff: Box<dyn BackoffStrategy>,
 }
 
@@ -83,17 +99,80 @@ impl SignalingClient {
     ///
     /// - [`SignalingError::WebSocket`] if the initial connection or `Hello` send fails.
     /// - [`SignalingError::NotConnected`] if all reconnect attempts are exhausted on connect.
+    ///
+    /// # Authentication
+    ///
+    /// This constructor sends an **empty** identity proof. It only succeeds against a server whose
+    /// [`PeerAuthenticator`](crate::PeerAuthenticator) does not require a real proof (e.g. the
+    /// `insecure-lan` `AcceptAll`). For a production server, use
+    /// [`connect_authenticated`](Self::connect_authenticated).
     pub async fn connect(
         url: impl Into<String>,
         session_id: SessionId,
         my_fp: impl Into<String>,
         backoff: impl BackoffStrategy + 'static,
     ) -> Result<Self, SignalingError> {
-        let url = url.into();
-        let my_fp = my_fp.into();
-        let mut backoff: Box<dyn BackoffStrategy> = Box::new(backoff);
+        Self::connect_inner(
+            url.into(),
+            session_id,
+            my_fp.into(),
+            None,
+            Box::new(backoff),
+        )
+        .await
+    }
 
-        let ws = connect_with_retry(&url, &session_id, &my_fp, &mut *backoff).await?;
+    /// Connects to the signaling server and registers with a signed identity proof (R-SIG-AUTH).
+    ///
+    /// The client derives its fingerprint from `keystore`'s device identity, receives the server's
+    /// `Challenge`, signs `DOMAIN || session_id || pubkey || challenge` with `keystore`, and
+    /// presents the proof in the `Hello` payload — proving it owns the claimed fingerprint. This
+    /// is the production constructor.
+    ///
+    /// # Errors
+    ///
+    /// - [`SignalingError::Crypto`] if the device identity cannot be read or signing fails.
+    /// - [`SignalingError::WebSocket`] if the connection or `Hello` send fails.
+    /// - [`SignalingError::NotConnected`] if all reconnect attempts are exhausted on connect.
+    pub async fn connect_authenticated(
+        url: impl Into<String>,
+        session_id: SessionId,
+        keystore: Arc<dyn Keystore>,
+        backoff: impl BackoffStrategy + 'static,
+    ) -> Result<Self, SignalingError> {
+        let my_fp = keystore
+            .device_identity()
+            .await
+            .map_err(SignalingError::Crypto)?
+            .fingerprint()
+            .as_str()
+            .to_owned();
+        Self::connect_inner(
+            url.into(),
+            session_id,
+            my_fp,
+            Some(keystore),
+            Box::new(backoff),
+        )
+        .await
+    }
+
+    /// Shared connect path for both the test and authenticated constructors.
+    async fn connect_inner(
+        url: String,
+        session_id: SessionId,
+        my_fp: String,
+        keystore: Option<Arc<dyn Keystore>>,
+        mut backoff: Box<dyn BackoffStrategy>,
+    ) -> Result<Self, SignalingError> {
+        let ws = connect_with_retry(
+            &url,
+            &session_id,
+            &my_fp,
+            keystore.as_deref(),
+            &mut *backoff,
+        )
+        .await?;
 
         backoff.reset();
         info!(url = %url, "signaling client connected");
@@ -103,6 +182,7 @@ impl SignalingClient {
             url,
             session_id,
             my_fp,
+            keystore,
             backoff,
         })
     }
@@ -140,6 +220,7 @@ impl SignalingClient {
                         &self.url,
                         &self.session_id,
                         &self.my_fp,
+                        self.keystore.as_deref(),
                         &mut *self.backoff,
                     )
                     .await
@@ -159,6 +240,7 @@ impl SignalingClient {
                         &self.url,
                         &self.session_id,
                         &self.my_fp,
+                        self.keystore.as_deref(),
                         &mut *self.backoff,
                     )
                     .await
@@ -220,10 +302,11 @@ async fn connect_with_retry(
     url: &str,
     session_id: &SessionId,
     my_fp: &str,
+    keystore: Option<&dyn Keystore>,
     backoff: &mut dyn BackoffStrategy,
 ) -> Result<WsStream, SignalingError> {
     loop {
-        match try_connect(url, session_id, my_fp).await {
+        match try_connect(url, session_id, my_fp, keystore).await {
             Ok(ws) => return Ok(ws),
             Err(e) => {
                 debug!(error = %e, "connection attempt failed");
@@ -242,14 +325,18 @@ async fn connect_with_retry(
     }
 }
 
-/// Single connection attempt: TCP + WS upgrade + `Hello` send + Hello ack consume.
+/// Single connection attempt: TCP + WS upgrade + `Challenge` receive + signed `Hello` send +
+/// Hello ack consume.
 ///
-/// Consuming the Hello ack here ensures that after reconnect, the first message returned
-/// by [`SignalingClient::recv`] is a real application message, not a spurious Hello ack.
+/// The server sends a `Challenge` envelope first; the client signs it into an identity proof
+/// (R-SIG-AUTH) carried in the `Hello` payload. Consuming the Hello ack here ensures that after
+/// reconnect, the first message returned by [`SignalingClient::recv`] is a real application
+/// message, not a spurious Challenge or Hello ack.
 async fn try_connect(
     url: &str,
     session_id: &SessionId,
     my_fp: &str,
+    keystore: Option<&dyn Keystore>,
 ) -> Result<WsStream, SignalingError> {
     let ws_config = WebSocketConfig {
         max_message_size: Some(MAX_WS_MESSAGE_SIZE),
@@ -258,6 +345,21 @@ async fn try_connect(
     };
     let (mut ws, _response) = connect_async_with_config(url, Some(ws_config), false).await?;
 
+    // Receive the server's Challenge (server→client, sent immediately on connect).
+    let challenge = recv_challenge(&mut ws).await?;
+
+    // Build the identity proof. With a keystore, sign the challenge (production). Without one
+    // (test/insecure-lan path), send an empty proof — accepted only by a permissive server.
+    let proof_payload = match keystore {
+        Some(ks) => {
+            let proof = IdentityProof::create(ks, session_id.as_bytes(), &challenge)
+                .await
+                .map_err(SignalingError::Crypto)?;
+            Bytes::copy_from_slice(&proof.encode())
+        }
+        None => Bytes::new(),
+    };
+
     // Send Hello to register this peer in the session.
     // `to_fp` is all-zeros for Hello; the server ignores it.
     let hello = SignalingEnvelope {
@@ -265,7 +367,7 @@ async fn try_connect(
         session_id: *session_id,
         from_fp: my_fp.to_owned(),
         to_fp: "0".repeat(64),
-        payload: Bytes::new(),
+        payload: proof_payload,
     };
     let encoded = envelope::encode(&hello)?;
     ws.send(Message::Binary(encoded.to_vec())).await?;
@@ -295,4 +397,34 @@ async fn try_connect(
 
     debug!(url = %url, "Hello sent and acked");
     Ok(ws)
+}
+
+/// Receives the server's `Challenge` envelope and extracts the 32-byte nonce.
+///
+/// Pings are answered; any other message before the Challenge is a protocol violation.
+async fn recv_challenge(
+    ws: &mut WsStream,
+) -> Result<[u8; PEER_AUTH_CHALLENGE_LEN], SignalingError> {
+    loop {
+        match ws.next().await {
+            Some(Ok(Message::Binary(bytes))) => {
+                let env = envelope::decode(&bytes)?;
+                if env.kind != MessageKind::Challenge {
+                    return Err(SignalingError::UnexpectedMessageType);
+                }
+                let challenge: [u8; PEER_AUTH_CHALLENGE_LEN] = env
+                    .payload
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| SignalingError::InvalidChallenge)?;
+                return Ok(challenge);
+            }
+            Some(Ok(Message::Ping(data))) => {
+                ws.send(Message::Pong(data)).await?;
+            }
+            Some(Ok(_)) => return Err(SignalingError::UnexpectedMessageType),
+            Some(Err(e)) => return Err(SignalingError::from(e)),
+            None => return Err(SignalingError::NotConnected),
+        }
+    }
 }
