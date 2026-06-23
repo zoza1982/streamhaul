@@ -91,6 +91,31 @@ Both have been reviewed by the Dalek developers and are widely deployed. `verify
 used (not `verify`) to reject small-order keys and non-canonical signatures (ADR-0006).
 Signing keys zeroize on drop via `ZeroizeOnDrop`.
 
+### `str0m` (WebRTC sans-IO engine, P4-4)
+
+| Property | Status |
+|----------|--------|
+| Version pinned | Yes — `str0m = "=0.20.0"` (exact-pinned per CLAUDE.md §7) |
+| Known advisory | None in RustSec database as of P4-4 (`cargo audit` clean) |
+| Independent audit | **NOT YET** — pre-GA item (Risk Register: `R-STR0M-AUDIT`) |
+| Wrapper isolation | Yes — all str0m types are wrapped behind `WebRtcTransport`/`WebRtcChannel`; raw str0m types never appear in the public `sh-transport` API |
+| Fuzzing | Deferred — a `webrtc_framing` fuzz target for STUN/DTLS/SCTP input is a pre-GA requirement (see R-STR0M-AUDIT) |
+| Dependency reality | `str0m` pulls `aws-lc-rs` (via `dimpl`) AND a second `rcgen 0.14` transitively, alongside the existing `ring`/`rustls` tree. See ADR-0013 for the justified dependency posture. |
+| Fingerprint verification | str0m's `fingerprint_verification` flag defaults to `true` and is NOT disabled anywhere in production code. The seam to set the remote fingerprint before DTLS is exposed via `WebRtcTransport::set_remote_dtls_fingerprint()` (P4-5 binding path). |
+
+`str0m` parses DTLS, STUN, RTP, and SCTP bytes from hostile network input. Mitigations:
+
+- All `str0m` types are wrapped behind `WebRtcTransport`/`WebRtcChannel`; no raw str0m API
+  surface is public.
+- Per-channel receive queues are capped at 512 frames (`MAX_RECV_QUEUE_DEPTH`) to prevent
+  memory exhaustion from a flooding peer.
+- `WebRtcTransport::set_remote_dtls_fingerprint()` exposes the certificate-pin seam that
+  P4-5 will wire to the signed `BindCert` commitment, closing the DTLS MITM surface.
+- Any `str0m` version upgrade requires a security review before merge.
+
+A full third-party audit of `str0m` (DTLS, STUN, SCTP, ICE parsers) is a **blocking
+requirement before production GA**. This is tracked as Risk Register item `R-STR0M-AUDIT`.
+
 ### `rustls` / `quinn`
 
 Used for the QUIC transport. `rustls` has been audited by Cure53. The TLS exporter label

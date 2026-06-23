@@ -82,4 +82,11 @@ pub enum TransportError {
     /// QUIC connection's TLS exporter is unavailable (e.g. connection not yet established).
     #[error("failed to export Noise session-binding context from QUIC TLS layer")]
     NoiseContextExport,
+
+    /// A str0m WebRTC engine error.
+    ///
+    /// Wraps errors from the [`str0m`] WebRTC sans-IO engine, including DTLS, ICE, SCTP,
+    /// and data-channel errors.
+    #[error("webrtc: {0}")]
+    Webrtc(String),
 }

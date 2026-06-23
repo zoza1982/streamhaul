@@ -3,9 +3,9 @@
 //!
 //! This crate provides:
 //!
-//! - The [`CongestionController`] trait and a concrete **SCReAM** (Self-Clocked Rate Adaptation
-//!   for Multimedia) implementation following [RFC 8298] for the native (QUIC) path. A GCC
-//!   implementation for the WebRTC path arrives in Phase 4.
+//! - The [`CongestionController`] trait with two concrete implementations:
+//!   **SCReAM** (Self-Clocked Rate Adaptation for Multimedia, RFC 8298) for the native (QUIC)
+//!   path, and **GCC** (Google Congestion Control) for the WebRTC path.
 //! - The **content classifier** (LLD §5.2): a 4-signal heuristic plus hysteresis FSM that maps
 //!   real-time screen-content signals to [`classifier::ContentMode`] (`Work`, `Scrolling`,
 //!   `Game`). The score function is swappable behind [`classifier::ScoreProvider`] for v2 ML.
@@ -92,9 +92,11 @@ pub mod allocator;
 pub mod bitrate;
 pub mod classifier;
 pub mod controller;
+pub mod gcc;
 pub mod loss_recovery;
 pub mod scream;
 pub mod stats;
+pub(crate) mod util;
 
 pub use allocator::{AllocatorConfig, ChannelAllocation, RateAllocator};
 pub use bitrate::Bitrate;
@@ -102,6 +104,7 @@ pub use classifier::{
     AppClass, ContentClassifier, ContentMode, HeuristicScoreProvider, Score, ScoreProvider, Signals,
 };
 pub use controller::CongestionController;
+pub use gcc::{GccConfig, GccController};
 pub use loss_recovery::{
     FecPolicy, FecPolicyConfig, GapDetector, GapReport, LossRecoveryController, LossState,
     NackRequest, RecoveryAction, RefreshStripe, RollingIntraRefresh,
