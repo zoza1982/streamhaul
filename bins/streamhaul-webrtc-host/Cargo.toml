@@ -14,6 +14,11 @@ rust-version.workspace = true
 [dependencies]
 sh-transport = { path = "../../crates/sh-transport" }
 sh-signaling = { path = "../../crates/sh-signaling", features = ["insecure-lan"] }
+# sh-crypto: the identity-bound Noise XK handshake + BindCert (P5-3 Stage 2, ADR-0014/0023). The
+# host runs the responder side, commits its own DTLS fingerprint, and extracts the browser's
+# committed DTLS fingerprint to pin (instead of the untrusted SDP `a=fingerprint`).
+sh-crypto = { path = "../../crates/sh-crypto" }
+sh-types = { path = "../../crates/sh-types" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
@@ -21,6 +26,11 @@ anyhow = { workspace = true }
 # str0m: exact-pinned to match sh-transport's version (see sh-transport/Cargo.toml).
 str0m = { version = "=0.20.0", default-features = false, features = ["rust-crypto"] }
 bytes = { workspace = true }
+# X25519 static-key generation for the Noise XK responder (the host owns its static so it can
+# advertise the matching public key to the browser initiator).
+x25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+async-trait = { workspace = true }
 
 [lints]
 workspace = true

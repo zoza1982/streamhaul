@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! Offset  Len   Field
-//! 0       1     kind: u8   (0=Hello … 6=Error, 7=Challenge)
+//! 0       1     kind: u8   (0=Hello … 6=Error, 7=Challenge, 8=Noise)
 //! 1       16    session_id: [u8; 16]
 //! 17      64    from_fp:   [u8; 64]  (UTF-8 ASCII hex fingerprint, 64 chars)
 //! 81      64    to_fp:     [u8; 64]  (same)
@@ -43,7 +43,7 @@ const FP_LEN: usize = 64;
 
 /// Kind discriminant for a [`SignalingEnvelope`].
 ///
-/// Values 0–7 are defined; all other byte values are rejected at decode time.
+/// Values 0–8 are defined; all other byte values are rejected at decode time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessageKind {
@@ -65,6 +65,14 @@ pub enum MessageKind {
     /// Server-to-client challenge — sent immediately on connect; payload is a random 32-byte
     /// nonce the client must sign in its `Hello` identity proof (R-SIG-AUTH, ADR-0016).
     Challenge = 7,
+    /// Peer-to-peer Noise handshake transcript (P5-3 Stage 2, ADR-0023). The opaque payload
+    /// carries identity-bound Noise XK BindCert exchange material (a 1-byte sub-type followed by
+    /// the body — see `bins/streamhaul-webrtc-host`). Routed opaquely by `(session_id, to_fp)`
+    /// exactly like `Offer`/`Answer`; the relay never inspects the payload (zero-knowledge
+    /// invariant preserved). This message is what makes the WebRTC DTLS pin **identity-bound**:
+    /// each peer commits its own DTLS `a=fingerprint` inside the identity-signed `BindCert`, and
+    /// the peer pins the committed value rather than the untrusted SDP fingerprint.
+    Noise = 8,
 }
 
 impl MessageKind {
@@ -72,7 +80,7 @@ impl MessageKind {
     ///
     /// # Errors
     ///
-    /// Returns [`SignalingError::UnknownMessageKind`] if `byte` is not in 0–7.
+    /// Returns [`SignalingError::UnknownMessageKind`] if `byte` is not in 0–8.
     pub(crate) fn from_u8(byte: u8) -> Result<Self, SignalingError> {
         match byte {
             0 => Ok(Self::Hello),
@@ -83,6 +91,7 @@ impl MessageKind {
             5 => Ok(Self::Bye),
             6 => Ok(Self::Error),
             7 => Ok(Self::Challenge),
+            8 => Ok(Self::Noise),
             other => Err(SignalingError::UnknownMessageKind { byte: other }),
         }
     }
@@ -432,6 +441,7 @@ mod tests {
             MessageKind::Bye,
             MessageKind::Error,
             MessageKind::Challenge,
+            MessageKind::Noise,
         ];
         for kind in kinds {
             let env = make_env(kind, b"test payload");

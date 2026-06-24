@@ -415,12 +415,27 @@ impl WebClient {
 
     /// Add a remote ICE candidate received via signaling.
     ///
+    /// The candidate is associated with the single `m=application` (DataChannel) section
+    /// (`sdpMid = "0"`, `sdpMLineIndex = 0`). **Firefox requires** an `sdpMid` or
+    /// `sdpMLineIndex` on a remote candidate — it throws `"Cannot add a candidate without
+    /// specifying either sdpMid or sdpMLineIndex"` for a bare candidate string. A browser↔native
+    /// Streamhaul session always has exactly one DataChannel section at index 0, so this binding is
+    /// correct (see ADR-0023 quirk #2). Chrome is lenient and accepts the explicit values too.
+    ///
+    /// An empty candidate string is treated as an end-of-candidates marker and is silently
+    /// ignored (some browsers emit `""` to signal EOC; it carries no routable candidate).
+    ///
     /// # Errors
     ///
     /// Returns a `JsValue` if the candidate is malformed or `addIceCandidate` rejects.
     #[wasm_bindgen]
     pub async fn add_ice_candidate(&self, candidate: String) -> Result<(), JsValue> {
+        if candidate.is_empty() {
+            return Ok(());
+        }
         let init = web_sys::RtcIceCandidateInit::new(&candidate);
+        init.set_sdp_mid(Some("0"));
+        init.set_sdp_m_line_index(Some(0));
         let cand = web_sys::RtcIceCandidate::new(&init)?;
         JsFuture::from(
             self.pc

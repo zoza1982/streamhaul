@@ -1,11 +1,19 @@
 /**
  * browser-native.spec.ts — Playwright e2e test for browser↔native WebRTC interop (P5-3).
  *
- * # What this test proves
+ * # What this test proves (Stage 2 — identity-bound, ADR-0023)
  *
- * A real Firefox `RTCPeerConnection` (browser side) can negotiate a DTLS DataChannel with the
- * native `streamhaul-webrtc-host` binary (native side), exchange a frame, and receive an echo.
- * This closes the `R-BROWSER-INTEROP` risk item for the DataChannel-only path.
+ * A real Firefox `WebClient` (browser side) negotiates a DTLS DataChannel with the native
+ * `streamhaul-webrtc-host` binary where the DTLS pin is **identity-bound**: it comes from the
+ * Noise XK `BindCert` exchanged over signaling, NOT the untrusted SDP `a=fingerprint`.
+ *
+ *   (a) Identity-bound happy path — session establishes + echo, AND the pin the browser enforced
+ *       equals the host's committed DTLS fingerprint (`pinUsedHex === host_fp`), proving the pin
+ *       is sourced from the BindCert, not just any SDP value.
+ *   (b) MITM rejection (non-vacuous) — a man-in-the-middle swaps the host's advertised DTLS
+ *       fingerprint in the answer SDP after the BindCert committed a different one; the browser's
+ *       fail-closed `verify_sdp_fingerprint_pin` ABORTS the connection. The happy-path arm above
+ *       is the honest control proving the same setup connects when NOT tampered.
  *
  * # Test setup
  *
@@ -44,6 +52,10 @@ interface InteropResult {
   connected: boolean;
   echoed: boolean;
   frameHex: string | null;
+  /** Hex of the DTLS pin the browser enforced (the host's BindCert commit), or null. */
+  pinUsedHex: string | null;
+  /** True iff the MITM SDP-fingerprint swap was rejected by the fail-closed pin gate. */
+  mitmRejected: boolean;
   error: string | null;
 }
 
@@ -194,15 +206,21 @@ test.skip(
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 test.beforeEach(async () => {
-  // 1. Start the signaling server.
-  signalingProc = spawnProcess(binaryPath("streamhaul-signaling"), ["--addr", "127.0.0.1:8765"]);
-  // Wait for the server to be ready.
-  await waitForStdoutLine(signalingProc, "SIGNALING_READY");
+  // 1. Start the signaling server on a DYNAMIC port (`:0`) so concurrent / re-run invocations
+  //    never collide on a fixed port (a stale process previously gave an opaque "Address already
+  //    in use"). The server prints its ACTUAL bound address on SIGNALING_READY.
+  signalingProc = spawnProcess(binaryPath("streamhaul-signaling"), ["--addr", "127.0.0.1:0"]);
+  const readyLine = await waitForStdoutLine(signalingProc, "SIGNALING_READY addr=");
+  const sigAddr = readyLine.trim(); // e.g. "127.0.0.1:54321"
+  if (!/^127\.0\.0\.1:\d{1,5}$/.test(sigAddr)) {
+    throw new Error(`SIGNALING_READY addr is not a 127.0.0.1:<port> address: "${sigAddr}"`);
+  }
+  const signalingUrl = `ws://${sigAddr}`;
 
-  // 2. Start the native WebRTC host.
+  // 2. Start the native WebRTC host pointed at the dynamic signaling URL.
   hostProc = spawnProcess(binaryPath("streamhaul-webrtc-host"), [
     "--signaling-url",
-    "ws://127.0.0.1:8765",
+    signalingUrl,
     "--session-id",
     SESSION_HEX,
     "--bind",
@@ -210,9 +228,9 @@ test.beforeEach(async () => {
   ]);
   // Read the DTLS fingerprint printed by the host.
   const hostFp = await waitForStdoutLine(hostProc, "HOST_DTLS_FP=");
-  // FIX 5: validate that the fingerprint is exactly 64 lowercase hex characters so a
-  // malformed value surfaces immediately with a clear error rather than propagating into
-  // encodeEnvelope deep in the browser where the failure message would be confusing.
+  // Validate that the fingerprint is exactly 64 lowercase hex characters so a malformed value
+  // surfaces immediately with a clear error rather than propagating into encodeEnvelope deep in
+  // the browser where the failure message would be confusing.
   if (!/^[0-9a-f]{64}$/.test(hostFp)) {
     throw new Error(
       `HOST_DTLS_FP is not 64 lowercase hex chars: "${hostFp.slice(0, 80)}"`,
@@ -220,6 +238,7 @@ test.beforeEach(async () => {
   }
   // Store for use in the test.
   process.env["_TEST_HOST_FP"] = hostFp;
+  process.env["_TEST_SIGNALING_URL"] = signalingUrl;
 });
 
 test.afterEach(async () => {
@@ -232,43 +251,77 @@ test.afterEach(async () => {
     signalingProc = null;
   }
   delete process.env["_TEST_HOST_FP"];
+  delete process.env["_TEST_SIGNALING_URL"];
 });
 
 // ── Test ─────────────────────────────────────────────────────────────────────
 
-test("browser↔native WebRTC DataChannel echo (P5-3)", async ({ page }) => {
-  const hostFp = process.env["_TEST_HOST_FP"]!;
-
+/** Run the in-page driver and return its {@link InteropResult}. */
+async function runDriver(
+  page: import("@playwright/test").Page,
+  query: string,
+): Promise<{ r: InteropResult; errors: string[] }> {
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(String(e)));
 
-  // Navigate to the interop test page with session and host_fp params.
-  await page.goto(`/e2e/browser-native.html?session=${SESSION_HEX}&host_fp=${hostFp}`);
+  // Pass the dynamic signaling URL to the in-page driver so it connects to the actual port the
+  // signaling server bound (the fixed-port assumption is gone).
+  const sigUrl = process.env["_TEST_SIGNALING_URL"]!;
+  await page.goto(`/e2e/browser-native.html?${query}&sig=${encodeURIComponent(sigUrl)}`);
 
-  // Poll window.__interopResult for up to 30 s.
   const result = await page.waitForFunction(
     () => {
       const r = (window as unknown as { __interopResult?: InteropResult }).__interopResult;
       return r !== undefined ? r : null;
     },
     null,
-    { timeout: 30_000, polling: 500 },
+    { timeout: 40_000, polling: 500 },
   );
 
   const r = (await result.jsonValue()) as InteropResult;
+  if (errors.length > 0) console.error("Page errors:", errors);
+  if (r.error) console.error("InteropResult error:", r.error);
+  return { r, errors };
+}
 
-  // Surface any page errors for easier debugging.
-  if (errors.length > 0) {
-    console.error("Page errors:", errors);
-  }
+test("identity-bound browser↔native DataChannel echo (P5-3 Stage 2)", async ({ page }) => {
+  const hostFp = process.env["_TEST_HOST_FP"]!;
 
-  // If there was an error, include it in the assertion message.
-  if (r.error) {
-    console.error("InteropResult error:", r.error);
-  }
+  const { r, errors } = await runDriver(page, `session=${SESSION_HEX}&host_fp=${hostFp}`);
 
   expect(r.connected, `DataChannel should be open (error: ${r.error ?? "none"})`).toBe(true);
   expect(r.echoed, "should have received an echo frame from the native host").toBe(true);
   expect(r.frameHex, "echo frame hex should not be null").not.toBeNull();
+
+  // NON-VACUOUS identity-binding assertion: the pin the browser ENFORCED equals the host's
+  // committed DTLS fingerprint (sourced from the Noise BindCert), not just any SDP value.
+  expect(r.pinUsedHex, "the enforced DTLS pin should be recorded").not.toBeNull();
+  expect(
+    r.pinUsedHex,
+    "the enforced pin must equal the host's BindCert-committed DTLS fingerprint",
+  ).toBe(hostFp);
+
+  expect(errors, "no page errors").toHaveLength(0);
+});
+
+test("MITM SDP-fingerprint swap is rejected by the identity-bound pin (P5-3 Stage 2)", async ({
+  page,
+}) => {
+  const hostFp = process.env["_TEST_HOST_FP"]!;
+
+  // mitm=1: a man-in-the-middle swaps the host's answer SDP a=fingerprint AFTER the BindCert
+  // committed the real one. The fail-closed verify_sdp_fingerprint_pin gate must abort.
+  const { r, errors } = await runDriver(page, `session=${SESSION_HEX}&host_fp=${hostFp}&mitm=1`);
+
+  expect(
+    r.mitmRejected,
+    `the swapped SDP fingerprint must be rejected by the pin gate (error: ${r.error ?? "none"})`,
+  ).toBe(true);
+  // The session must NOT have connected under MITM.
+  expect(r.connected, "MITM session must NOT connect").toBe(false);
+  expect(r.echoed, "MITM session must NOT echo").toBe(false);
+  // The pin was still sourced from the (honest) BindCert before the swap — proving the rejection
+  // is caused by the SDP/pin MISMATCH, not a missing pin.
+  expect(r.pinUsedHex, "the honest BindCert pin should still have been computed").toBe(hostFp);
   expect(errors, "no page errors").toHaveLength(0);
 });

@@ -1,8 +1,13 @@
 //! `streamhaul-webrtc-host` — native WebRTC answerer for browser↔native interop testing (P5-3).
 //!
-//! Connects to a `streamhaul-signaling` server, advertises its DTLS fingerprint, waits for an
-//! SDP offer from a browser peer, negotiates the DTLS DataChannel, and exchanges a simple echo
-//! frame to verify connectivity.
+//! # Stage 2: identity-bound DTLS pin (ADR-0023 / ADR-0014)
+//!
+//! Connects to a `streamhaul-signaling` server, runs the **identity-bound Noise XK handshake**
+//! with the browser over signaling (committing its own DTLS fingerprint inside an identity-signed
+//! `BindCert` and extracting the browser's committed fingerprint), then accepts the browser SDP
+//! offer pinning the **BindCert-committed** browser fingerprint — NOT the untrusted SDP
+//! `a=fingerprint`. A signaling/SDP MITM that swaps the offer fingerprint is therefore rejected:
+//! str0m fail-closes the DTLS handshake against the identity-bound pin.
 //!
 //! # Usage
 //!
@@ -24,14 +29,17 @@
 //!
 //! This binary uses the `insecure-lan` signaling path (`AcceptAll` authenticator), which sends
 //! an **empty** identity proof. It is intended for local integration tests **only**. Never
-//! connect it to a production signaling server.
+//! connect it to a production signaling server. The identity binding proven here is the
+//! **Noise/BindCert ↔ DTLS** layer, which is independent of (and not a substitute for) the
+//! signaling-peer authentication (R-SIG-AUTH) deferred on this path.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use bytes::Bytes;
+use sh_crypto::{DtlsCommitment, HandshakeOutcome, NoiseHandshake, SoftwareKeystore};
 use sh_signaling::backoff::ExponentialBackoff;
 use sh_signaling::envelope::{MessageKind, SessionId, SignalingEnvelope};
 use sh_signaling::SignalingClient;
@@ -49,11 +57,34 @@ use tracing::{debug, info, warn};
 /// `sh-protocol` wire format (see `sh-protocol::CommonHeader`).
 const SHP_ECHO_FRAME: &[u8] = b"SHP\x00\x00\x00\x00\x04ECHO";
 
+/// Per-step deadline for every blocking signaling receive in the handshake / offer phase.
+///
+/// Without this, a peer that connects but never sends the expected message (or sends them out of
+/// order) would hang the host forever behind the test harness's opaque outer timeout. Each step
+/// instead fails fast with a named error identifying which step stalled. 30 s is generous for a
+/// loopback round-trip yet bounded.
+const SIGNALING_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ── Noise-over-signaling sub-types (payload[0] of a `MessageKind::Noise` envelope) ──────────────
+//
+// The opaque `Noise` payload is `[sub_type: u8] || body`. The relay never inspects it
+// (zero-knowledge); only the two peers parse it. See ADR-0023 for the full ordering.
+
+/// `body` is empty. Browser→host: lets the host learn the browser's `from_fp` so it can address
+/// its own Noise replies. (The host cannot send anything to the browser until it knows `to_fp`.)
+const NOISE_SUB_HELLO: u8 = 0x00;
+/// `body` is the host's 32-byte X25519 static **public** key. Host→browser, sent once so the
+/// browser (XK initiator) can construct the handshake (XK requires the responder static up front).
+const NOISE_SUB_HOST_STATIC_PUB: u8 = 0x01;
+/// `body` is an opaque Noise XK handshake message. Either direction; carries the BindCert.
+const NOISE_SUB_MSG: u8 = 0x02;
+
 /// Entry point for the streamhaul-webrtc-host binary.
 ///
 /// # Errors
 ///
-/// Returns an error if signaling, SDP negotiation, or DataChannel exchange fails.
+/// Returns an error if signaling, the Noise handshake, SDP negotiation, or the DataChannel
+/// exchange fails.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -84,6 +115,12 @@ async fn main() -> anyhow::Result<()> {
             local_fp_hex.len()
         );
     }
+    // The 32-byte SHA-256 DTLS whole-cert fingerprint that we commit inside our BindCert.
+    let local_dtls_commit: [u8; 32] = local_fp
+        .bytes
+        .as_slice()
+        .try_into()
+        .context("local DTLS fingerprint is not 32 bytes (expected SHA-256)")?;
 
     // Print in a machine-readable form so the test harness can parse it.
     println!("HOST_DTLS_FP={local_fp_hex}");
@@ -104,15 +141,30 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("failed to connect to signaling server")?;
 
-    info!("connected to signaling server, waiting for browser offer");
+    info!("connected to signaling server, waiting for browser Noise hello");
 
-    // ── Step 3: receive the SDP offer from the browser ────────────────────────
-    let (offer_sdp, browser_fp) = receive_offer(&mut sig_client).await?;
-    // SECURITY: browser_fp is security-sensitive pairing material in Stage 2. Do not
-    // promote this log to info/warn in production code paths.
-    debug!(browser_fp = %browser_fp, "received SDP offer from browser");
+    // ── Step 3: identity-bound Noise XK handshake over signaling ──────────────
+    //
+    // The host is the XK responder. It generates its X25519 static, advertises the public key,
+    // runs the 3-message XK exchange, and extracts the BROWSER's committed DTLS fingerprint to
+    // pin. See `run_noise_responder` for the message ordering (ADR-0023).
+    let keystore = SoftwareKeystore::generate();
+    let (browser_fp, browser_dtls_pin) = run_noise_responder(
+        &mut sig_client,
+        &keystore,
+        &args,
+        &local_fp_hex,
+        local_dtls_commit,
+    )
+    .await
+    .context("identity-bound Noise handshake failed")?;
+    info!("Noise XK handshake complete; pinning browser's identity-bound DTLS fingerprint");
 
-    // ── Step 4: bind UDP socket first so we know the concrete local address ───
+    // ── Step 4: receive the SDP offer from the browser ────────────────────────
+    let offer_sdp = receive_offer(&mut sig_client, &browser_fp).await?;
+    debug!("received SDP offer from browser");
+
+    // ── Step 5: bind UDP socket first so we know the concrete local address ───
     //
     // Bind before building the transport so we can register the concrete local address
     // as a host ICE candidate. str0m requires at least one local candidate before ICE
@@ -134,8 +186,16 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid placeholder remote addr: {e}"))?;
 
+    // STAGE 2: pin the browser's BindCert-committed DTLS fingerprint, NOT the offer's SDP
+    // `a=fingerprint`. A signaling MITM that swaps the SDP fingerprint is rejected because str0m
+    // fail-closes against this identity-bound pin (the genuine browser cert is required).
     let bridge_result = SdpBridgeBuilder::new(rtc)
-        .accept_browser_offer(&offer_sdp, local_udp_addr, placeholder_remote)
+        .accept_browser_offer_with_pin(
+            &offer_sdp,
+            browser_dtls_pin,
+            local_udp_addr,
+            placeholder_remote,
+        )
         .map_err(|e| anyhow::anyhow!("SDP bridge error: {e}"))?;
 
     let answer_sdp = bridge_result.answer_sdp;
@@ -149,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to register local ICE candidate")?;
     info!(addr = %local_udp_addr, candidate = %local_candidate_sdp, "registered + will trickle local ICE candidate");
 
-    // ── Step 5: send the SDP answer back to the browser ───────────────────────
+    // ── Step 6: send the SDP answer back to the browser ───────────────────────
     let answer_env = SignalingEnvelope {
         kind: MessageKind::Answer,
         session_id: args.session_id,
@@ -191,12 +251,12 @@ async fn main() -> anyhow::Result<()> {
         .context("failed to send EndOfCandidates")?;
     info!("sent EndOfCandidates to browser");
 
-    // ── Step 6: start the drive loop ─────────────────────────────────────────
+    // ── Step 7: start the drive loop ─────────────────────────────────────────
 
     let socket: Arc<dyn sh_transport::driver::AsyncUdpSocket> = Arc::new(udp_socket);
     let _driver_handle = spawn_webrtc_driver(Arc::clone(&transport), socket, now);
 
-    // ── Step 7: forward any trickle ICE candidates from signaling ────────────
+    // ── Step 8: forward any trickle ICE candidates from signaling ────────────
     //
     // Accept the next DataChannel in a separate task so we can simultaneously pump
     // trickle candidates from the signaling channel.
@@ -273,6 +333,264 @@ impl Args {
     }
 }
 
+/// A synthetic [`Keystore`] that trusts every peer, with **no-op trust-store mutation**.
+///
+/// Used for the Stage 2 TOFU **first pairing** path: the host has not pinned the browser's
+/// identity ahead of time, so [`NoiseHandshake::complete`] would reject it as `UntrustedPeer`.
+/// This wrapper returns `true` from `is_trusted`, mirroring the wasm `TrustAllKeystore` and the
+/// `complete_for_first_pairing` browser path.
+///
+/// # Why the trust-store mutators are no-ops (Keystore-contract honesty, CLAUDE.md §6)
+///
+/// [`NoiseHandshake::complete`] only ever calls [`is_trusted`](sh_crypto::Keystore::is_trusted) on
+/// the supplied keystore — never `trust_peer` / `trust_peer_if_not_revoked` / `revoke_peer`. The
+/// other methods exist solely to satisfy the `Keystore` trait bound. They therefore **do not**
+/// touch any backing store: writing to a throwaway inner keystore and then reporting
+/// `TrustOutcome::Pinned` would be a lie (nothing is persisted), violating the trust-store
+/// contract. Instead they are explicit no-ops that report "not revoked" / freshly-pinned without
+/// persisting anything. Persistent TOFU pinning across reconnects is intentionally **deferred**
+/// (ADR-0023); this binary is a single-session integration test only.
+///
+/// The host's own identity (`device_identity` / `sign`) is **not** served by this keystore — the
+/// real `keystore` passed to the handshake constructor signs the host's `BindCert`. The
+/// `device_identity` / `sign` impls here exist only to satisfy the trait and are never invoked by
+/// `complete`; they return a uniform `CryptoError` if ever called so a future code path that does
+/// reach them fails loudly rather than silently using a stand-in identity.
+///
+/// # Keep in sync
+///
+/// A semantically-equivalent `TrustAllKeystore` exists in `sh-crypto-wasm` (browser first-pairing,
+/// `complete_for_first_pairing`). They are intentionally duplicated because this is a test/dev
+/// binary and `sh-crypto-wasm` is a wasm32-only excluded crate; consolidating into a `sh-crypto`
+/// test/dev-feature single source is tracked as a low-priority follow-up. If the `Keystore` trait
+/// surface changes, update **both**.
+struct TrustAllKeystore;
+
+#[async_trait::async_trait]
+impl sh_crypto::Keystore for TrustAllKeystore {
+    async fn device_identity(&self) -> Result<sh_crypto::DeviceIdentity, sh_crypto::CryptoError> {
+        // Never called by `complete`. Fail loudly rather than fabricate an identity.
+        Err(sh_crypto::CryptoError::HandshakeFailed {
+            reason: "TrustAllKeystore has no device identity (first-pairing trust-check only)",
+        })
+    }
+
+    async fn sign(&self, _data: &[u8]) -> Result<sh_crypto::Signature, sh_crypto::CryptoError> {
+        // Never called by `complete`. Fail loudly rather than sign with a stand-in key.
+        Err(sh_crypto::CryptoError::HandshakeFailed {
+            reason: "TrustAllKeystore cannot sign (first-pairing trust-check only)",
+        })
+    }
+
+    async fn trust_peer(
+        &self,
+        _id: &sh_crypto::DeviceIdentity,
+    ) -> Result<(), sh_crypto::CryptoError> {
+        // No-op: TOFU persistence is intentionally not implemented in this test binary.
+        Ok(())
+    }
+
+    async fn is_trusted(
+        &self,
+        _id: &sh_crypto::DeviceIdentity,
+    ) -> Result<bool, sh_crypto::CryptoError> {
+        Ok(true)
+    }
+
+    async fn revoke_peer(
+        &self,
+        _id: &sh_crypto::DeviceIdentity,
+    ) -> Result<(), sh_crypto::CryptoError> {
+        // No-op: nothing is persisted, so nothing is revoked.
+        Ok(())
+    }
+
+    async fn was_peer_revoked(
+        &self,
+        _id: &sh_crypto::DeviceIdentity,
+    ) -> Result<bool, sh_crypto::CryptoError> {
+        // No persistent store ⇒ no peer is ever recorded as revoked.
+        Ok(false)
+    }
+
+    async fn trust_peer_if_not_revoked(
+        &self,
+        _id: &sh_crypto::DeviceIdentity,
+    ) -> Result<sh_crypto::pairing::TrustOutcome, sh_crypto::CryptoError> {
+        // No-op trust-on-first-use: report freshly-pinned WITHOUT persisting (honest about the
+        // no-op — there is no backing store to write to).
+        Ok(sh_crypto::pairing::TrustOutcome::Pinned)
+    }
+}
+
+/// Run the identity-bound Noise XK handshake as the **responder** (host side).
+///
+/// Message ordering (ADR-0023), with `B`=browser, `H`=host:
+///
+/// ```text
+/// B → H : Noise(NOISE_SUB_HELLO, [])           // host learns browser's from_fp
+/// H → B : Noise(NOISE_SUB_HOST_STATIC_PUB, X)  // host advertises X25519 static pub (XK needs it)
+/// B → H : Noise(NOISE_SUB_MSG, msg0)
+/// H → B : Noise(NOISE_SUB_MSG, msg1)
+/// B → H : Noise(NOISE_SUB_MSG, msg2)
+/// H     : complete() → extract browser's committed DTLS fingerprint
+/// ```
+///
+/// Returns `(browser_from_fp, browser_committed_dtls_fp)`. The pin is the browser's identity-
+/// signed `BindCert` DTLS commitment (`HandshakeOutcome::require_webrtc_dtls_pin`), which the
+/// caller pins on the WebRTC transport.
+async fn run_noise_responder(
+    sig: &mut SignalingClient,
+    keystore: &SoftwareKeystore,
+    args: &Args,
+    local_fp_hex: &str,
+    local_dtls_commit: [u8; 32],
+) -> anyhow::Result<(String, [u8; 32])> {
+    // Generate the host's X25519 static. The public key is advertised; the secret never leaves
+    // this function (consumed by the responder handshake constructor).
+    let local_static = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let local_static_pub = x25519_dalek::PublicKey::from(&local_static);
+
+    // 1. Wait for the browser's NOISE_HELLO so we learn its `from_fp` (the address for replies).
+    let browser_fp = recv_noise_hello(sig).await?;
+
+    // 2. Advertise our X25519 static public key.
+    send_noise(
+        sig,
+        args,
+        local_fp_hex,
+        &browser_fp,
+        NOISE_SUB_HOST_STATIC_PUB,
+        local_static_pub.as_bytes(),
+    )
+    .await
+    .context("failed to send host static pub")?;
+
+    // 3. Construct the XK responder, committing OUR DTLS fingerprint in the BindCert.
+    let clock = sh_types::SystemClock;
+    let mut hs = NoiseHandshake::responder_xk_with_dtls(
+        keystore,
+        local_static,
+        &[],
+        DtlsCommitment::sha256(local_dtls_commit),
+        &clock,
+    )
+    .await
+    .context("failed to construct XK responder")?;
+
+    // 4. XK is 3 messages: read msg0, write msg1, read msg2.
+    let msg0 = recv_noise_msg(sig, &browser_fp).await?;
+    hs.read_message(&msg0, &clock)
+        .context("failed to read Noise msg0")?;
+
+    let msg1 = hs.write_message().context("failed to write Noise msg1")?;
+    send_noise(sig, args, local_fp_hex, &browser_fp, NOISE_SUB_MSG, &msg1)
+        .await
+        .context("failed to send Noise msg1")?;
+
+    let msg2 = recv_noise_msg(sig, &browser_fp).await?;
+    hs.read_message(&msg2, &clock)
+        .context("failed to read Noise msg2")?;
+
+    if !hs.is_finished() {
+        anyhow::bail!("Noise handshake did not finish after 3 messages");
+    }
+
+    // 5. Complete with a trust-all keystore (TOFU first pairing). `complete` only calls
+    //    `is_trusted` on this keystore; the host's own BindCert was already signed by `keystore`
+    //    during the responder constructor. Extract the browser's committed DTLS fingerprint — the
+    //    identity-bound pin.
+    let outcome: HandshakeOutcome = hs
+        .complete(&TrustAllKeystore)
+        .await
+        .context("Noise complete (first pairing) failed")?;
+
+    let browser_dtls_pin = outcome
+        .require_webrtc_dtls_pin()
+        .context("browser BindCert carries no DTLS fingerprint (downgrade)")?;
+
+    Ok((browser_fp, browser_dtls_pin))
+}
+
+/// Receive a single signaling envelope with a bounded [`SIGNALING_STEP_TIMEOUT`] deadline.
+///
+/// `step` names the handshake/offer step for the timeout / connection-closed error so a stall is
+/// diagnosable instead of opaque. Returns the envelope, or an error if the deadline elapses, the
+/// connection closes, or signaling I/O fails.
+async fn recv_bounded(sig: &mut SignalingClient, step: &str) -> anyhow::Result<SignalingEnvelope> {
+    let received = tokio::time::timeout(SIGNALING_STEP_TIMEOUT, sig.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("timed out waiting for signaling message ({step})"))?
+        .with_context(|| format!("signaling recv failed ({step})"))?;
+    received.ok_or_else(|| anyhow::anyhow!("signaling connection closed before {step}"))
+}
+
+/// Wait for a `MessageKind::Noise` envelope carrying `NOISE_SUB_HELLO`; returns the browser's
+/// `from_fp`.
+async fn recv_noise_hello(sig: &mut SignalingClient) -> anyhow::Result<String> {
+    loop {
+        let env = recv_bounded(sig, "Noise hello").await?;
+        if env.kind == MessageKind::Noise {
+            match env.payload.first().copied() {
+                Some(NOISE_SUB_HELLO) => return Ok(env.from_fp),
+                Some(other) => {
+                    debug!(
+                        sub = other,
+                        "ignoring non-hello Noise sub-type before hello"
+                    );
+                }
+                None => warn!("empty Noise payload (ignored)"),
+            }
+        } else {
+            debug!(kind = ?env.kind, "ignoring non-Noise signaling message before hello");
+        }
+    }
+}
+
+/// Wait for a `MessageKind::Noise` envelope carrying `NOISE_SUB_MSG` from `expected_fp`; returns
+/// the opaque Noise body.
+async fn recv_noise_msg(sig: &mut SignalingClient, expected_fp: &str) -> anyhow::Result<Vec<u8>> {
+    loop {
+        let env = recv_bounded(sig, "Noise handshake message").await?;
+        if env.kind == MessageKind::Noise && env.from_fp == expected_fp {
+            match env.payload.split_first() {
+                Some((&NOISE_SUB_MSG, body)) => return Ok(body.to_vec()),
+                Some((&other, _)) => {
+                    debug!(
+                        sub = other,
+                        "ignoring unexpected Noise sub-type during exchange"
+                    );
+                }
+                None => warn!("empty Noise payload during exchange (ignored)"),
+            }
+        } else {
+            debug!(kind = ?env.kind, "ignoring unrelated signaling message during Noise exchange");
+        }
+    }
+}
+
+/// Send a `MessageKind::Noise` envelope with `sub_type` prefixed onto `body`.
+async fn send_noise(
+    sig: &mut SignalingClient,
+    args: &Args,
+    from_fp: &str,
+    to_fp: &str,
+    sub_type: u8,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let mut payload = Vec::with_capacity(body.len().saturating_add(1));
+    payload.push(sub_type);
+    payload.extend_from_slice(body);
+    let env = SignalingEnvelope {
+        kind: MessageKind::Noise,
+        session_id: args.session_id,
+        from_fp: from_fp.to_owned(),
+        to_fp: to_fp.to_owned(),
+        payload: Bytes::from(payload),
+    };
+    sig.send(env).await.context("failed to send Noise envelope")
+}
+
 /// Parse a 32-char lowercase hex string into a [`SessionId`].
 fn parse_session_id(hex: &str) -> anyhow::Result<SessionId> {
     if hex.len() != 32 {
@@ -297,23 +615,21 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Wait for a `MessageKind::Offer` envelope from the signaling server.
+/// Wait for a `MessageKind::Offer` envelope from `expected_fp`.
 ///
-/// Returns `(offer_sdp_text, browser_from_fp)`.
+/// Returns the `offer_sdp_text`.
 ///
 /// # Errors
 ///
 /// Returns an error if the signaling connection closes before an offer arrives, or if the
 /// payload is not valid UTF-8.
-async fn receive_offer(sig: &mut SignalingClient) -> anyhow::Result<(String, String)> {
+async fn receive_offer(sig: &mut SignalingClient, expected_fp: &str) -> anyhow::Result<String> {
     loop {
-        let Some(env) = sig.recv().await.context("signaling recv failed")? else {
-            anyhow::bail!("signaling connection closed before receiving an offer");
-        };
-        if env.kind == MessageKind::Offer {
+        let env = recv_bounded(sig, "SDP offer").await?;
+        if env.kind == MessageKind::Offer && env.from_fp == expected_fp {
             let offer_sdp =
                 String::from_utf8(env.payload.to_vec()).context("offer payload is not UTF-8")?;
-            return Ok((offer_sdp, env.from_fp));
+            return Ok(offer_sdp);
         }
         debug!(kind = ?env.kind, "ignoring non-offer signaling message");
     }
@@ -414,4 +730,23 @@ async fn run_data_channel(transport: &PinnedWebRtcTransport) -> anyhow::Result<(
 
     info!("echo complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NOISE_SUB_HELLO, NOISE_SUB_HOST_STATIC_PUB, NOISE_SUB_MSG};
+
+    /// The Noise sub-type wire values are a cross-language contract with the browser driver
+    /// (`clients/web/e2e/browser-native.ts`). Pin the exact numeric values here so a change on the
+    /// Rust side breaks this test (and the mirrored assertion in `browser-native.spec.ts` breaks on
+    /// the TS side) rather than silently desyncing the two implementations. See ADR-0023.
+    #[test]
+    fn noise_sub_type_wire_values_are_pinned() {
+        assert_eq!(NOISE_SUB_HELLO, 0x00, "NOISE_SUB_HELLO wire value changed");
+        assert_eq!(
+            NOISE_SUB_HOST_STATIC_PUB, 0x01,
+            "NOISE_SUB_HOST_STATIC_PUB wire value changed"
+        );
+        assert_eq!(NOISE_SUB_MSG, 0x02, "NOISE_SUB_MSG wire value changed");
+    }
 }
