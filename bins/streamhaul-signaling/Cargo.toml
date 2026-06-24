@@ -1,0 +1,21 @@
+[package]
+name = "streamhaul-signaling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# streamhaul-signaling: standalone WebSocket signaling server for local/integration use.
+# Wires sh-signaling's SignalingServer with AcceptAll (insecure-lan) for development and
+# browser↔native e2e testing (P5-3). Not for production deployment.
+
+[dependencies]
+sh-signaling = { path = "../../crates/sh-signaling", features = ["insecure-lan"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

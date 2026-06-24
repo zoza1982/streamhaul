@@ -26,6 +26,10 @@ export default defineConfig({
           firefoxUserPrefs: {
             // Allow RTCPeerConnection loopback (host↔host on the same machine) without ICE servers.
             "media.peerconnection.ice.loopback": true,
+            // Emit RAW host IP candidates (127.0.0.1) instead of mDNS `.local` hostnames — the
+            // native str0m host has no mDNS resolver, so obfuscated candidates would never pair
+            // (browser↔native ICE would stall and the DataChannel never opens).
+            "media.peerconnection.ice.obfuscate_host_addresses": false,
             // Enable WebCodecs (VideoEncoder/VideoDecoder) in this Firefox build.
             "dom.media.webcodecs.enabled": true,
             "dom.media.webcodecs.image-decoder.enabled": true,

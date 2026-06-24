@@ -987,6 +987,359 @@ impl Channel for WebRtcChannel {
     }
 }
 
+// ── SdpBridge ─────────────────────────────────────────────────────────────────
+
+/// Errors that can occur during SDP bridging (browser ↔ native offer/answer exchange).
+#[derive(Debug, thiserror::Error)]
+pub enum SdpBridgeError {
+    /// The offered SDP string exceeds the maximum allowed size.
+    #[error("SDP too large ({actual} bytes > {max} bytes)")]
+    SdpTooLarge {
+        /// Actual byte length of the received SDP.
+        actual: usize,
+        /// Maximum allowed byte length.
+        max: usize,
+    },
+
+    /// No `a=fingerprint:sha-256 …` attribute line was found in the SDP.
+    #[error("no a=fingerprint:sha-256 line found in SDP")]
+    NoFingerprint,
+
+    /// A fingerprint hex group could not be parsed.
+    #[error("fingerprint hex parse error: {reason}")]
+    FingerprintParseError {
+        /// Human-readable description of what went wrong.
+        reason: &'static str,
+    },
+
+    /// An ICE candidate string could not be parsed.
+    #[error("ICE candidate parse error: {0}")]
+    CandidateParseError(String),
+
+    /// The SDP offer string could not be parsed by str0m.
+    #[error("SDP parse error: {0}")]
+    SdpParseError(String),
+
+    /// str0m rejected the SDP offer (e.g. incompatible codecs, fingerprint conflict).
+    #[error("offer rejection: {0}")]
+    OfferRejected(String),
+}
+
+/// The result of successfully bridging a browser SDP offer to a native str0m transport.
+pub struct SdpBridgeResult {
+    /// The SDP answer string to send back to the browser.
+    pub answer_sdp: String,
+
+    /// The local DTLS fingerprint of the native peer.
+    ///
+    /// Must be shared with the browser out-of-band (or via signaling) so the browser can
+    /// verify the DTLS handshake.
+    ///
+    /// # Security
+    ///
+    /// This is security-sensitive pairing material. Do not log at `info` or higher.
+    pub local_dtls_fingerprint: Fingerprint,
+
+    /// The fully-pinned WebRTC transport, ready to be driven.
+    pub transport: PinnedWebRtcTransport,
+}
+
+/// Maximum SDP byte length accepted by [`SdpBridgeBuilder`].
+///
+/// 64 KiB is sufficient for any real SDP; larger values indicate a hostile or buggy peer.
+const MAX_SDP_BYTES: usize = 64 * 1024;
+
+/// Maximum SDP lines scanned for the fingerprint attribute.
+///
+/// Limits CPU exposure when processing SDPs with many short lines.
+const MAX_SDP_LINES: usize = 10_000;
+
+/// Maximum length of a single SDP line we will inspect.
+///
+/// `a=fingerprint:sha-256` lines are at most ~90 characters; 200 provides safe headroom.
+const MAX_SDP_LINE_LEN: usize = 200;
+
+/// Builder that accepts a browser's SDP offer and produces a [`SdpBridgeResult`].
+///
+/// # Security
+///
+/// - The SDP is size-bounded (64 KiB) before any parsing.
+/// - The `a=fingerprint:sha-256` line is located with bounded line scanning (10 000 lines).
+/// - Each hex group is validated to be exactly 2 ASCII hex characters.
+/// - The resulting fingerprint byte count is verified to be exactly 32 (SHA-256).
+/// - `pin_remote_dtls` is called on the builder before returning the transport, preserving
+///   the DTLS-pin security invariant from [`WebRtcTransportBuilder`].
+///
+/// # Trickle ICE
+///
+/// Real-world trickle ICE flow:
+///
+/// 1. Call [`accept_browser_offer`](Self::accept_browser_offer) with the browser's SDP offer
+///    to get the [`SdpBridgeResult`] (answer SDP + transport).
+/// 2. Send the SDP answer to the browser.
+/// 3. Feed each subsequent trickle candidate from the browser to
+///    [`PinnedWebRtcTransport::add_remote_candidate`] on the **returned transport**.
+///
+/// [`SdpBridgeBuilder::add_remote_candidate`] only handles the rare case where a candidate
+/// arrives simultaneously with the offer text (before the builder has been consumed by
+/// `accept_browser_offer`). In the typical trickle flow the candidates arrive after the offer,
+/// so they must be forwarded to the transport returned by `accept_browser_offer`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use std::net::SocketAddr;
+/// use std::time::Instant;
+/// use str0m::Rtc;
+/// use sh_transport::webrtc::SdpBridgeBuilder;
+///
+/// # fn run(offer_sdp: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// let rtc = Rtc::new(Instant::now());
+/// let local: SocketAddr = "0.0.0.0:0".parse()?;
+/// let remote: SocketAddr = "0.0.0.0:0".parse()?;
+/// let result = SdpBridgeBuilder::new(rtc)
+///     .accept_browser_offer(offer_sdp, local, remote)?;
+/// // Send result.answer_sdp back to the browser.
+/// # Ok(())
+/// # }
+/// ```
+pub struct SdpBridgeBuilder {
+    rtc: Rtc,
+}
+
+impl SdpBridgeBuilder {
+    /// Create a new `SdpBridgeBuilder` wrapping a freshly-constructed [`str0m::Rtc`].
+    #[must_use]
+    pub fn new(rtc: Rtc) -> Self {
+        Self { rtc }
+    }
+
+    /// Parse and add a remote ICE candidate (trickle ICE) before the offer is accepted.
+    ///
+    /// Call this for each trickle-ICE candidate that arrives alongside the offer.
+    /// Candidates arriving **after** [`accept_browser_offer`](Self::accept_browser_offer)
+    /// must be added via [`PinnedWebRtcTransport::add_remote_candidate`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SdpBridgeError::CandidateParseError`] if the candidate string is malformed.
+    pub fn add_remote_candidate(&mut self, candidate_sdp: &str) -> Result<(), SdpBridgeError> {
+        let candidate = str0m::Candidate::from_sdp_string(candidate_sdp)
+            .map_err(|e| SdpBridgeError::CandidateParseError(e.to_string()))?;
+        self.rtc.add_remote_candidate(candidate);
+        Ok(())
+    }
+
+    /// Return the local DTLS fingerprint before consuming the builder.
+    ///
+    /// Useful if you need the local fingerprint before calling
+    /// [`accept_browser_offer`](Self::accept_browser_offer) (e.g. to include it in a
+    /// signaling message sent before the answer is ready).
+    ///
+    /// # Security
+    ///
+    /// Do not log this value at `info` or higher; it is security-sensitive pairing material.
+    #[must_use]
+    pub fn local_dtls_fingerprint(&mut self) -> Fingerprint {
+        self.rtc.direct_api().local_dtls_fingerprint().clone()
+    }
+
+    /// Accept the browser's SDP offer and produce a [`SdpBridgeResult`].
+    ///
+    /// This method:
+    /// 1. Validates the `offer_sdp` byte length (≤ 64 KiB).
+    /// 2. Parses the remote DTLS fingerprint from the SDP (SHA-256 only, exactly 32 bytes).
+    /// 3. Calls `rtc.sdp_api().accept_offer(…)` to get the SDP answer.
+    /// 4. Pins the remote DTLS fingerprint via [`WebRtcTransportBuilder::pin_remote_dtls`].
+    ///
+    /// # Errors
+    ///
+    /// - [`SdpBridgeError::SdpTooLarge`] if the SDP exceeds 64 KiB.
+    /// - [`SdpBridgeError::NoFingerprint`] if no `a=fingerprint:sha-256` line is found.
+    /// - [`SdpBridgeError::FingerprintParseError`] if the fingerprint hex is malformed.
+    /// - [`SdpBridgeError::SdpParseError`] if str0m cannot parse the SDP.
+    /// - [`SdpBridgeError::OfferRejected`] if str0m rejects the offer.
+    pub fn accept_browser_offer(
+        mut self,
+        offer_sdp: &str,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> Result<SdpBridgeResult, SdpBridgeError> {
+        // 1. Bound the SDP size before doing any work.
+        let byte_len = offer_sdp.len();
+        if byte_len > MAX_SDP_BYTES {
+            return Err(SdpBridgeError::SdpTooLarge {
+                actual: byte_len,
+                max: MAX_SDP_BYTES,
+            });
+        }
+
+        // 2. Extract the remote DTLS fingerprint from the SDP text.
+        let remote_fp = parse_sdp_fingerprint(offer_sdp)?;
+
+        // 3. Parse the SDP offer with str0m.
+        let sdp_offer = str0m::change::SdpOffer::from_sdp_string(offer_sdp)
+            .map_err(|e| SdpBridgeError::SdpParseError(e.to_string()))?;
+
+        // 4. Accept the offer — str0m also internally extracts + records the remote fingerprint
+        //    from the SDP and will fail-close any DTLS mismatch automatically. We additionally
+        //    call pin_remote_dtls below (same value) to satisfy the structural invariant.
+        let sdp_answer = self
+            .rtc
+            .sdp_api()
+            .accept_offer(sdp_offer)
+            .map_err(|e| SdpBridgeError::OfferRejected(e.to_string()))?;
+
+        // 5. Capture the local DTLS fingerprint (before the Rtc is consumed by the builder).
+        let local_dtls_fingerprint = self.rtc.direct_api().local_dtls_fingerprint().clone();
+
+        // 6. Build the transport, pinning the remote fingerprint (enforces the structural
+        //    invariant from WebRtcTransportBuilder: pin BEFORE any DTLS traffic).
+        let transport = WebRtcTransportBuilder::new(self.rtc, local_addr, remote_addr)
+            .pin_remote_dtls(remote_fp);
+
+        let answer_sdp = sdp_answer.to_sdp_string();
+
+        Ok(SdpBridgeResult {
+            answer_sdp,
+            local_dtls_fingerprint,
+            transport,
+        })
+    }
+}
+
+impl PinnedWebRtcTransport {
+    /// Parse and add a remote ICE candidate (trickle ICE) to the running transport.
+    ///
+    /// Call this for each trickle-ICE candidate received from the browser **after** the
+    /// SDP offer/answer exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::CandidateParseError`] if the candidate string is malformed.
+    /// This is part of the general [`TransportError`] type — callers do not need to import
+    /// the builder-specific [`SdpBridgeError`] to handle parse failures.
+    pub fn add_remote_candidate(&self, candidate_sdp: &str) -> Result<(), TransportError> {
+        let candidate = str0m::Candidate::from_sdp_string(candidate_sdp)
+            .map_err(|e| TransportError::CandidateParseError(e.to_string()))?;
+        self.0.lock().rtc.add_remote_candidate(candidate);
+        Ok(())
+    }
+
+    /// Add a local host ICE candidate so str0m knows which UDP address to use for connectivity.
+    ///
+    /// **Must** be called after binding the UDP socket and before the ICE exchange begins.
+    /// str0m will not attempt any connectivity checks until at least one local candidate is
+    /// registered; omitting this call means ICE (and therefore DTLS/DataChannel) will never
+    /// connect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::CandidateParseError`] if `addr` is unspecified, multicast,
+    /// loopback-excluded, or otherwise rejected by the ICE implementation.
+    ///
+    /// # Notes
+    ///
+    /// - `addr` must be a concrete, routable IP (e.g. `127.0.0.1` for loopback testing).
+    ///   `0.0.0.0` / `::` (unspecified) will be rejected.
+    /// - This method takes `&self` because candidate state is accessed through the internal
+    ///   `Mutex<WebRtcInner>`. Do not call it concurrently while another thread holds the same
+    ///   lock, and call it **before** passing the transport to `spawn_webrtc_driver` to avoid
+    ///   racing with the driver's own lock acquisitions.
+    pub fn add_local_host_candidate(&self, addr: SocketAddr) -> Result<String, TransportError> {
+        let candidate = str0m::Candidate::host(addr, "udp")
+            .map_err(|e| TransportError::CandidateParseError(e.to_string()))?;
+        // Capture the SDP form (`candidate:<foundation> 1 udp …`) BEFORE the value is consumed
+        // by `add_local_candidate`, so the caller can trickle it to the remote peer over
+        // signalling — the browser cannot reach the host without learning this candidate.
+        let sdp = candidate.to_sdp_string();
+        self.0.lock().rtc.add_local_candidate(candidate);
+        Ok(sdp)
+    }
+}
+
+/// Parse the first `a=fingerprint:sha-256 AA:BB:CC:…` line from an SDP string.
+///
+/// # Validation
+///
+/// - Scans at most [`MAX_SDP_LINES`] lines.
+/// - Only lines with length ≤ [`MAX_SDP_LINE_LEN`] are considered.
+/// - Only `sha-256` algorithm is accepted (browser-standard for DTLS-SRTP).
+/// - Each hex group must be exactly 2 ASCII hex characters.
+/// - The resulting byte slice must be exactly 32 bytes (SHA-256 output length).
+///
+/// # Errors
+///
+/// - [`SdpBridgeError::NoFingerprint`] if no matching line is found.
+/// - [`SdpBridgeError::FingerprintParseError`] if parsing or validation fails.
+fn parse_sdp_fingerprint(sdp: &str) -> Result<Fingerprint, SdpBridgeError> {
+    const PREFIX: &str = "a=fingerprint:sha-256 ";
+
+    // Deliberate design: return the FIRST sha-256 fingerprint found in document order.
+    // In SDP, session-level attributes precede `m=` sections, so the first fingerprint is
+    // the session-level one. This is consistent with how str0m resolves fingerprints
+    // (`session.fingerprint().or_else(|| ...)` in str0m's data.rs). RFC 4572 §5 says
+    // media-level fingerprints override session-level ones, but we do not implement that
+    // override — we always take the session-level fingerprint and str0m does the same.
+    // Any future change to honor media-level precedence must update this function AND
+    // ensure it stays consistent with str0m's own fingerprint selection.
+    for (i, line) in sdp.lines().enumerate() {
+        if i >= MAX_SDP_LINES {
+            break;
+        }
+        if line.len() > MAX_SDP_LINE_LEN {
+            continue;
+        }
+        // Try exact case match first.
+        if let Some(hex_part) = line.strip_prefix(PREFIX) {
+            return decode_fingerprint_hex(hex_part);
+        }
+        // Also accept uppercase/mixed-case algorithm identifier (RFC 4572 is case-insensitive).
+        let lower = line.to_ascii_lowercase();
+        if let Some(hex_part) = lower.strip_prefix(PREFIX) {
+            return decode_fingerprint_hex(hex_part);
+        }
+    }
+
+    Err(SdpBridgeError::NoFingerprint)
+}
+
+/// Decode a colon-separated hex fingerprint string (e.g. `"AA:BB:CC:…"`) into a
+/// [`Fingerprint`] with `hash_func = "sha-256"`.
+fn decode_fingerprint_hex(hex_part: &str) -> Result<Fingerprint, SdpBridgeError> {
+    let groups: Vec<&str> = hex_part.split(':').collect();
+    if groups.is_empty() {
+        return Err(SdpBridgeError::FingerprintParseError {
+            reason: "fingerprint hex part is empty",
+        });
+    }
+
+    let mut bytes = Vec::with_capacity(groups.len());
+    for group in &groups {
+        if group.len() != 2 {
+            return Err(SdpBridgeError::FingerprintParseError {
+                reason: "each hex group must be exactly 2 characters",
+            });
+        }
+        let byte =
+            u8::from_str_radix(group, 16).map_err(|_| SdpBridgeError::FingerprintParseError {
+                reason: "fingerprint hex group is not valid hexadecimal",
+            })?;
+        bytes.push(byte);
+    }
+
+    if bytes.len() != 32 {
+        return Err(SdpBridgeError::FingerprintParseError {
+            reason: "SHA-256 fingerprint must be exactly 32 bytes",
+        });
+    }
+
+    Ok(Fingerprint {
+        hash_func: "sha-256".to_owned(),
+        bytes,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1723,6 +2076,208 @@ mod tests {
             transport.packet_loss(),
             0.0,
             "packet_loss() must be 0.0 initially"
+        );
+    }
+
+    // ── SdpBridge unit tests ──────────────────────────────────────────────────
+
+    /// Build a valid `a=fingerprint:sha-256` SDP line from 32 bytes.
+    fn make_fp_line(bytes: &[u8; 32]) -> String {
+        let hex_groups: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        format!("a=fingerprint:sha-256 {}", hex_groups.join(":"))
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_valid() {
+        let fp_bytes = [0xABu8; 32];
+        let sdp = format!(
+            "v=0\r\n{}\r\no=- 0 0 IN IP4 127.0.0.1\r\n",
+            make_fp_line(&fp_bytes)
+        );
+        let fp = parse_sdp_fingerprint(&sdp).unwrap();
+        assert_eq!(fp.hash_func, "sha-256");
+        assert_eq!(fp.bytes, fp_bytes);
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_lowercase_algo() {
+        // Some implementations emit lowercase algorithm identifier.
+        let fp_bytes = [0x11u8; 32];
+        let hex_groups: Vec<String> = fp_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let sdp = format!("a=fingerprint:sha-256 {}", hex_groups.join(":"));
+        let fp = parse_sdp_fingerprint(&sdp).unwrap();
+        assert_eq!(fp.bytes, fp_bytes);
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_no_fingerprint() {
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let err = parse_sdp_fingerprint(sdp).unwrap_err();
+        assert!(
+            matches!(err, SdpBridgeError::NoFingerprint),
+            "expected NoFingerprint, got {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_too_large_rejected_by_builder() {
+        // build_sdp_bridge checks size before parsing.
+        let big_sdp = "x".repeat(64 * 1024 + 1);
+        let rtc = Rtc::new(Instant::now());
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        match SdpBridgeBuilder::new(rtc).accept_browser_offer(&big_sdp, local, remote) {
+            Err(SdpBridgeError::SdpTooLarge { .. }) => {}
+            Err(e) => panic!("expected SdpTooLarge, got error: {e}"),
+            Ok(_) => panic!("expected Err, got Ok"),
+        }
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_wrong_byte_count() {
+        // 31 bytes instead of 32.
+        let fp_bytes = [0xAAu8; 31];
+        let hex_groups: Vec<String> = fp_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let sdp = format!("a=fingerprint:sha-256 {}", hex_groups.join(":"));
+        let err = parse_sdp_fingerprint(&sdp).unwrap_err();
+        assert!(
+            matches!(err, SdpBridgeError::FingerprintParseError { .. }),
+            "expected FingerprintParseError for wrong byte count, got {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_invalid_hex() {
+        // Non-hex character in one group.
+        let sdp = "a=fingerprint:sha-256 ZZ:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF";
+        let err = parse_sdp_fingerprint(sdp).unwrap_err();
+        assert!(
+            matches!(err, SdpBridgeError::FingerprintParseError { .. }),
+            "expected FingerprintParseError for invalid hex, got {err}"
+        );
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_group_wrong_length() {
+        // Group with 3 chars instead of 2.
+        let sdp = "a=fingerprint:sha-256 ABC:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF";
+        let err = parse_sdp_fingerprint(sdp).unwrap_err();
+        assert!(
+            matches!(err, SdpBridgeError::FingerprintParseError { .. }),
+            "expected FingerprintParseError for wrong group length, got {err}"
+        );
+    }
+
+    #[test]
+    fn sdp_bridge_error_display() {
+        // Smoke-test that Display impls work (thiserror derives them).
+        let e = SdpBridgeError::SdpTooLarge {
+            actual: 100_000,
+            max: 65_536,
+        };
+        assert!(e.to_string().contains("100000"));
+
+        let e2 = SdpBridgeError::NoFingerprint;
+        assert!(e2.to_string().contains("fingerprint"));
+
+        let e3 = SdpBridgeError::FingerprintParseError {
+            reason: "test reason",
+        };
+        assert!(e3.to_string().contains("test reason"));
+
+        let e4 = SdpBridgeError::CandidateParseError("bad candidate".to_owned());
+        assert!(e4.to_string().contains("bad candidate"));
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_uppercase_algo() {
+        // Exercises the `to_ascii_lowercase()` branch for case-insensitive algorithm matching.
+        let fp_bytes = [0xCCu8; 32];
+        let hex_groups: Vec<String> = fp_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        // Use uppercase algorithm name and uppercase hex groups.
+        let sdp = format!("A=FINGERPRINT:SHA-256 {}", hex_groups.join(":"));
+        let fp = parse_sdp_fingerprint(&sdp).unwrap();
+        assert_eq!(fp.bytes, fp_bytes);
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_fp_on_oversized_line_skipped() {
+        // A fingerprint on a line exceeding MAX_SDP_LINE_LEN (200) is skipped silently,
+        // and the parser continues to find a valid fingerprint on a subsequent line.
+        let fp_bytes = [0xDDu8; 32];
+        let hex_groups: Vec<String> = fp_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let valid_fp_line = format!("a=fingerprint:sha-256 {}", hex_groups.join(":"));
+        // Construct an overlong line that looks like a fingerprint but should be skipped.
+        let overlong_line = format!("{}{}", valid_fp_line, " ".repeat(200));
+        let sdp = format!("{overlong_line}\r\n{valid_fp_line}");
+        let fp = parse_sdp_fingerprint(&sdp).unwrap();
+        assert_eq!(fp.bytes, fp_bytes);
+    }
+
+    #[test]
+    fn parse_sdp_fingerprint_beyond_max_lines_returns_not_found() {
+        // A fingerprint placed past MAX_SDP_LINES is never reached.
+        let fp_bytes = [0xEEu8; 32];
+        let hex_groups: Vec<String> = fp_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let fp_line = format!("a=fingerprint:sha-256 {}", hex_groups.join(":"));
+        // Build an SDP with MAX_SDP_LINES lines of filler, then the fingerprint.
+        let filler = "a=foo:bar\r\n".repeat(MAX_SDP_LINES);
+        let sdp = format!("{filler}{fp_line}");
+        let err = parse_sdp_fingerprint(&sdp).unwrap_err();
+        assert!(
+            matches!(err, SdpBridgeError::NoFingerprint),
+            "expected NoFingerprint when fingerprint is past MAX_SDP_LINES, got {err}"
+        );
+    }
+
+    /// Verify that an unsupported algorithm (`sha-1`) returns `NoFingerprint`, not a parse error.
+    ///
+    /// This documents the deliberate behavior: we only accept `sha-256`. A present-but-wrong
+    /// algorithm is treated as absent (no matching line found), which causes the caller to reject
+    /// the SDP with `SdpBridgeError::NoFingerprint`. The error message is less precise than a
+    /// dedicated `UnsupportedAlgorithm` variant, but the rejection is correct.
+    #[test]
+    fn parse_sdp_fingerprint_unsupported_algorithm_returns_no_fingerprint() {
+        // sha-1 produces 20 bytes — build a valid sha-1 hex string.
+        let fp_bytes = [0x11u8; 20];
+        let hex_groups: Vec<String> = fp_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let sdp = format!("a=fingerprint:sha-1 {}", hex_groups.join(":"));
+        let err = parse_sdp_fingerprint(&sdp).unwrap_err();
+        assert!(
+            matches!(err, SdpBridgeError::NoFingerprint),
+            "sha-1 fingerprint must return NoFingerprint (algorithm not accepted), got {err}"
+        );
+    }
+
+    /// Verify RFC 4572 §5 media-level fingerprint behavior.
+    ///
+    /// `parse_sdp_fingerprint` returns the FIRST `a=fingerprint:sha-256` line in document order.
+    /// In SDP, session-level attributes appear before `m=` lines, so the first fingerprint is
+    /// the session-level one. This matches str0m's own fingerprint selection. This test asserts
+    /// the documented behavior so that a future change to RFC 4572 media-level precedence does
+    /// not silently diverge from str0m and break the pin invariant.
+    #[test]
+    fn parse_sdp_fingerprint_returns_session_level_not_media_level() {
+        let session_fp = [0xAA_u8; 32];
+        let media_fp = [0xBB_u8; 32];
+
+        let make_fp = |bytes: &[u8; 32]| -> String {
+            let hex_groups: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+            format!("a=fingerprint:sha-256 {}", hex_groups.join(":"))
+        };
+
+        // Construct a minimal SDP with session-level fingerprint first, then an m= section
+        // with a media-level fingerprint bearing different bytes.
+        let sdp = format!(
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n{}\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n{}\r\n",
+            make_fp(&session_fp),
+            make_fp(&media_fp)
+        );
+
+        let fp = parse_sdp_fingerprint(&sdp).unwrap();
+        assert_eq!(
+            fp.bytes, session_fp,
+            "must return session-level fingerprint (first in document order), not media-level"
         );
     }
 }

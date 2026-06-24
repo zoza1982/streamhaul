@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<!--
+  browser-native.html — test harness page for browser↔native WebRTC interop (P5-3).
+
+  Used by browser-native.spec.ts (Playwright). The page imports the compiled JS bundle for
+  browser-native.ts, which drives the RTCPeerConnection negotiation and DataChannel exchange.
+
+  Parameters (URL query string):
+    session   — 32-char hex session ID
+    host_fp   — 64-char hex DTLS fingerprint of the native host (streamhaul-webrtc-host)
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Browser↔Native Interop Test (P5-3)</title>
+    <style>
+      body {
+        font-family: monospace;
+        padding: 1rem;
+        background: #111;
+        color: #eee;
+      }
+      #status {
+        margin-top: 0.5rem;
+        font-size: 0.9rem;
+        color: #aaa;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Browser↔Native WebRTC Interop Test</h2>
+    <p id="status">Running… check <code>window.__interopResult</code> for the result.</p>
+    <!--
+      The Vite build bundles browser-native.ts into /e2e/browser-native.js.
+      Type="module" enables ES module semantics and avoids a top-level-await restriction.
+    -->
+    <script type="module" src="./browser-native.js"></script>
+  </body>
+</html>
