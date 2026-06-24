@@ -1,25 +1,43 @@
 /**
  * browser-native.ts — browser-side driver for the browser↔native WebRTC interop test (P5-3).
  *
- * This script runs inside a Playwright-controlled Firefox page. It:
- *   1. Reads `session` and `host_fp` from the URL query string.
- *   2. Opens a WebSocket to the signaling server (`ws://127.0.0.1:8765`).
- *   3. Creates an `RTCPeerConnection`, adds a DataChannel, and generates an SDP offer.
- *   4. Sends the offer to the native host via signaling.
- *   5. Receives the SDP answer + trickle ICE candidates and applies them.
- *   6. Waits for the DataChannel to open, sends `SHP\x00\x00\x00\x00\x05HELLO`.
- *   7. Waits for an echo frame from the native host.
- *   8. Writes the result to `window.__interopResult`.
+ * # Stage 2: identity-bound DTLS pin (ADR-0023 / ADR-0014)
  *
- * The Playwright spec (`browser-native.spec.ts`) spawns the native binaries, then navigates to
- * this page and polls `window.__interopResult` to verify connectivity.
+ * This runs inside a Playwright-controlled Firefox page. Unlike Stage 1 (which pinned the host's
+ * DTLS fingerprint from the SDP — transport interop only), Stage 2 layers the **live Noise XK
+ * handshake** over signaling so the pin is **identity-bound**:
+ *
+ *   1. A production `WebClient` (offerer) creates the SDP offer; we read its local DTLS
+ *      fingerprint (`local_dtls_fingerprint()`).
+ *   2. We run the Noise XK handshake (`WasmNoiseHandshake`) over the signaling channel, committing
+ *      the browser's local DTLS fingerprint inside the identity-signed `BindCert`, and extract the
+ *      host's committed fingerprint (`require_dtls_pin()`).
+ *   3. We feed that BindCert-committed pin into `WebClient.set_dtls_pin()` and let
+ *      `connect_as_offerer()` verify the host's **answer** SDP `a=fingerprint` against it. A
+ *      signaling/SDP fingerprint swap is rejected by the fail-closed `guard_remote_sdp` gate
+ *      **before** `setRemoteDescription` — never touching DTLS.
+ *
+ * The host (native answerer) symmetrically pins the BROWSER's BindCert-committed fingerprint, not
+ * the offer SDP. Together this is the browser↔native equivalent of the native
+ * `dtls_identity_binding` MITM test.
+ *
+ * # Modes (URL query)
+ *
+ *   - `?session=<hex>&host_fp=<hex>`  — identity-bound happy path (assert connected + echo +
+ *     pinUsedHex === hostFp).
+ *   - `…&mitm=1`                      — a man-in-the-middle SWAPS the host's answer SDP
+ *     `a=fingerprint` after the BindCert committed a different one → `connect_as_offerer` MUST
+ *     ABORT with a pin mismatch (non-vacuous MITM rejection).
  *
  * # Security note
  *
- * This page uses `InsecureLanLab` / `AcceptAll`-compatible signaling (empty proof).
- * It is for local integration tests only.
+ * Uses `InsecureLanLab` / `AcceptAll`-compatible signaling (empty proof). The identity binding is
+ * the Noise/BindCert layer, which is independent of the signaling auth (R-SIG-AUTH on the live
+ * signaling path is deferred — ADR-0023). For local integration tests only.
  */
 
+import { loadBridge } from "../src/bridge/index.js";
+import type { ShBridge, WebClient, WasmNoiseHandshake } from "../src/bridge/types.js";
 import {
   decodeEnvelope,
   encodeEnvelope,
@@ -35,11 +53,17 @@ export interface InteropResult {
   echoed: boolean;
   /** The raw echo frame bytes (hex-encoded) or null if not received. */
   frameHex: string | null;
+  /** Hex of the DTLS pin the browser actually enforced (the host's BindCert commit), or null. */
+  pinUsedHex: string | null;
+  /** True iff the MITM SDP-fingerprint swap was REJECTED by the fail-closed pin gate. */
+  mitmRejected: boolean;
   /** Error message, if any. */
   error: string | null;
 }
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// Noise-over-signaling sub-types live in a dependency-free single-source module so the driver and
+// its unit test cannot drift; the matching Rust values are guarded by a Rust test (see ADR-0023).
+import { NOISE_SUB_HELLO, NOISE_SUB_HOST_STATIC_PUB, NOISE_SUB_MSG } from "./noise-subtypes.js";
 
 /** Magic prefix of the SHP frame sent to the host. */
 const SHP_HELLO_FRAME = new Uint8Array([
@@ -51,56 +75,89 @@ const SHP_HELLO_FRAME = new Uint8Array([
   0x48, 0x45, 0x4c, 0x4c, 0x4f,
 ]);
 
-/** Signaling server WebSocket URL.
- *
- * Uses the explicit IPv4 loopback address to avoid DNS resolution to `::1` (IPv6) on
- * systems where `localhost` resolves to both IPv4 and IPv6, which would fail if the
- * signaling server is bound only to 127.0.0.1.
+/**
+ * Default signaling WebSocket URL (explicit IPv4 loopback to avoid `::1` resolution). Used only as
+ * a fallback; the Playwright harness passes the actual dynamic-port URL via the `sig` query param
+ * (the signaling server binds `:0`, so the port is not fixed).
  */
-const SIGNALING_URL = "ws://127.0.0.1:8765";
+const DEFAULT_SIGNALING_URL = "ws://127.0.0.1:8765";
+
+/** Resolve the signaling URL from the `sig` query param, validating the scheme. */
+function resolveSignalingUrl(params: URLSearchParams): string {
+  const raw = params.get("sig");
+  if (raw === null || raw === "") return DEFAULT_SIGNALING_URL;
+  // Only accept ws://127.0.0.1:<port> / ws://localhost:<port> to avoid pointing the page at an
+  // arbitrary attacker-controlled host if the query string is ever influenced externally.
+  if (!/^ws:\/\/(127\.0\.0\.1|localhost):\d{1,5}$/.test(raw)) {
+    throw new Error(`refusing to use non-loopback signaling URL: "${raw.slice(0, 80)}"`);
+  }
+  return raw;
+}
 
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 /**
- * Main driver function called by the Playwright spec via `page.evaluate`.
- *
- * Reads URL params, establishes the WebRTC DataChannel, exchanges frames, and
- * returns the {@link InteropResult}.
+ * Main driver: runs the identity-bound browser↔native session (or the MITM-rejection arm).
  */
 async function runInteropTest(): Promise<InteropResult> {
   const result: InteropResult = {
     connected: false,
     echoed: false,
     frameHex: null,
+    pinUsedHex: null,
+    mitmRejected: false,
     error: null,
   };
+
+  let ws: WebSocket | null = null;
+  let viewer: WebClient | null = null;
 
   try {
     const params = new URLSearchParams(window.location.search);
     const sessionHex = params.get("session") ?? "0".repeat(32);
     const hostFp = params.get("host_fp") ?? "";
+    const mitm = params.get("mitm") === "1";
 
-    if (hostFp.length !== 64) {
-      result.error = `host_fp must be 64 hex chars, got ${hostFp.length}`;
+    if (!/^[0-9a-f]{64}$/.test(hostFp)) {
+      result.error = `host_fp must be 64 lowercase hex chars, got ${hostFp.length}`;
       return result;
     }
 
-    // SECURITY NOTE (Stage 1 / AcceptAll path only):
-    // The browser fingerprint is set to 64 zeros because the AcceptAll authenticator does not
-    // validate `from_fp`. This is intentionally unsafe for production — two tabs connecting to
-    // the same session would silently overwrite each other's slot in the signaling registry.
-    // Stage 2 will replace this with the real browser DTLS fingerprint (from WebClient.local_dtls_fingerprint())
-    // and require it to be proven via the Noise XK handshake BindCert.
-    // NEVER use AcceptAll or all-zeros from_fp outside of local test infrastructure.
-    const browserFp = "0".repeat(64);
-
-    // Parse session ID.
+    const signalingUrl = resolveSignalingUrl(params);
     const sessionId = hexToBytes(sessionHex.padEnd(32, "0").slice(0, 32));
 
-    // Connect to signaling.
-    const ws = await connectWs(SIGNALING_URL);
+    const bridge: ShBridge = await loadBridge();
 
-    // Send Hello (empty proof — AcceptAll path).
+    // ── 1. Production WebClient (offerer): create the offer, read our local DTLS fp ──
+    const noop = (): void => {};
+    const SignalingChannel = bridge.SignalingChannel;
+    viewer = new bridge.WebClient(new SignalingChannel(noop));
+
+    // create_offer() builds the offerer's "shp" DataChannel and sets the local description, so
+    // local_dtls_fingerprint() is valid afterwards. setLocalDescription also STARTS ICE gathering,
+    // so we register the candidate handler immediately and BUFFER candidates until the WS is up
+    // (the Noise handshake runs first and takes a few round-trips). Losing the browser's host
+    // candidate would leave the native peer with no remote candidate → ICE failure.
+    const offerSdp = await viewer.create_offer();
+    const browserDtlsFp = viewer.local_dtls_fingerprint(); // 32 bytes
+    const browserFp = toHex(browserDtlsFp); // 64-char hex (our signaling from_fp)
+    if (!/^[0-9a-f]{64}$/.test(browserFp)) {
+      throw new Error(`local DTLS fingerprint is not 64 hex chars: "${browserFp.slice(0, 80)}"`);
+    }
+
+    // Candidate buffer + sink. Until `flushCandidates` is wired to the live WS, candidates queue.
+    const pendingCandidates: Array<string | null> = [];
+    let candidateSink: ((cand: string | null) => void) | null = null;
+    viewer.on_ice_candidate((cand: string | null) => {
+      if (candidateSink !== null) candidateSink(cand);
+      else pendingCandidates.push(cand);
+    });
+
+    // ── 2. Connect to signaling and register as the real browser DTLS fingerprint ──
+    ws = await connectWs(signalingUrl);
+    const inbound = makeEnvelopeQueue(ws);
+    const liveWs = ws;
+
     sendEnvelope(ws, {
       kind: MessageKind.Hello,
       sessionId,
@@ -109,30 +166,35 @@ async function runInteropTest(): Promise<InteropResult> {
       payload: new Uint8Array(0),
     });
 
-    // Create RTCPeerConnection and DataChannel.
-    const pc = new RTCPeerConnection({
-      iceServers: [],
-      // Allow loopback ICE candidates (Firefox-only pref set in playwright.config.ts).
-    });
+    // ── 3. Identity-bound Noise XK handshake over signaling (browser = initiator) ──
+    const hostPin = await runNoiseInitiator(
+      bridge,
+      ws,
+      inbound,
+      sessionId,
+      browserFp,
+      hostFp,
+      browserDtlsFp,
+    );
+    result.pinUsedHex = toHex(hostPin);
 
-    const dc = pc.createDataChannel("sh-interop", { ordered: true });
-    // Receive binary frames as ArrayBuffer (Firefox defaults DataChannel binaryType to "blob",
-    // which the echo handler below does not accept).
-    dc.binaryType = "arraybuffer";
+    // ── 4. Pin the host's BindCert-committed fingerprint (NOT the SDP). ──
+    viewer.set_dtls_pin(hostPin);
 
-    // Handle trickle ICE candidates — send to host via signaling.
-    pc.onicecandidate = (e) => {
-      if (e.candidate) {
-        sendEnvelope(ws, {
+    // ── 5. Wire ICE trickle to the live WS and flush any candidates buffered during the Noise
+    //      handshake (and all future ones). The browser's host candidate MUST reach the native
+    //      peer or ICE never connects.
+    const sendCandidate = (cand: string | null): void => {
+      if (cand !== null && cand !== "") {
+        sendEnvelope(liveWs, {
           kind: MessageKind.Candidate,
           sessionId,
           fromFp: browserFp,
           toFp: hostFp,
-          payload: new TextEncoder().encode(e.candidate.candidate),
+          payload: new TextEncoder().encode(cand),
         });
       } else {
-        // End of candidates.
-        sendEnvelope(ws, {
+        sendEnvelope(liveWs, {
           kind: MessageKind.EndOfCandidates,
           sessionId,
           fromFp: browserFp,
@@ -141,164 +203,334 @@ async function runInteropTest(): Promise<InteropResult> {
         });
       }
     };
+    // Attach the DataChannel frame sink BEFORE connecting so no echo is missed.
+    const echoPromise = new Promise<Uint8Array>((resolve) => {
+      // viewer is non-null in this scope.
+      viewer!.on_frame((frame: Uint8Array) => resolve(frame));
+    });
 
-    // Create SDP offer.
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-
-    // Send offer to native host.
+    // ── 6. Send the offer FIRST, then trickle candidates. ──
+    // The native host's `receive_offer` loop drops any non-Offer envelope, so candidates sent
+    // before the offer would be lost. We send the offer, THEN wire the candidate sink and flush
+    // the buffered candidates — by which point the host has moved on to its candidate pump.
     sendEnvelope(ws, {
       kind: MessageKind.Offer,
       sessionId,
       fromFp: browserFp,
       toFp: hostFp,
-      payload: new TextEncoder().encode(offer.sdp ?? ""),
+      payload: new TextEncoder().encode(offerSdp),
     });
 
-    // Wait for the SDP answer from the host.
-    //
-    // We resolve as soon as the Answer envelope is received and applied, so that ICE
-    // connectivity can start. The host also sends EndOfCandidates immediately after the
-    // answer (no trickle candidates on the native side), but we do not gate on it —
-    // this makes the flow robust to different sequencing models and avoids a race where
-    // EndOfCandidates arrives before the Answer is processed.
-    //
-    // FIX 3 (FLAKE): track whether this promise is already settled so any trailing
-    // Candidate/EndOfCandidates messages after pc.close() become no-ops, and remove the
-    // listener immediately on settle to avoid calling addIceCandidate on a closed pc.
-    let signalingDone = false;
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(
-        () => reject(new Error("timed out waiting for SDP answer")),
-        20_000,
-      );
+    candidateSink = sendCandidate;
+    for (const cand of pendingCandidates.splice(0)) sendCandidate(cand);
 
-      // FIX 1: wrapping entire handler body in try-catch so any throw from decodeEnvelope,
-      // setRemoteDescription, or addIceCandidate is forwarded to the outer reject instead of
-      // becoming a silent unhandled rejection that produces a 20 s opaque timeout.
-      // FIX 3: save handler reference so it can be removed immediately on settle.
-      const handler = async (event: MessageEvent): Promise<void> => {
-        try {
-          // FIX 3: ignore trailing messages after the promise settled.
-          if (signalingDone) return;
+    let answerSdp = await waitForAnswer(inbound, hostFp);
 
-          let raw: Uint8Array;
-          if (event.data instanceof ArrayBuffer) {
-            raw = new Uint8Array(event.data);
-          } else if (event.data instanceof Blob) {
-            raw = new Uint8Array(await (event.data as Blob).arrayBuffer());
-          } else {
-            return;
-          }
+    // ── 6b. MITM arm: swap the host's advertised DTLS fingerprint in the answer SDP. ──
+    // The BindCert committed the host's REAL fingerprint (hostPin); this tampered answer presents a
+    // DIFFERENT fingerprint, so connect_as_offerer's fail-closed pin gate MUST abort.
+    if (mitm) {
+      answerSdp = swapSdpFingerprint(answerSdp);
+    }
 
-          if (raw.length < ENVELOPE_HEADER_LEN) return;
+    // ── 7. Connect as offerer — pin-checked. On mismatch (MITM), this THROWS before setRemote. ──
+    try {
+      await viewer.connect_as_offerer(answerSdp);
+    } catch (e) {
+      if (mitm) {
+        // Expected: the identity-bound pin gate rejected the swapped SDP fingerprint.
+        result.mitmRejected = true;
+        return result;
+      }
+      throw e;
+    }
 
-          const env = decodeEnvelope(raw);
+    if (mitm) {
+      // The swap should have been rejected. Reaching here means the gate FAILED to fire — a bug.
+      throw new Error("MITM SDP-fingerprint swap was NOT rejected by the pin gate");
+    }
 
-          if (env.kind === MessageKind.Answer) {
-            const answerSdp = new TextDecoder().decode(env.payload);
-            await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
-            window.clearTimeout(timeout);
-            // FIX 3: mark done and remove listener BEFORE resolving to prevent any
-            // concurrent message dispatch from seeing signalingDone=false.
-            signalingDone = true;
-            ws.removeEventListener("message", handler);
-            resolve();
-          } else if (env.kind === MessageKind.Candidate) {
-            // FIX 3: guard against addIceCandidate on a closed/done pc.
-            if (signalingDone) return;
-            const candidateStr = new TextDecoder().decode(env.payload);
-            // Firefox REQUIRES sdpMid (or sdpMLineIndex) on a remote candidate — there is a
-            // single m=application (DataChannel) section, so index 0 / mid "0". (Chrome is
-            // lenient; Firefox throws "Cannot add a candidate without specifying either sdpMid
-            // or sdpMLineIndex".)
-            await pc.addIceCandidate({
-              candidate: candidateStr,
-              sdpMid: "0",
-              sdpMLineIndex: 0,
-            });
-          } else if (env.kind === MessageKind.EndOfCandidates) {
-            // FIX 3: guard against addIceCandidate on a closed/done pc.
-            if (signalingDone) return;
-            // Signal to Firefox that the host will not trickle any more candidates.
-            // Passing no argument to addIceCandidate signals end-of-candidates per the WebRTC
-            // spec; this is the most broadly supported form (undefined/null are equivalent but
-            // the no-arg call is idiomatic and avoids TypeScript type errors).
-            await pc.addIceCandidate();
-          } else if (env.kind === MessageKind.Error) {
-            // FIX 2: surface signaling errors explicitly instead of waiting for the 20 s
-            // timeout — a signaling-side reject never delivers an Answer, so without this
-            // branch the caller would hang until the timeout fires.
-            window.clearTimeout(timeout);
-            signalingDone = true;
-            ws.removeEventListener("message", handler);
-            reject(
-              new Error(
-                "signaling error: " + new TextDecoder().decode(env.payload),
-              ),
-            );
-          }
-        } catch (err) {
-          // FIX 1: propagate any synchronous or async throw to the outer reject.
-          window.clearTimeout(timeout);
-          signalingDone = true;
-          ws.removeEventListener("message", handler);
-          reject(err instanceof Error ? err : new Error(String(err)));
-        }
-      };
-
-      ws.addEventListener("message", handler);
+    // Pump trickle ICE candidates from the host until the DataChannel echo completes. A throw here
+    // is surfaced as result.error (cleaner than a raw pageerror) rather than discarded.
+    void pumpRemoteCandidates(viewer, inbound, hostFp).catch((e: unknown) => {
+      if (result.error === null) {
+        result.error = `candidate pump failed: ${e instanceof Error ? e.message : String(e)}`;
+      }
     });
 
-    // Wait for DataChannel to open.
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(
-        () => reject(new Error("timed out waiting for DataChannel open")),
-        20_000,
-      );
-      dc.onopen = () => {
-        window.clearTimeout(timeout);
-        resolve();
-      };
-      dc.onerror = (e) => {
-        window.clearTimeout(timeout);
-        reject(new Error(`DataChannel error: ${String(e)}`));
-      };
-    });
+    // ── 8. Once the DataChannel opens, send the HELLO frame so the host echoes it. ──
+    // NOTE: the offerer's own channel-open is not exposed by WebClient (`on_data_channel` is the
+    // ANSWERER's `ondatachannel`, which does not fire for the offerer's `createDataChannel`
+    // channel). We therefore use the first successful `send_frame` as the open signal, and treat a
+    // never-opens condition as a DISTINCT failure (rejects below) instead of masking it as the
+    // generic echo timeout.
+    const sentFrame = sendFrameWhenOpen(viewer, SHP_HELLO_FRAME, 30_000);
+    // Surface a never-opens rejection if it loses the race to the echo (so it isn't unhandled).
+    sentFrame.catch(() => undefined);
+
+    // ── 9. Wait for the DataChannel echo (proves the identity-bound session connected). ──
+    // Race the echo against (a) a channel-never-opened rejection and (b) an overall deadline, so a
+    // failure to open the channel surfaces its specific cause rather than a generic timeout.
+    const echoFrame = await Promise.race([
+      echoPromise,
+      sentFrame.then(() => new Promise<Uint8Array>(() => {})), // never resolves on its own; lets its rejection win
+      timeoutReject<Uint8Array>(30_000, "timed out waiting for echo frame"),
+    ]);
 
     result.connected = true;
-
-    // Send the HELLO frame.
-    dc.send(SHP_HELLO_FRAME.buffer);
-
-    // Wait for the echo frame from the native host.
-    const echoFrame = await new Promise<ArrayBuffer>((resolve, reject) => {
-      const timeout = window.setTimeout(
-        () => reject(new Error("timed out waiting for echo frame")),
-        10_000,
-      );
-      dc.onmessage = (e: MessageEvent) => {
-        window.clearTimeout(timeout);
-        if (e.data instanceof ArrayBuffer) {
-          resolve(e.data);
-        } else {
-          reject(new Error(`unexpected DataChannel message type: ${typeof e.data}`));
-        }
-      };
-    });
-
     result.echoed = true;
-    result.frameHex = Array.from(new Uint8Array(echoFrame))
-      .map((b) => b.toString(16).padStart(2, "0"))
-      .join("");
-
-    ws.close();
-    pc.close();
+    result.frameHex = toHex(echoFrame);
   } catch (e) {
-    result.error = e instanceof Error ? e.message : String(e);
+    result.error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+  } finally {
+    try {
+      ws?.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      viewer?.close();
+    } catch {
+      /* ignore */
+    }
   }
 
   return result;
+}
+
+// ── Noise XK initiator over signaling ─────────────────────────────────────────
+
+/**
+ * Run the browser side (XK initiator) of the identity-bound Noise handshake over signaling.
+ *
+ * Ordering (B=browser, H=host) — see `bins/streamhaul-webrtc-host`:
+ * ```
+ * B → H : Noise(HELLO, [])
+ * H → B : Noise(HOST_STATIC_PUB, X)
+ * B → H : Noise(MSG, msg0)
+ * H → B : Noise(MSG, msg1)
+ * B → H : Noise(MSG, msg2)
+ * B     : complete_for_first_pairing() → require_dtls_pin()  (the host's committed DTLS fp)
+ * ```
+ *
+ * Returns the host's BindCert-committed 32-byte DTLS pin.
+ */
+async function runNoiseInitiator(
+  bridge: ShBridge,
+  ws: WebSocket,
+  inbound: EnvelopeQueue,
+  sessionId: Uint8Array,
+  browserFp: string,
+  hostFp: string,
+  browserDtlsFp: Uint8Array,
+): Promise<Uint8Array> {
+  const sendNoise = (sub: number, body: Uint8Array): void => {
+    const payload = new Uint8Array(body.length + 1);
+    payload[0] = sub;
+    payload.set(body, 1);
+    sendEnvelope(ws, {
+      kind: MessageKind.Noise,
+      sessionId,
+      fromFp: browserFp,
+      toFp: hostFp,
+      payload,
+    });
+  };
+
+  const recvNoise = async (expectedSub: number): Promise<Uint8Array> => {
+    for (;;) {
+      const env = await inbound.next(20_000);
+      if (env.kind !== MessageKind.Noise || env.fromFp !== hostFp) continue;
+      if (env.payload.length < 1) continue;
+      if (env.payload[0] !== expectedSub) continue;
+      return env.payload.slice(1);
+    }
+  };
+
+  // 1. Announce ourselves so the host learns our from_fp.
+  sendNoise(NOISE_SUB_HELLO, new Uint8Array(0));
+
+  // 2. Receive the host's X25519 static public key.
+  const hostStaticPub = await recvNoise(NOISE_SUB_HOST_STATIC_PUB);
+  if (hostStaticPub.length !== 32) {
+    throw new Error(`host static pub must be 32 bytes, got ${hostStaticPub.length}`);
+  }
+
+  // 3. Build the XK initiator, committing OUR DTLS fingerprint in the BindCert.
+  const keystore = bridge.WasmKeystore.generate();
+  const hs: WasmNoiseHandshake = bridge.WasmNoiseHandshake.initiator_xk_with_dtls(
+    keystore,
+    hostStaticPub,
+    browserDtlsFp,
+    new Uint8Array(0),
+  );
+
+  // 4. XK: write msg0, read msg1, write msg2.
+  sendNoise(NOISE_SUB_MSG, hs.write_message());
+  hs.read_message(await recvNoise(NOISE_SUB_MSG));
+  sendNoise(NOISE_SUB_MSG, hs.write_message());
+
+  if (!hs.is_finished()) {
+    throw new Error("Noise handshake did not finish after 3 messages");
+  }
+
+  // 5. Complete (TOFU first pairing) and extract the host's committed DTLS pin.
+  const outcome = hs.complete_for_first_pairing();
+  return outcome.require_dtls_pin();
+}
+
+// ── Signaling envelope queue ──────────────────────────────────────────────────
+
+interface DecodedEnvelope {
+  kind: number;
+  fromFp: string;
+  payload: Uint8Array;
+}
+
+interface EnvelopeQueue {
+  /** Resolve with the next decoded envelope, or reject after `timeoutMs`. */
+  next(timeoutMs: number): Promise<DecodedEnvelope>;
+}
+
+interface QueueWaiter {
+  resolve: (env: DecodedEnvelope) => void;
+  reject: (err: Error) => void;
+}
+
+/**
+ * Buffer all inbound signaling envelopes so sequential `await next()` calls never drop a message
+ * that arrives between awaits (the Stage-1 single-handler model raced on out-of-order delivery).
+ *
+ * On WS `close`/`error` (server died / disconnect), all pending `next()` waiters are rejected
+ * immediately with `WebSocket closed` rather than hanging until their per-call timeout — so a
+ * dead signaling server surfaces a clear error fast instead of an opaque 20 s stall.
+ */
+function makeEnvelopeQueue(ws: WebSocket): EnvelopeQueue {
+  const buffer: DecodedEnvelope[] = [];
+  const waiters: QueueWaiter[] = [];
+  let closed = false;
+
+  const onMessage = async (event: MessageEvent): Promise<void> => {
+    let raw: Uint8Array;
+    if (event.data instanceof ArrayBuffer) {
+      raw = new Uint8Array(event.data);
+    } else if (event.data instanceof Blob) {
+      raw = new Uint8Array(await event.data.arrayBuffer());
+    } else {
+      return;
+    }
+    if (raw.length < ENVELOPE_HEADER_LEN) return;
+    let env: ReturnType<typeof decodeEnvelope>;
+    try {
+      env = decodeEnvelope(raw);
+    } catch {
+      return; // hostile/malformed envelope — drop, never throw out of the listener
+    }
+    const decoded: DecodedEnvelope = { kind: env.kind, fromFp: env.fromFp, payload: env.payload };
+    const waiter = waiters.shift();
+    if (waiter !== undefined) waiter.resolve(decoded);
+    else buffer.push(decoded);
+  };
+  ws.addEventListener("message", (e) => void onMessage(e));
+
+  const onClosed = (): void => {
+    if (closed) return;
+    closed = true;
+    // Reject every pending waiter so no caller hangs until its timeout.
+    while (waiters.length > 0) {
+      waiters.shift()?.reject(new Error("WebSocket closed"));
+    }
+  };
+  ws.addEventListener("close", onClosed);
+  ws.addEventListener("error", onClosed);
+
+  return {
+    next(timeoutMs: number): Promise<DecodedEnvelope> {
+      const buffered = buffer.shift();
+      if (buffered !== undefined) return Promise.resolve(buffered);
+      if (closed) return Promise.reject(new Error("WebSocket closed"));
+      return new Promise<DecodedEnvelope>((resolve, reject) => {
+        const waiter: QueueWaiter = {
+          resolve: (env) => {
+            window.clearTimeout(timer);
+            resolve(env);
+          },
+          reject: (err) => {
+            window.clearTimeout(timer);
+            reject(err);
+          },
+        };
+        const timer = window.setTimeout(() => {
+          const idx = waiters.indexOf(waiter);
+          if (idx >= 0) waiters.splice(idx, 1);
+          reject(new Error("timed out waiting for a signaling envelope"));
+        }, timeoutMs);
+        waiters.push(waiter);
+      });
+    },
+  };
+}
+
+/** Drain the queue until an `Answer` envelope from `hostFp` arrives; returns the answer SDP. */
+async function waitForAnswer(inbound: EnvelopeQueue, hostFp: string): Promise<string> {
+  for (;;) {
+    const env = await inbound.next(20_000);
+    if (env.kind === MessageKind.Answer && env.fromFp === hostFp) {
+      return new TextDecoder().decode(env.payload);
+    }
+    // Ignore unrelated messages (e.g. an early Candidate); keep waiting for the Answer.
+  }
+}
+
+/** Forward the host's trickle ICE candidates to the viewer until the queue stalls or closes. */
+async function pumpRemoteCandidates(
+  viewer: WebClient,
+  inbound: EnvelopeQueue,
+  hostFp: string,
+): Promise<void> {
+  for (;;) {
+    let env: DecodedEnvelope;
+    try {
+      env = await inbound.next(30_000);
+    } catch {
+      return; // no more candidates within the window — connectivity already established or done
+    }
+    if (env.fromFp !== hostFp) continue;
+    if (env.kind === MessageKind.Candidate) {
+      const candidate = new TextDecoder().decode(env.payload);
+      if (candidate.length === 0) continue;
+      try {
+        await viewer.add_ice_candidate(candidate);
+      } catch {
+        // A candidate may arrive after the pc closed (echo done) — ignore.
+        return;
+      }
+    } else if (env.kind === MessageKind.EndOfCandidates || env.kind === MessageKind.Bye) {
+      return;
+    }
+  }
+}
+
+// ── SDP MITM shim ─────────────────────────────────────────────────────────────
+
+/**
+ * Swap the SHA-256 `a=fingerprint` value in an SDP blob to a DIFFERENT (but well-formed) value,
+ * simulating a signaling/SDP man-in-the-middle. The new fingerprint is structurally valid (so the
+ * SDP parser accepts it) but does NOT match the host's BindCert-committed pin — so the
+ * identity-bound `verify_sdp_fingerprint_pin` gate must reject it.
+ */
+function swapSdpFingerprint(sdp: string): string {
+  return sdp.replace(
+    /a=fingerprint:sha-256 ([0-9A-Fa-f:]+)/,
+    (_match, hex: string) => {
+      // Flip the first hex group so the value differs but stays 32 colon-separated byte groups.
+      const groups = hex.split(":");
+      const first = groups[0] ?? "00";
+      const flipped = (parseInt(first, 16) ^ 0xff).toString(16).padStart(2, "0").toUpperCase();
+      groups[0] = flipped;
+      return `a=fingerprint:sha-256 ${groups.join(":")}`;
+    },
+  );
 }
 
 // ── Utilities ────────────────────────────────────────────────────────────────
@@ -319,20 +551,57 @@ function sendEnvelope(ws: WebSocket, env: Parameters<typeof encodeEnvelope>[0]):
 }
 
 /**
+ * Send `frame` once the offerer's DataChannel is open, **distinguishing** a "channel never opened"
+ * failure from the generic echo timeout.
+ *
+ * The `WebClient` exposes no offerer-channel-open event (`on_data_channel` is the *answerer*'s
+ * `ondatachannel` — it does NOT fire for the offerer's own `createDataChannel` channel), so we use
+ * the first successful `send_frame` (which throws on a not-yet-open channel) as the open signal.
+ * Resolves on the first successful send; **rejects** with a distinct error if the channel never
+ * becomes writable within `timeoutMs` (so the caller surfaces "DataChannel never opened" rather
+ * than the opaque "timed out waiting for echo").
+ */
+async function sendFrameWhenOpen(
+  viewer: WebClient,
+  frame: Uint8Array,
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      viewer.send_frame(frame);
+      return;
+    } catch {
+      if (Date.now() > deadline) {
+        throw new Error(
+          "DataChannel never opened (send_frame stayed un-writable) — ICE/DTLS likely failed",
+        );
+      }
+      await new Promise((r) => window.setTimeout(r, 100));
+    }
+  }
+}
+
+/** A promise that rejects after `ms` with `label`. */
+function timeoutReject<T>(ms: number, label: string): Promise<T> {
+  return new Promise<T>((_, reject) => window.setTimeout(() => reject(new Error(label)), ms));
+}
+
+/** Hex-encode bytes (lowercase). */
+function toHex(bytes: Uint8Array): string {
+  let s = "";
+  for (const b of bytes) s += b.toString(16).padStart(2, "0");
+  return s;
+}
+
+/**
  * Decode a 32-char lowercase hex string to a Uint8Array (16 bytes).
  *
- * Throws if the string is not exactly 32 lowercase hex characters, so a malformed
- * URL parameter produces a clear error rather than silently producing all-zero bytes
- * (which `parseInt(..., 16)` returns as 0 for non-hex input).
- *
- * The regex guard `^[0-9a-f]{32}$` guarantees every group is valid hex before parsing,
- * so the `isNaN` check that previously appeared here was unreachable and is removed.
+ * Throws if the string is not exactly 32 lowercase hex characters.
  */
 function hexToBytes(hex: string): Uint8Array {
   if (!/^[0-9a-f]{32}$/.test(hex)) {
-    throw new Error(
-      `hexToBytes: expected 32 lowercase hex chars, got "${hex.slice(0, 64)}"`,
-    );
+    throw new Error(`hexToBytes: expected 32 lowercase hex chars, got "${hex.slice(0, 64)}"`);
   }
   const bytes = new Uint8Array(16);
   for (let i = 0; i < 16; i++) {

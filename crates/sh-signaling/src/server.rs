@@ -494,7 +494,11 @@ async fn handle_message(
         MessageKind::Offer
         | MessageKind::Answer
         | MessageKind::Candidate
-        | MessageKind::EndOfCandidates => {
+        | MessageKind::EndOfCandidates
+        | MessageKind::Noise => {
+            // `Noise` carries the peer-to-peer identity-bound BindCert/Noise transcript (P5-3,
+            // ADR-0023). Routed opaquely on `(session_id, to_fp)` exactly like the SDP/ICE kinds;
+            // the relay never inspects the payload (zero-knowledge invariant).
             forward_to_peer(&env, registry).await?;
             Ok(None)
         }

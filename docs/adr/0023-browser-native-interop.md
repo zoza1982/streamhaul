@@ -196,3 +196,102 @@ never exit after one exchange and this would be naturally handled.
 - CI gains a `browser-native-e2e` job (Linux, Firefox + geckodriver pinned).
 - R-BROWSER-INTEROP partially closed (DataChannel-only path, browser as offerer, Linux CI).
   Full closure (media tracks, Chrome/Safari, H.264 decode) remains deferred per R-BROWSER-MATRIX.
+
+---
+
+## Addendum — Stage 2: identity-bound DTLS pin (the headline MITM defense)
+
+**Status:** Accepted · **Date:** 2026-06-24 · **Relates to:** P5-3 Stage 2, ADR-0014 (DTLS↔identity
+binding), ADR-0017 (PinnedWebRtcTransport), ADR-0020/0021 (browser crypto + WebRTC client), ADR-0016
+(R-SIG-AUTH).
+
+### Context
+
+Stage 1 (above) pinned the host's DTLS fingerprint **from the SDP `a=fingerprint`** — transport
+interop only, NOT identity-bound. A signaling/SDP man-in-the-middle could swap the fingerprint
+and the browser would happily pin (and DTLS-verify against) the attacker's certificate. Stage 2
+makes the live browser↔native session **MITM-protected** by sourcing the DTLS pin from the
+**identity-signed Noise `BindCert`** (the P4-5 defense), exactly as the native↔native transport does.
+
+### Decision
+
+#### 1. Noise XK over signaling — message ordering
+
+A new opaque envelope kind `MessageKind::Noise = 8` carries the peer-to-peer Noise transcript. The
+relay routes it on `(session_id, to_fp)` **only** — it never inspects the payload (zero-knowledge
+invariant preserved, identical treatment to `Offer`/`Answer`). The payload is `[sub_type: u8] ||
+body`:
+
+| sub_type | name | direction | body |
+|----------|------|-----------|------|
+| `0x00` | `HELLO` | browser → host | empty — lets the host learn the browser's `from_fp` |
+| `0x01` | `HOST_STATIC_PUB` | host → browser | host's 32-byte X25519 static **public** key |
+| `0x02` | `MSG` | either | one opaque Noise XK handshake message (carries the BindCert) |
+
+```text
+B → H : Noise(HELLO, [])            # host learns the browser's from_fp (the reply address)
+H → B : Noise(HOST_STATIC_PUB, X)   # host advertises its X25519 static pub
+B → H : Noise(MSG, msg0)            # XK message 1 (commits browser DTLS fp in BindCert)
+H → B : Noise(MSG, msg1)            # XK message 2 (commits host DTLS fp in BindCert)
+B → H : Noise(MSG, msg2)            # XK message 3
+both  : complete → extract the OTHER's committed DTLS fingerprint
+```
+
+The browser is the **XK initiator** (matching the `WebClient` offerer role; the
+`sh-crypto-wasm` bridge generates the browser's X25519 static internally). XK requires the
+initiator to know the responder's static up front, so the host (responder) publishes its static
+pub first — this is *why* `HOST_STATIC_PUB` precedes the handshake messages.
+
+#### 2. Each peer commits its own DTLS fingerprint; pins the peer's committed value (NOT the SDP)
+
+- **Browser** commits its local DTLS `a=fingerprint` (`WebClient.local_dtls_fingerprint()`) in its
+  BindCert. After completion it extracts the **host's** committed fingerprint
+  (`WasmHandshakeOutcome.require_dtls_pin()`) → `WebClient.set_dtls_pin(pin)` →
+  `connect_as_offerer(answerSdp)` runs the **fail-closed** `guard_remote_sdp` /
+  `verify_sdp_fingerprint_pin` against the host **answer** SDP **before** `setRemoteDescription`. A
+  swapped answer fingerprint aborts the connection — no DTLS over the attacker cert.
+- **Native host** commits its own DTLS fingerprint and extracts the **browser's** committed
+  fingerprint (`HandshakeOutcome::require_webrtc_dtls_pin()`), then pins it via the new
+  `SdpBridgeBuilder::accept_browser_offer_with_pin(offer_sdp, bindcert_fp, local, remote)`. This
+  variant **ignores the offer's SDP `a=fingerprint`** and pins the identity-bound value via
+  `WebRtcTransportBuilder::pin_remote_dtls` (ADR-0017 invariant preserved). str0m fail-closes the
+  DTLS handshake unless the browser's genuine certificate hashes to the BindCert-committed value, so
+  a relay that rewrote the offer fingerprint is defeated (it cannot present the genuine cert).
+
+#### 3. TOFU first pairing
+
+Stage 2 first pairing uses `complete_for_first_pairing` (browser) and a native `TrustAllKeystore`
+in `streamhaul-webrtc-host` (mirroring the wasm one — `NoiseHandshake::complete` only calls
+`is_trusted` on the supplied keystore). This proves the DTLS↔identity binding; **persistent TOFU
+pinning across reconnects is deferred**.
+
+#### 4. ICE quirk: `WebClient.add_ice_candidate` now sets `sdpMid`/`sdpMLineIndex`
+
+Firefox rejects a bare remote candidate (ADR-0023 quirk #2). `WebClient.add_ice_candidate` now sets
+`sdpMid = "0"` / `sdpMLineIndex = 0` (the single `m=application` section) and treats an empty
+candidate string as an end-of-candidates marker (ignored). The browser also sends its offer
+**before** trickling candidates, because the host's `receive_offer` loop drops non-`Offer`
+envelopes — candidates sent earlier would be lost, leaving the native peer with no remote candidate
+(ICE failure).
+
+### Security analysis
+
+- **Identity binding ≠ signaling auth.** The DTLS↔identity binding is the Noise/BindCert layer and
+  holds regardless of the signaling authenticator. The e2e stays `insecure-lan` / `AcceptAll`
+  (empty proof) — this is honest: it proves the headline MITM defense without conflating it with
+  R-SIG-AUTH. Wiring the production `IdentityProofAuthenticator` into the live browser↔native path
+  is deferred (R-SIG-AUTH-LIVE).
+- **Non-vacuous MITM proof.** The e2e MITM arm swaps the host's answer SDP fingerprint to a
+  different but well-formed value *after* the BindCert committed the real one; the fail-closed pin
+  gate rejects it. The happy-path arm is the honest control (the same setup connects when
+  untampered, and asserts `pinUsedHex === host_fp` — the pin equals the BindCert commit, not just
+  any SDP value). This is the browser↔native equivalent of the native `dtls_identity_binding` test.
+- **Zero-knowledge preserved.** `MessageKind::Noise` is routed only by `(session_id, to_fp)`; the
+  relay never parses the Noise/BindCert payload.
+
+### Deferrals (honest)
+
+- **R-SIG-AUTH on the live signaling path** (R-SIG-AUTH-LIVE) — separable from the identity binding.
+- **Persistent TOFU pinning across reconnects** — Stage 2 uses first-pairing trust-all.
+- **Chrome/Safari** (R-BROWSER-MATRIX — Safari impossible on Linux), **coturn** (R-COTURN-DEPLOY),
+  **media / H.264-over-wire from a real native capture** (live-native media/UI path).

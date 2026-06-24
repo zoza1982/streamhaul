@@ -1969,13 +1969,18 @@ name = "streamhaul-webrtc-host"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
+ "rand_core 0.6.4",
+ "sh-crypto",
  "sh-signaling",
  "sh-transport",
+ "sh-types",
  "str0m",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x25519-dalek",
 ]
 
 [[package]]

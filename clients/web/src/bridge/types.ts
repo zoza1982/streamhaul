@@ -62,6 +62,55 @@ export interface SignalingChannelCtor {
   new (sendFn: (payload: string) => void): unknown;
 }
 
+// ── Identity-bound Noise handshake (sh-crypto-wasm) ─────────────────────────────
+//
+// Used by the P5-3 Stage 2 browser↔native e2e to run the live Noise XK handshake whose
+// BindCert commits the browser's DTLS fingerprint and yields the host's committed pin. Private
+// keys never cross this boundary (see `crates/sh-crypto-wasm`).
+
+/** The completed, fully-verified Noise handshake result. */
+export interface WasmHandshakeOutcome {
+  readonly peer_fingerprint: string;
+  readonly peer_pubkey: Uint8Array;
+  /** The peer's committed 32-byte DTLS pin, throwing if absent/all-zero (anti-downgrade gate). */
+  require_dtls_pin(): Uint8Array;
+  has_dtls_pin(): boolean;
+}
+
+/** An in-progress Noise XK/IK handshake. */
+export interface WasmNoiseHandshake {
+  write_message(): Uint8Array;
+  read_message(msg: Uint8Array): void;
+  is_finished(): boolean;
+  /** Completes for TOFU first pairing (skips the trust check; caller pins via the outcome). */
+  complete_for_first_pairing(): WasmHandshakeOutcome;
+  complete_trusted(keystore: WasmKeystore): WasmHandshakeOutcome;
+}
+
+/** Static constructors for `WasmNoiseHandshake` (mirrors the `#[wasm_bindgen]` associated fns). */
+export interface WasmNoiseHandshakeCtor {
+  /** XK initiator committing `local_dtls_fp`; needs the responder's X25519 static up front. */
+  initiator_xk_with_dtls(
+    keystore: WasmKeystore,
+    peerStaticPub: Uint8Array,
+    localDtlsFp: Uint8Array,
+    sessionContext: Uint8Array,
+  ): WasmNoiseHandshake;
+}
+
+/** An opaque device identity + TOFU trust store (Ed25519 signing key stays in wasm). */
+export interface WasmKeystore {
+  fingerprint(): string;
+  public_key_bytes(): Uint8Array;
+  trust_peer_by_key(peerPubkey: Uint8Array): void;
+  is_trusted_by_key(peerPubkey: Uint8Array): boolean;
+}
+
+/** Static constructors for `WasmKeystore`. */
+export interface WasmKeystoreCtor {
+  generate(): WasmKeystore;
+}
+
 /** Constructor surface for `WebClient`. */
 export interface WebClientCtor {
   new (signaling: unknown): WebClient;
@@ -105,4 +154,8 @@ export interface ShBridge {
   set_panic_hook(): void;
   /** Parse the SHA-256 DTLS fingerprint (32 bytes) from an SDP blob (hostile-input safe). */
   parse_sdp_fingerprint(sdp: string): Uint8Array;
+
+  // ── Identity-bound Noise handshake (sh-crypto-wasm) ────────────────────
+  WasmKeystore: WasmKeystoreCtor;
+  WasmNoiseHandshake: WasmNoiseHandshakeCtor;
 }

@@ -1023,6 +1023,14 @@ pub enum SdpBridgeError {
     /// str0m rejected the SDP offer (e.g. incompatible codecs, fingerprint conflict).
     #[error("offer rejection: {0}")]
     OfferRejected(String),
+
+    /// The externally-supplied identity-bound pin is invalid (e.g. the all-zero sentinel that the
+    /// P4-5 anti-downgrade gate rejects). See [`SdpBridgeBuilder::accept_browser_offer_with_pin`].
+    #[error("invalid identity-bound DTLS pin: {reason}")]
+    InvalidPin {
+        /// Human-readable description of why the pin was rejected.
+        reason: &'static str,
+    },
 }
 
 /// The result of successfully bridging a browser SDP offer to a native str0m transport.
@@ -1160,12 +1168,15 @@ impl SdpBridgeBuilder {
     /// - [`SdpBridgeError::SdpParseError`] if str0m cannot parse the SDP.
     /// - [`SdpBridgeError::OfferRejected`] if str0m rejects the offer.
     pub fn accept_browser_offer(
-        mut self,
+        self,
         offer_sdp: &str,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
     ) -> Result<SdpBridgeResult, SdpBridgeError> {
-        // 1. Bound the SDP size before doing any work.
+        // Bound the SDP size BEFORE parsing the fingerprint so an oversized blob is reported as
+        // `SdpTooLarge` (not the `NoFingerprint` that a bounded scan of giant junk would yield).
+        // `accept_offer_inner` re-checks the same cap; the duplicate guard here keeps the
+        // size-before-parse ordering the SDP-derived path documents.
         let byte_len = offer_sdp.len();
         if byte_len > MAX_SDP_BYTES {
             return Err(SdpBridgeError::SdpTooLarge {
@@ -1174,34 +1185,118 @@ impl SdpBridgeBuilder {
             });
         }
 
-        // 2. Extract the remote DTLS fingerprint from the SDP text.
+        // SDP-derived path: extract the remote DTLS fingerprint from the SDP text, then pin it.
+        // str0m also internally extracts + records the same fingerprint and fail-closes any DTLS
+        // mismatch; `pin_remote_dtls` (same value) additionally satisfies the structural invariant.
         let remote_fp = parse_sdp_fingerprint(offer_sdp)?;
+        self.accept_offer_inner(offer_sdp, remote_fp, local_addr, remote_addr)
+    }
 
-        // 3. Parse the SDP offer with str0m.
+    /// Accept the browser's SDP offer but pin an **externally-supplied** DTLS fingerprint
+    /// (P5-3 Stage 2, ADR-0023 / ADR-0014).
+    ///
+    /// This is the identity-bound variant of [`accept_browser_offer`](Self::accept_browser_offer).
+    /// Instead of trusting the SDP `a=fingerprint` (which arrives over the untrusted signaling
+    /// relay and can be swapped by a man-in-the-middle), the caller supplies `pinned_fp` — the
+    /// 32-byte SHA-256 DTLS fingerprint the browser **committed inside its identity-signed Noise
+    /// `BindCert`** (obtained from `HandshakeOutcome::require_webrtc_dtls_pin`). str0m then
+    /// fail-closes the DTLS handshake unless the browser's actual certificate hashes to
+    /// `pinned_fp`.
+    ///
+    /// # Why this defeats a signaling/SDP MITM
+    ///
+    /// A relay-level attacker who rewrites the offer's `a=fingerprint` cannot also forge the
+    /// browser's identity-signed `BindCert` (it is Ed25519-signed and verified inside the Noise
+    /// transcript). Because we pin the BindCert-committed value and ignore the SDP value, the
+    /// attacker's swapped fingerprint is never used; the genuine browser certificate is required,
+    /// which the attacker cannot present. The ADR-0017 builder pin invariant is preserved:
+    /// `pin_remote_dtls` is still the sole finisher, called here with the identity-bound value.
+    ///
+    /// # Anti-downgrade defense-in-depth
+    ///
+    /// An **all-zero** `pinned_fp` is rejected with [`SdpBridgeError::InvalidPin`]. All-zero is the
+    /// P4-5 anti-downgrade sentinel — `HandshakeOutcome::require_webrtc_dtls_pin` already refuses to
+    /// return it — but guarding here too means a caller that bypassed that gate (or passed a
+    /// zeroed buffer) can never silently build a transport pinned to `[0; 32]`.
+    ///
+    /// # Errors
+    ///
+    /// - [`SdpBridgeError::InvalidPin`] if `pinned_fp` is the all-zero sentinel.
+    /// - [`SdpBridgeError::SdpTooLarge`] if the SDP exceeds 64 KiB.
+    /// - [`SdpBridgeError::SdpParseError`] if str0m cannot parse the SDP.
+    /// - [`SdpBridgeError::OfferRejected`] if str0m rejects the offer.
+    ///
+    /// Note: unlike [`accept_browser_offer`](Self::accept_browser_offer), this method does **not**
+    /// require a parseable `a=fingerprint` line in the offer SDP — the pin is identity-bound, not
+    /// SDP-derived. (str0m still records the SDP fingerprint internally for its own bookkeeping,
+    /// but [`WebRtcTransportBuilder::pin_remote_dtls`] overwrites it with `pinned_fp` before any
+    /// DTLS traffic flows.)
+    pub fn accept_browser_offer_with_pin(
+        self,
+        offer_sdp: &str,
+        pinned_fp: [u8; 32],
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> Result<SdpBridgeResult, SdpBridgeError> {
+        // Anti-downgrade: reject the all-zero sentinel (defense-in-depth; see method docs).
+        if pinned_fp == [0u8; 32] {
+            return Err(SdpBridgeError::InvalidPin {
+                reason: "all-zero DTLS pin (anti-downgrade sentinel) is not a valid commitment",
+            });
+        }
+        let remote_fp = Fingerprint {
+            hash_func: "sha-256".to_owned(),
+            bytes: pinned_fp.to_vec(),
+        };
+        self.accept_offer_inner(offer_sdp, remote_fp, local_addr, remote_addr)
+    }
+
+    /// Shared finisher: size-bound the SDP, `accept_offer`, capture the local fingerprint, and pin
+    /// `remote_fp` via [`WebRtcTransportBuilder::pin_remote_dtls`].
+    ///
+    /// The only thing that differs between [`accept_browser_offer`](Self::accept_browser_offer) and
+    /// [`accept_browser_offer_with_pin`](Self::accept_browser_offer_with_pin) is the **source** of
+    /// `remote_fp` (parsed-from-SDP vs identity-bound BindCert commitment). Centralizing the rest
+    /// here keeps the size cap, parse, accept, and the ADR-0017 pin invariant from drifting apart.
+    fn accept_offer_inner(
+        mut self,
+        offer_sdp: &str,
+        remote_fp: Fingerprint,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> Result<SdpBridgeResult, SdpBridgeError> {
+        // 1. Bound the SDP size before doing any work (hostile-input guard).
+        let byte_len = offer_sdp.len();
+        if byte_len > MAX_SDP_BYTES {
+            return Err(SdpBridgeError::SdpTooLarge {
+                actual: byte_len,
+                max: MAX_SDP_BYTES,
+            });
+        }
+
+        // 2. Parse the SDP offer with str0m.
         let sdp_offer = str0m::change::SdpOffer::from_sdp_string(offer_sdp)
             .map_err(|e| SdpBridgeError::SdpParseError(e.to_string()))?;
 
-        // 4. Accept the offer — str0m also internally extracts + records the remote fingerprint
-        //    from the SDP and will fail-close any DTLS mismatch automatically. We additionally
-        //    call pin_remote_dtls below (same value) to satisfy the structural invariant.
+        // 3. Accept the offer. str0m internally records the *SDP* fingerprint; we override it below
+        //    with `remote_fp` via `pin_remote_dtls`, so the SDP value is never the one DTLS
+        //    verifies against on the identity-bound path (and is the same value on the SDP path).
         let sdp_answer = self
             .rtc
             .sdp_api()
             .accept_offer(sdp_offer)
             .map_err(|e| SdpBridgeError::OfferRejected(e.to_string()))?;
 
-        // 5. Capture the local DTLS fingerprint (before the Rtc is consumed by the builder).
+        // 4. Capture the local DTLS fingerprint before the Rtc is consumed by the builder.
         let local_dtls_fingerprint = self.rtc.direct_api().local_dtls_fingerprint().clone();
 
-        // 6. Build the transport, pinning the remote fingerprint (enforces the structural
-        //    invariant from WebRtcTransportBuilder: pin BEFORE any DTLS traffic).
+        // 5. Build the transport, pinning `remote_fp` (enforces the ADR-0017 structural invariant:
+        //    pin BEFORE any DTLS traffic).
         let transport = WebRtcTransportBuilder::new(self.rtc, local_addr, remote_addr)
             .pin_remote_dtls(remote_fp);
 
-        let answer_sdp = sdp_answer.to_sdp_string();
-
         Ok(SdpBridgeResult {
-            answer_sdp,
+            answer_sdp: sdp_answer.to_sdp_string(),
             local_dtls_fingerprint,
             transport,
         })
@@ -2279,5 +2374,91 @@ mod tests {
             fp.bytes, session_fp,
             "must return session-level fingerprint (first in document order), not media-level"
         );
+    }
+
+    /// Build a real browser-style SDP offer via a second str0m `Rtc` (DataChannel only).
+    fn make_real_offer_sdp() -> String {
+        let mut offerer = Rtc::new(Instant::now());
+        let mut api = offerer.sdp_api();
+        let _ = api.add_channel("shp".to_owned());
+        let (offer, _pending) = api
+            .apply()
+            .expect("offer with a channel must produce changes");
+        offer.to_sdp_string()
+    }
+
+    /// P5-3 Stage 2 (ADR-0023): `accept_browser_offer_with_pin` pins the **supplied** identity-bound
+    /// fingerprint, NOT the offer SDP's `a=fingerprint`. A signaling MITM that swaps the SDP
+    /// fingerprint cannot influence the pin, so the genuine browser certificate is still required.
+    #[test]
+    fn accept_browser_offer_with_pin_pins_supplied_not_sdp() {
+        let offer_sdp = make_real_offer_sdp();
+        // The SDP carries the offerer's real fingerprint; the BindCert commit is a DIFFERENT
+        // value here to prove the pin comes from the argument, not the SDP.
+        let bind_cert_pin = [0x5Au8; 32];
+        let local: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:4001".parse().unwrap();
+
+        let rtc = Rtc::new(Instant::now());
+        let result = SdpBridgeBuilder::new(rtc)
+            .accept_browser_offer_with_pin(&offer_sdp, bind_cert_pin, local, remote)
+            .expect("accept_browser_offer_with_pin must succeed on a valid offer");
+
+        // The transport exists and is pinned; the answer SDP is well-formed.
+        assert!(
+            result.answer_sdp.contains("a=fingerprint:sha-256"),
+            "answer SDP must contain the host's own fingerprint line"
+        );
+
+        // The identity-bound pin (NOT the SDP one) was applied. We cannot read str0m's internal
+        // remote-fingerprint directly before DTLS, but we CAN assert the SDP fingerprint differs
+        // from our pin — so a passing DTLS handshake would have to match the BindCert value.
+        let sdp_fp = parse_sdp_fingerprint(&offer_sdp).expect("offer has a fingerprint");
+        assert_ne!(
+            sdp_fp.bytes, bind_cert_pin,
+            "test premise: the offer's SDP fingerprint must differ from the BindCert pin"
+        );
+    }
+
+    /// `accept_browser_offer_with_pin` still enforces the 64 KiB hostile-input bound (with a
+    /// non-zero pin so the size check — not the anti-downgrade guard — is what fires).
+    #[test]
+    fn accept_browser_offer_with_pin_rejects_oversized_sdp() {
+        let big_sdp = "x".repeat(MAX_SDP_BYTES + 1);
+        let local: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:4001".parse().unwrap();
+        let rtc = Rtc::new(Instant::now());
+        match SdpBridgeBuilder::new(rtc).accept_browser_offer_with_pin(
+            &big_sdp,
+            [0x5Au8; 32],
+            local,
+            remote,
+        ) {
+            Err(SdpBridgeError::SdpTooLarge { .. }) => {}
+            other => panic!(
+                "expected SdpTooLarge, got {:?}",
+                other.map(|_| "Ok(SdpBridgeResult)")
+            ),
+        }
+    }
+
+    /// P4-5 anti-downgrade defense-in-depth: an all-zero `pinned_fp` (the sentinel
+    /// `require_webrtc_dtls_pin` already rejects) is refused with `InvalidPin`, so a transport can
+    /// never be silently pinned to `[0; 32]`. Checked BEFORE the SDP is even parsed.
+    #[test]
+    fn accept_browser_offer_with_pin_rejects_all_zero_pin() {
+        let offer_sdp = make_real_offer_sdp();
+        let local: SocketAddr = "127.0.0.1:4000".parse().unwrap();
+        let remote: SocketAddr = "127.0.0.1:4001".parse().unwrap();
+        let rtc = Rtc::new(Instant::now());
+        match SdpBridgeBuilder::new(rtc)
+            .accept_browser_offer_with_pin(&offer_sdp, [0u8; 32], local, remote)
+        {
+            Err(SdpBridgeError::InvalidPin { .. }) => {}
+            other => panic!(
+                "expected InvalidPin for all-zero pin, got {:?}",
+                other.map(|_| "Ok(SdpBridgeResult)")
+            ),
+        }
     }
 }

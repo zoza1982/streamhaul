@@ -44,9 +44,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind signaling server on {addr}"))?;
 
-    info!(addr = %addr, "streamhaul-signaling listening");
-    // Print machine-readable line so test harnesses can wait for ready.
-    println!("SIGNALING_READY addr={addr}");
+    // Resolve the ACTUAL bound address. When `--addr` requested port 0 the OS assigns an ephemeral
+    // port; the requested `addr` still reads `:0`, so test harnesses must read the bound address
+    // from this line to learn the real port (avoids fixed-port "Address already in use" flakiness
+    // when a stale process lingers).
+    let bound = server
+        .local_addr()
+        .context("failed to read signaling server bound address")?;
+
+    info!(addr = %bound, "streamhaul-signaling listening");
+    // Print machine-readable line so test harnesses can wait for ready and learn the real port.
+    println!("SIGNALING_READY addr={bound}");
     // Flush stdout so the test harness can see the line immediately.
     use std::io::Write as _;
     std::io::stdout().flush().ok();

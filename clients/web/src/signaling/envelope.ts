@@ -5,13 +5,18 @@
  *
  * ```
  * Offset  Len   Field
- * 0       1     kind: u8  (0=Hello…6=Error, 7=Challenge)
+ * 0       1     kind: u8  (0=Hello…6=Error, 7=Challenge, 8=Noise)
  * 1       16    session_id: [u8; 16]
  * 17      64    from_fp: UTF-8 hex (64 chars)
  * 81      64    to_fp:   UTF-8 hex (64 chars)
  * 145     4     payload_len: u32 BE
  * 149     N     opaque_payload (N = payload_len, max 65536)
  * ```
+ *
+ * Note: `decodeEnvelope` does NOT range-validate `kind` (it returns the raw byte). Consumers
+ * filter by the specific `MessageKind` values they expect, so an unknown/out-of-range kind is
+ * simply never matched (ignored) rather than rejected at decode time. The Rust server, by
+ * contrast, rejects unknown kinds at decode (`MessageKind::from_u8`).
  */
 
 /** Kind discriminant for a signaling envelope. */
@@ -24,6 +29,8 @@ export const MessageKind = {
   Bye: 5,
   Error: 6,
   Challenge: 7,
+  /** Peer-to-peer identity-bound Noise handshake transcript (P5-3 Stage 2, ADR-0023). */
+  Noise: 8,
 } as const;
 
 /** Union of all valid message kind values. */
