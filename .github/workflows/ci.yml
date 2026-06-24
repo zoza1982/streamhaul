@@ -119,6 +119,55 @@ jobs:
         run: wasm-pack build --target web crates/sh-crypto-wasm
 
   # ----------------------------------------------------------------------------
+  # Browser WebRTC client: live RTCPeerConnection e2e in headless Firefox.
+  # `sh-web-client` (P5-1c, ADR-0021) enforces the DTLS-fingerprint identity pin
+  # (P4-5 / ADR-0014) in the browser.  Node has no RTCPeerConnection, so this job
+  # uses headless Firefox + geckodriver.  The non-vacuous MITM-rejection e2e proves
+  # a signaling/SDP fingerprint swap is rejected before setRemoteDescription.
+  # Chrome/Safari matrix is deferred — R-BROWSER-MATRIX.
+  # ----------------------------------------------------------------------------
+  browser-webrtc-client:
+    name: browser-webrtc-client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add wasm32-unknown-unknown target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack (pinned, checksum-verified binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+      - name: Install Firefox (headless e2e)
+        uses: browser-actions/setup-firefox@v1
+        with:
+          # Pinned to the exact proven build (ADR-0021: Firefox 152.0.1 + geckodriver 0.37.0).
+          # `browser-actions/setup-firefox` needs a full version string (a bare "152" 404s);
+          # `latest` could auto-advance into a geckodriver-incompatible Firefox.
+          firefox-version: "152.0.1"
+      - name: Install geckodriver (pinned GitHub release)
+        run: |
+          set -euo pipefail
+          # Pinned to 0.37.0 to match ADR-0021 (the proven local toolchain: Firefox 152 + geckodriver 0.37).
+          GECKO_VERSION=v0.37.0
+          GECKO_SHA256=90d4e33bd9816684400c160d1309aaffec23a3f65103511d5a62d8501062e548
+          URL="https://github.com/mozilla/geckodriver/releases/download/${GECKO_VERSION}/geckodriver-${GECKO_VERSION}-linux64.tar.gz"
+          curl -fsSL "$URL" -o /tmp/geckodriver.tar.gz
+          echo "${GECKO_SHA256}  /tmp/geckodriver.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin
+          chmod +x /usr/local/bin/geckodriver
+          geckodriver --version
+
+      - name: clippy sh-web-client (wasm target, panic-ban)
+        run: cargo clippy --manifest-path crates/sh-web-client/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: wasm-pack test --headless --firefox sh-web-client (SDP-parser + WebRTC DTLS-pin e2e)
+        env:
+          # ICE loopback + DTLS convergence can be slower on a loaded CI runner than locally.
+          WASM_BINDGEN_TEST_TIMEOUT: "60"
+        run: wasm-pack test --headless --firefox crates/sh-web-client
+      - name: wasm-pack build --target web sh-web-client (artifact smoke-check)
+        run: wasm-pack build --target web crates/sh-web-client
+
+  # ----------------------------------------------------------------------------
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:

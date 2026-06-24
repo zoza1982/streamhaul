@@ -1,0 +1,97 @@
+# This crate targets wasm32-unknown-unknown exclusively (it depends on `web-sys`
+# `RtcPeerConnection` and friends, which only exist in a browser).  An empty `[workspace]`
+# table keeps it out of the root workspace so `cargo build/test --workspace` never tries to
+# build it for the host target, and the workspace `exclude` list in the root `Cargo.toml`
+# does the same.
+[workspace]
+
+[package]
+name = "sh-web-client"
+description = "Browser WebRTC client for Streamhaul: RTCPeerConnection orchestration with DTLS-fingerprint identity pinning (MITM defense)."
+# Not in the workspace (wasm32-only target) — all fields are explicit, not inherited.
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zoza1982/streamhaul"
+rust-version = "1.82"
+
+# cdylib  = the .wasm binary loaded by wasm-bindgen / bundlers
+# rlib    = enables `wasm-pack test --headless --firefox` to link test harness code
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Path deps to the parent wasm bridges (SHP codec + crypto).  Both are workspace-excluded
+# wasm32-only crates; depending on them here keeps the browser client a thin orchestration
+# layer over already-verified codec and crypto bridges (no re-implementation).
+sh-wasm = { path = "../sh-wasm" }
+sh-crypto-wasm = { path = "../sh-crypto-wasm" }
+
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+# Force WebCrypto CSPRNG backend on wasm32-unknown-unknown (mirrors sh-crypto-wasm).  Without
+# the `js` feature, getrandom panics on wasm with "no entropy source found".  This crate does
+# not draw entropy directly, but its dep graph (sh-crypto-wasm) does, and the feature must be
+# unified at the final binary.
+getrandom = { version = "0.2", features = ["js"] }
+
+# console_error_panic_hook: routes Rust panics to the browser console with a readable
+# stack trace.  Wired only via the `set_panic_hook` helper (a development aid for the test
+# harness).  Production paths never panic; this never fires there.
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "RtcPeerConnection",
+    "RtcDataChannel",
+    "RtcSessionDescription",
+    "RtcSessionDescriptionInit",
+    "RtcIceCandidate",
+    "RtcIceCandidateInit",
+    "RtcDataChannelState",
+    "RtcDataChannelType",
+    "RtcIceConnectionState",
+    "RtcSdpType",
+    "RtcPeerConnectionIceEvent",
+    "RtcDataChannelEvent",
+    "MessageEvent",
+    "Window",
+    "console",
+]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# Dev-only: drive the REAL identity-bound Noise XK handshake + BindCert in the browser e2e test.
+# This is the same dev-dependency pattern as the native `sh-transport/tests/dtls_identity_binding.rs`
+# (which dev-depends on `sh-crypto`): there is NO production `sh-web-client → sh-crypto` coupling.
+# XK requires the initiator to know the responder's X25519 static up front; the `sh-crypto-wasm`
+# bridge generates that static internally and does not expose it, so the in-page handshake driver
+# bootstraps the responder static via `sh-crypto` directly, exactly as the `sh-crypto-wasm` suite's
+# own `full_xk_handshake_with_dtls_binding` test does.  All crates compile to wasm32-unknown-unknown.
+sh-crypto = { path = "../sh-crypto" }
+x25519-dalek = { version = "=2.0.1", default-features = false, features = ["static_secrets", "zeroize"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+pollster = "=0.3.0"
+
+# Mirror the workspace lint settings so this excluded crate obeys the same quality gates
+# (CLAUDE.md §6 panic-ban + safety posture).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"

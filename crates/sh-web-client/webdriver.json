@@ -1,0 +1,11 @@
+{
+  "moz:firefoxOptions": {
+    "prefs": {
+      "media.peerconnection.ice.loopback": true,
+      "media.peerconnection.ice.obfuscate_host_addresses": false,
+      "media.peerconnection.mtransport_process": false,
+      "network.process.enabled": false,
+      "media.navigator.streams.fake": true
+    }
+  }
+}
