@@ -9,8 +9,13 @@
 //!
 //! Phase-4 adds:
 //! - [`session`] — P4-6 transport capability negotiation and [`SessionEstablisher`].
+//!
+//! Phase-7 adds:
+//! - [`file`] — P7-2 file-transfer orchestration ([`FileSender`] / [`FileReceiver`] / [`FileError`]):
+//!   resume + SHA-256 integrity, capability-gated (ADR-0024).
 
 pub mod authz;
+pub mod file;
 pub mod packetize;
 pub mod pipeline;
 pub mod session;
@@ -19,6 +24,7 @@ pub use authz::{
     Capabilities, Denied, FreshPresence, InMemoryMinEpochStore, MinEpochStore, PrivilegedAction,
     SessionAuthorizer, Ugc,
 };
+pub use file::{FileError, FileReceiver, FileSender};
 
 #[cfg(feature = "harness")]
 pub mod harness;

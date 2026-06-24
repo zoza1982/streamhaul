@@ -26,7 +26,7 @@ Most of the plumbing already exists and must not be re-invented:
 What is **net-new**: (1) the file-transfer **application wire format** (offer/accept/abort/complete
 control messages + a per-chunk data header carrying a transfer id + byte offset), (2) a **token-bucket
 pacer** that makes the sender respect `allocate().file()` so file traffic is budget-isolated as well
-as stream-isolated, (3) a **`FileTransfer` orchestrator** in `sh-core` implementing resume (byte
+as stream-isolated, (3) the **`FileSender`/`FileReceiver` orchestrator** in `sh-core` implementing resume (byte
 offset) and integrity (SHA-256 over the whole file), gated on `Capabilities::FILE`, and (4) a client
 surface in `clients/web`.
 
@@ -65,19 +65,22 @@ The sender awaits sufficient tokens before each chunk, so file throughput tracks
 This composes with the structural per-stream isolation: file is isolated **twice** — its own flow-
 control window *and* a leftover-only send budget.
 
-### Orchestration — `sh-core::file::FileTransfer`
+### Orchestration — `sh-core::file` (`FileSender` + `FileReceiver`)
 
-Drives offer → accept(resume_offset) → paced chunk stream → complete over the Control + File
-channels. **Resume:** the receiver advertises how many contiguous bytes it already holds as
-`resume_offset`; the sender resumes from there. **Integrity:** SHA-256 (the already-vetted `sha2`
-crate — no new dependency) over the *entire* reconstructed file is compared to the offer digest; a
-mismatch is a `FileComplete{ok:0}` + discard. Every entry point checks `Capabilities::FILE`.
+Implemented as **two side-agnostic state machines** (`FileSender`, `FileReceiver`) rather than one
+combined `FileTransfer` type, so the security-critical logic is unit-testable with no transport or
+async runtime. They drive offer → accept(resume_offset) → chunk stream → complete over the Control +
+File channels. **Resume:** the receiver advertises how many contiguous bytes it already holds as
+`resume_offset`; the sender resumes from there (and seeds its hash with the retained prefix so
+integrity still covers the whole file). **Integrity:** SHA-256 (the already-vetted `sha2` crate — no
+new dependency) over the *entire* reconstructed file is compared to the offer digest; a mismatch is a
+`FileComplete{ok:0}` + discard. `FileReceiver::accept_offer` checks `Capabilities::FILE`.
 
 ### P7-2 orchestrator requirements (security carry-forward — MUST enforce)
 
 The `sh-protocol::file` layer is **pure framing**: it bounds per-field/per-chunk values (chunk ≤ 1
 MiB, name ≤ 255 B, reserved-bit + discriminant rejection, never panics) but cannot enforce
-cross-message or stateful invariants. The P7-2 `FileTransfer` orchestrator **must** enforce all of
+cross-message or stateful invariants. The P7-2 `FileReceiver` orchestrator **must** enforce all of
 the following (each is a confirmed gate-review finding, tracked here so none is dropped):
 
 1. **`Capabilities::FILE`** checked at *every* entry point that acts on an offer/accept/chunk before
