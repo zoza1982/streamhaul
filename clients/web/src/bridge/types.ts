@@ -116,6 +116,44 @@ export interface WebClientCtor {
   new (signaling: unknown): WebClient;
 }
 
+// ── File-transfer framing (sh-wasm::file, P7-2 — ADR-0024) ──────────────────────
+//
+// 64-bit wire fields (transfer_id, total_size, offset, resume_offset) cross this boundary as
+// plain `number` (JS doubles): exact only up to 2^53. That is far above any practical browser
+// transfer, and matches the existing bridge's plain-`number` surface (BigInt is avoided). The
+// wasm encoders reject negative / non-integral / out-of-range values.
+
+/** A decoded `FileOffer` (sender → receiver announcement). */
+export interface WasmFileOffer {
+  readonly transfer_id: number;
+  readonly total_size: number;
+  readonly chunk_size: number;
+  /** SHA-256 of the whole file (32 bytes). */
+  readonly sha256: Uint8Array;
+  /** File-name bytes (opaque; the receiver mirrors the sh-core sanitizer). */
+  readonly name: Uint8Array;
+}
+
+/** A decoded `FileChunkHeader` (fixed 21-byte data-plane header). */
+export interface WasmFileChunkHeader {
+  readonly transfer_id: number;
+  readonly offset: number;
+  readonly len: number;
+  readonly last: boolean;
+}
+
+/** A decoded `FileAccept` (receiver → sender, carrying a resume offset). */
+export interface WasmFileAccept {
+  readonly transfer_id: number;
+  readonly resume_offset: number;
+}
+
+/** A decoded `FileComplete` (receiver → sender integrity report). */
+export interface WasmFileComplete {
+  readonly transfer_id: number;
+  readonly ok: boolean;
+}
+
 /** The typed bridge surface used by the app. */
 export interface ShBridge {
   // ── SHP codec (sh-wasm) ────────────────────────────────────────────────
@@ -147,6 +185,27 @@ export interface ShBridge {
     peer_quic: boolean,
     peer_webrtc: boolean,
   ): number;
+
+  // ── File-transfer framing (sh-wasm::file, P7-2) ────────────────────────
+  encode_file_offer(
+    transfer_id: number,
+    total_size: number,
+    chunk_size: number,
+    sha256: Uint8Array,
+    name: Uint8Array,
+  ): Uint8Array;
+  decode_file_offer(data: Uint8Array): WasmFileOffer;
+  encode_file_chunk_header(
+    transfer_id: number,
+    offset: number,
+    len: number,
+    last: boolean,
+  ): Uint8Array;
+  decode_file_chunk_header(data: Uint8Array): WasmFileChunkHeader;
+  encode_file_accept(transfer_id: number, resume_offset: number): Uint8Array;
+  decode_file_accept(data: Uint8Array): WasmFileAccept;
+  encode_file_complete(transfer_id: number, ok: boolean): Uint8Array;
+  decode_file_complete(data: Uint8Array): WasmFileComplete;
 
   // ── WebRTC client (sh-web-client) ──────────────────────────────────────
   WebClient: WebClientCtor;

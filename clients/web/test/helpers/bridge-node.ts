@@ -21,6 +21,15 @@ export type CodecBridge = Pick<
   | "decode_video_header"
   | "decode_common_header"
   | "negotiate_transport"
+  // File-transfer framing (P7-2): the byte-parity + round-trip tests call the REAL Rust codec.
+  | "encode_file_offer"
+  | "decode_file_offer"
+  | "encode_file_chunk_header"
+  | "decode_file_chunk_header"
+  | "encode_file_accept"
+  | "decode_file_accept"
+  | "encode_file_complete"
+  | "decode_file_complete"
 >;
 
 let cached: CodecBridge | null = null;

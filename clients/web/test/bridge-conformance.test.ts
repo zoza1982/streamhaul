@@ -19,6 +19,15 @@ const REQUIRED_CODEC_EXPORTS = [
   "decode_video_header",
   "decode_common_header",
   "negotiate_transport",
+  // File-transfer framing (P7-2).
+  "encode_file_offer",
+  "decode_file_offer",
+  "encode_file_chunk_header",
+  "decode_file_chunk_header",
+  "encode_file_accept",
+  "decode_file_accept",
+  "encode_file_complete",
+  "decode_file_complete",
 ] as const;
 
 describe("wasm bridge conformance (codec surface)", () => {

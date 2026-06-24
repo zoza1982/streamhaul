@@ -13,6 +13,18 @@
       .status dd { margin: 0; font-family: monospace; }
       button { margin-right: 0.5rem; }
       #error { color: #f66; font-family: monospace; min-height: 1.2em; }
+      /* File-transfer (P7-2) — functional-only styling. */
+      #file-transfer { margin-top: 1rem; max-width: 32rem; }
+      .file-drop { border: 2px dashed #555; border-radius: 6px; padding: 1.25rem; text-align: center;
+        color: #aaa; cursor: pointer; user-select: none; }
+      .file-drop.dragover { border-color: #6cf; background: #022; color: #cef; }
+      .file-status { margin: 0.4rem 0; font-family: monospace; min-height: 1.2em; }
+      .file-progress { background: #222; border: 1px solid #444; border-radius: 4px; overflow: hidden; height: 1.2em; }
+      .file-progress-bar { background: #285; width: 0%; height: 100%; text-align: center; color: #fff;
+        font-family: monospace; font-size: 0.8em; line-height: 1.2em; transition: width 0.1s linear; }
+      .file-integrity { margin-top: 0.4rem; font-family: monospace; color: #888; }
+      .file-integrity[data-state="ok"] { color: #6e6; }
+      .file-integrity[data-state="failed"] { color: #f66; }
     </style>
   </head>
   <body>
@@ -30,6 +42,7 @@
     </dl>
     <div id="error"></div>
     <canvas id="screen" width="320" height="240" tabindex="0"></canvas>
+    <section id="file-transfer" aria-label="File transfer"></section>
     <script type="module" src="/src/app.ts"></script>
   </body>
 </html>
