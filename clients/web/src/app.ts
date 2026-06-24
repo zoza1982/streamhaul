@@ -11,6 +11,7 @@ import { CanvasH264Decoder, isWebCodecsAvailable } from "./view/decoder.js";
 import { attachInputCapture } from "./control/input-capture.js";
 import { parseVideoFrame, isH264Keyframe } from "./protocol/frame.js";
 import { loadBridge } from "./bridge/index.js";
+import { mountFileTransferUi } from "./file/ui.js";
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -36,6 +37,13 @@ async function main(): Promise<void> {
   await session.init();
 
   const decoder = new CanvasH264Decoder(canvas);
+
+  // FILE (P7-2): mount the drag-and-drop send + receive-progress affordance. It drives the
+  // in-process sender→receiver loop (the live browser↔native file path is deferred, R-BROWSER-FILE).
+  const fileHost = document.getElementById("file-transfer");
+  // Keep the disposer so disconnect detaches the drag-drop listeners (mirrors `disposeInput`); the
+  // listener closures capture the wasm bridge, so leaving them attached would pin its linear memory.
+  const disposeFileUi = fileHost !== null ? mountFileTransferUi(fileHost) : (): void => {};
 
   // VIEW: route inbound video frames through the decoder. on_frame binds to the offerer's "shp"
   // DataChannel, which `create_offer` creates — so it must be registered AFTER the offer, inside
@@ -72,6 +80,7 @@ async function main(): Promise<void> {
   });
   el<HTMLButtonElement>("disconnect").addEventListener("click", () => {
     disposeInput();
+    disposeFileUi();
     decoder.close();
     // Close the WebClient (RTCPeerConnection + DataChannel), releasing ICE/DTLS resources.
     session.dispose();

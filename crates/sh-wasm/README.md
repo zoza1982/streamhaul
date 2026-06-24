@@ -24,6 +24,10 @@ secondary protocol or translation layer.
 | `encode_transport_caps(...)` | browser→host | Encode a 2-byte transport-capability payload |
 | `decode_transport_caps(bytes)` | host→browser | Decode a transport-capability payload |
 | `negotiate_transport(...)` | — | Run the symmetric QUIC>WebRTC negotiation |
+| `encode_file_offer(...)` / `decode_file_offer(bytes)` | sender↔receiver | File-transfer offer framing (P7-2) |
+| `encode_file_chunk_header(...)` / `decode_file_chunk_header(bytes)` | sender→receiver | 21-byte file chunk header (payload follows) |
+| `encode_file_accept(...)` / `decode_file_accept(bytes)` | receiver→sender | Accept + resume-offset framing |
+| `encode_file_complete(...)` / `decode_file_complete(bytes)` | receiver→sender | Integrity-result framing |
 
 ## Building
 

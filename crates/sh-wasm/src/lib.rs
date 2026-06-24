@@ -657,7 +657,335 @@ pub fn negotiate_transport(
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
+// ── File-transfer framing bridge (sh-protocol::file, P7-2 — ADR-0024) ─────────
+//
+// Pure wire bridge: every function delegates to `sh_protocol::file`, which is fuzzed and never
+// panics on hostile input. The TS file module (`clients/web/src/file/`) wraps these encoders /
+// decoders and mirrors the `sh-core` orchestrator's stateful validation — but the *bytes* are
+// always produced and parsed here, never re-implemented in TypeScript.
+
+/// Encode a [`FileOffer`](sh_protocol::file::FileOffer) to its wire form
+/// (`transfer_id u64 | total_size u64 | chunk_size u32 | sha256[32] | name_len u8 | name`).
+///
+/// `transfer_id` and `total_size` are passed as `f64` because JavaScript numbers are doubles;
+/// callers MUST keep them `<= 2^53` (the safe-integer range) — `BigInt` is intentionally avoided
+/// to match the existing bridge's plain-`number` surface. `sha256` must be exactly 32 bytes.
+///
+/// # Errors
+///
+/// Throws a `JsError` if `sha256` is not 32 bytes, `chunk_size` is `0` or above
+/// [`MAX_FILE_CHUNK`](sh_protocol::file::MAX_FILE_CHUNK), `name` exceeds
+/// [`MAX_FILE_NAME`](sh_protocol::file::MAX_FILE_NAME) bytes, or `transfer_id`/`total_size` are
+/// negative / non-integral.
+#[wasm_bindgen]
+pub fn encode_file_offer(
+    transfer_id: f64,
+    total_size: f64,
+    chunk_size: u32,
+    sha256: &[u8],
+    name: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    let transfer_id = u64_from_f64(transfer_id, "transfer_id")?;
+    let total_size = u64_from_f64(total_size, "total_size")?;
+    let sha = sha256_from_slice(sha256)?;
+    let offer = sh_protocol::file::FileOffer {
+        transfer_id,
+        total_size,
+        chunk_size,
+        sha256: sha,
+        name: name.to_vec(),
+    };
+    offer.encode().map_err(proto_err)
+}
+
+/// Decode a [`FileOffer`](sh_protocol::file::FileOffer) from `data`.
+///
+/// Returns a [`WasmFileOffer`] on success.
+///
+/// # Errors
+///
+/// Throws a `JsError` if `data` is truncated, `chunk_size` is out of range, or the declared name
+/// length runs past the buffer.
+#[wasm_bindgen]
+pub fn decode_file_offer(data: &[u8]) -> Result<WasmFileOffer, JsError> {
+    let inner = sh_protocol::file::FileOffer::decode(data).map_err(proto_err)?;
+    ensure_safe_u64(inner.transfer_id, "transfer_id")?;
+    ensure_safe_u64(inner.total_size, "total_size")?;
+    Ok(WasmFileOffer { inner })
+}
+
+/// A decoded [`FileOffer`](sh_protocol::file::FileOffer). Obtain via [`decode_file_offer`].
+#[wasm_bindgen]
+pub struct WasmFileOffer {
+    inner: sh_protocol::file::FileOffer,
+}
+
+#[wasm_bindgen]
+impl WasmFileOffer {
+    /// Opaque transfer identifier (returned as `f64`; always a safe integer for real transfers).
+    #[wasm_bindgen(getter)]
+    pub fn transfer_id(&self) -> f64 {
+        self.inner.transfer_id as f64
+    }
+
+    /// Total file size in bytes (returned as `f64`).
+    #[wasm_bindgen(getter)]
+    pub fn total_size(&self) -> f64 {
+        self.inner.total_size as f64
+    }
+
+    /// Intended chunk payload size in bytes.
+    #[wasm_bindgen(getter)]
+    pub fn chunk_size(&self) -> u32 {
+        self.inner.chunk_size
+    }
+
+    /// SHA-256 digest of the whole file (32 bytes).
+    #[wasm_bindgen(getter)]
+    pub fn sha256(&self) -> Vec<u8> {
+        self.inner.sha256.to_vec()
+    }
+
+    /// File-name bytes (opaque; the caller mirrors the `sh-core` sanitizer).
+    #[wasm_bindgen(getter)]
+    pub fn name(&self) -> Vec<u8> {
+        self.inner.name.clone()
+    }
+}
+
+/// Encode a [`FileChunkHeader`](sh_protocol::file::FileChunkHeader) to its fixed 21-byte wire form
+/// (`transfer_id u64 | offset u64 | len u32 | flags u8`). The payload bytes follow this header on
+/// the wire but are NOT included here.
+///
+/// # Errors
+///
+/// Throws a `JsError` if `len` is `0` or above [`MAX_FILE_CHUNK`](sh_protocol::file::MAX_FILE_CHUNK),
+/// or `transfer_id`/`offset` are negative / non-integral.
+#[wasm_bindgen]
+pub fn encode_file_chunk_header(
+    transfer_id: f64,
+    offset: f64,
+    len: u32,
+    last: bool,
+) -> Result<Vec<u8>, JsError> {
+    let transfer_id = u64_from_f64(transfer_id, "transfer_id")?;
+    let offset = u64_from_f64(offset, "offset")?;
+    let header = sh_protocol::file::FileChunkHeader {
+        transfer_id,
+        offset,
+        len,
+        last,
+    };
+    header.encode().map(|arr| arr.to_vec()).map_err(proto_err)
+}
+
+/// Decode the fixed 21-byte [`FileChunkHeader`](sh_protocol::file::FileChunkHeader) from `data`
+/// (the payload, if any, is whatever follows the first 21 bytes — not parsed here).
+///
+/// Returns a [`WasmFileChunkHeader`] on success.
+///
+/// # Errors
+///
+/// Throws a `JsError` if `data` is shorter than 21 bytes, `len` is out of range, or a reserved flag
+/// bit is set.
+#[wasm_bindgen]
+pub fn decode_file_chunk_header(data: &[u8]) -> Result<WasmFileChunkHeader, JsError> {
+    let inner = sh_protocol::file::FileChunkHeader::decode(data).map_err(proto_err)?;
+    ensure_safe_u64(inner.transfer_id, "transfer_id")?;
+    ensure_safe_u64(inner.offset, "offset")?;
+    Ok(WasmFileChunkHeader { inner })
+}
+
+/// A decoded [`FileChunkHeader`](sh_protocol::file::FileChunkHeader). Obtain via
+/// [`decode_file_chunk_header`].
+#[wasm_bindgen]
+pub struct WasmFileChunkHeader {
+    inner: sh_protocol::file::FileChunkHeader,
+}
+
+#[wasm_bindgen]
+impl WasmFileChunkHeader {
+    /// The transfer this chunk belongs to (returned as `f64`).
+    #[wasm_bindgen(getter)]
+    pub fn transfer_id(&self) -> f64 {
+        self.inner.transfer_id as f64
+    }
+
+    /// Byte offset of this chunk's payload within the file (returned as `f64`).
+    #[wasm_bindgen(getter)]
+    pub fn offset(&self) -> f64 {
+        self.inner.offset as f64
+    }
+
+    /// Payload length in bytes following this header.
+    //
+    // `len` mirrors the wire field name; it is a scalar accessor, not a collection length, so the
+    // `is_empty` companion clippy expects is not meaningful here.
+    #[wasm_bindgen(getter)]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> u32 {
+        self.inner.len
+    }
+
+    /// True if this is the last chunk of the transfer.
+    #[wasm_bindgen(getter)]
+    pub fn last(&self) -> bool {
+        self.inner.last
+    }
+}
+
+/// Encode a [`FileAccept`](sh_protocol::file::FileAccept) to its 16-byte wire form
+/// (`transfer_id u64 | resume_offset u64`).
+///
+/// # Errors
+///
+/// Throws a `JsError` if `transfer_id`/`resume_offset` are negative or non-integral.
+#[wasm_bindgen]
+pub fn encode_file_accept(transfer_id: f64, resume_offset: f64) -> Result<Vec<u8>, JsError> {
+    let transfer_id = u64_from_f64(transfer_id, "transfer_id")?;
+    let resume_offset = u64_from_f64(resume_offset, "resume_offset")?;
+    let accept = sh_protocol::file::FileAccept {
+        transfer_id,
+        resume_offset,
+    };
+    Ok(accept.encode().to_vec())
+}
+
+/// Decode a [`FileAccept`](sh_protocol::file::FileAccept) from `data`.
+///
+/// Returns a [`WasmFileAccept`] on success.
+///
+/// # Errors
+///
+/// Throws a `JsError` if `data` is shorter than 16 bytes.
+#[wasm_bindgen]
+pub fn decode_file_accept(data: &[u8]) -> Result<WasmFileAccept, JsError> {
+    let inner = sh_protocol::file::FileAccept::decode(data).map_err(proto_err)?;
+    ensure_safe_u64(inner.transfer_id, "transfer_id")?;
+    ensure_safe_u64(inner.resume_offset, "resume_offset")?;
+    Ok(WasmFileAccept { inner })
+}
+
+/// A decoded [`FileAccept`](sh_protocol::file::FileAccept). Obtain via [`decode_file_accept`].
+#[wasm_bindgen]
+pub struct WasmFileAccept {
+    inner: sh_protocol::file::FileAccept,
+}
+
+#[wasm_bindgen]
+impl WasmFileAccept {
+    /// The offered transfer id being accepted (returned as `f64`).
+    #[wasm_bindgen(getter)]
+    pub fn transfer_id(&self) -> f64 {
+        self.inner.transfer_id as f64
+    }
+
+    /// Byte offset to resume from (returned as `f64`).
+    #[wasm_bindgen(getter)]
+    pub fn resume_offset(&self) -> f64 {
+        self.inner.resume_offset as f64
+    }
+}
+
+/// Encode a [`FileComplete`](sh_protocol::file::FileComplete) to its 9-byte wire form
+/// (`transfer_id u64 | ok u8`).
+///
+/// # Errors
+///
+/// Throws a `JsError` if `transfer_id` is negative or non-integral.
+#[wasm_bindgen]
+pub fn encode_file_complete(transfer_id: f64, ok: bool) -> Result<Vec<u8>, JsError> {
+    let transfer_id = u64_from_f64(transfer_id, "transfer_id")?;
+    let complete = sh_protocol::file::FileComplete { transfer_id, ok };
+    Ok(complete.encode().to_vec())
+}
+
+/// Decode a [`FileComplete`](sh_protocol::file::FileComplete) from `data`.
+///
+/// Returns a [`WasmFileComplete`] on success.
+///
+/// # Errors
+///
+/// Throws a `JsError` if `data` is shorter than 9 bytes or the `ok` byte is not `0`/`1`.
+#[wasm_bindgen]
+pub fn decode_file_complete(data: &[u8]) -> Result<WasmFileComplete, JsError> {
+    let inner = sh_protocol::file::FileComplete::decode(data).map_err(proto_err)?;
+    ensure_safe_u64(inner.transfer_id, "transfer_id")?;
+    Ok(WasmFileComplete { inner })
+}
+
+/// A decoded [`FileComplete`](sh_protocol::file::FileComplete). Obtain via [`decode_file_complete`].
+#[wasm_bindgen]
+pub struct WasmFileComplete {
+    inner: sh_protocol::file::FileComplete,
+}
+
+#[wasm_bindgen]
+impl WasmFileComplete {
+    /// The completed transfer (returned as `f64`).
+    #[wasm_bindgen(getter)]
+    pub fn transfer_id(&self) -> f64 {
+        self.inner.transfer_id as f64
+    }
+
+    /// Whether the integrity check passed.
+    #[wasm_bindgen(getter)]
+    pub fn ok(&self) -> bool {
+        self.inner.ok
+    }
+}
+
 // ── Internal helpers (not exported to JS) ───────────────────────────────────
+
+/// Convert a JS `f64` to a `u64`, rejecting negative, non-integral, or out-of-range values.
+///
+/// The bridge surface uses plain `number` (doubles) for the 64-bit file fields rather than
+/// `BigInt`; this guards the (lossless) narrowing so a hostile / buggy caller cannot smuggle a
+/// fractional or negative value into a wire `u64`. The accepted range is **enforced** at the JS
+/// safe-integer ceiling (`2^53 - 1` = `Number.MAX_SAFE_INTEGER`): above that, an `f64` can no
+/// longer represent consecutive integers, so a value could only have arrived already rounded — we
+/// reject it rather than silently encoding a corrupted `u64` (this also closes the `2^64 as f64`
+/// rounds-up-and-saturates edge). 2^53 bytes (~9 PB) is far above any practical browser transfer.
+const MAX_SAFE_U64_F64: f64 = 9_007_199_254_740_991.0; // 2^53 - 1 (Number.MAX_SAFE_INTEGER)
+
+fn u64_from_f64(value: f64, field: &str) -> Result<u64, JsError> {
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > MAX_SAFE_U64_F64 {
+        return Err(JsError::new(&format!(
+            "invalid {field}: {value}; expected a non-negative integer <= 2^53-1"
+        )));
+    }
+    // Guarded above: finite, non-negative, integral, and within the JS safe-integer range.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    Ok(value as u64)
+}
+
+/// Reject a wire `u64` that cannot round-trip through a JS `f64` (`> 2^53 - 1`).
+///
+/// The decode getters return `u64 as f64`; above the safe-integer ceiling that cast silently rounds,
+/// so a re-encode of the rounded value would emit a different `u64` (e.g. a `FileAccept` echoing a
+/// host's `transfer_id` would mismatch). We reject such values at the decode boundary so decode is
+/// symmetric with [`u64_from_f64`]. A browser transfer can never legitimately exceed this (the
+/// aggregate cap is ~64 MiB), so this only rejects malformed/hostile offers.
+fn ensure_safe_u64(value: u64, field: &str) -> Result<(), JsError> {
+    // 2^53 - 1 = Number.MAX_SAFE_INTEGER, the same ceiling `u64_from_f64` enforces on encode.
+    const MAX_SAFE_U64: u64 = 9_007_199_254_740_991;
+    if value > MAX_SAFE_U64 {
+        return Err(JsError::new(&format!(
+            "decoded {field} {value} exceeds the JS safe-integer ceiling (2^53-1)"
+        )));
+    }
+    Ok(())
+}
+
+/// Convert a JS byte slice into the fixed 32-byte SHA-256 array, rejecting any other length.
+fn sha256_from_slice(sha256: &[u8]) -> Result<[u8; 32], JsError> {
+    <[u8; 32]>::try_from(sha256).map_err(|_| {
+        JsError::new(&format!(
+            "invalid sha256: {} bytes; expected exactly 32",
+            sha256.len()
+        ))
+    })
+}
 
 fn event_type_from_u8(byte: u8) -> Result<sh_protocol::EventType, JsError> {
     match byte {
@@ -1275,5 +1603,233 @@ mod tests {
         assert!(crate::decode_nack_feedback(&[0]).is_err());
         assert!(crate::decode_caps(&[0]).is_err());
         assert!(crate::decode_transport_caps(&[0x01]).is_err());
+    }
+
+    // ── File-transfer framing parity tests (P7-2) ────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn file_offer_native_encode_matches_wasm_encode() {
+        // Prove the wasm bridge produces bytes byte-identical to the native `sh-protocol` encoder.
+        use sh_protocol::file::FileOffer;
+        let sha = [0xABu8; 32];
+        let native = FileOffer {
+            transfer_id: 0x0102_0304_0506,
+            total_size: 4096,
+            chunk_size: 1024,
+            sha256: sha,
+            name: b"report.pdf".to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let wasm_bytes = crate::encode_file_offer(
+            0x0102_0304_0506_u64 as f64,
+            4096.0,
+            1024,
+            &sha,
+            b"report.pdf",
+        )
+        .unwrap();
+        assert_eq!(
+            native, wasm_bytes,
+            "native and wasm file-offer encode must be byte-identical"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn file_offer_roundtrip() {
+        let sha = [0x11u8; 32];
+        let bytes = crate::encode_file_offer(7.0, 12_345.0, 4096, &sha, b"notes.txt").unwrap();
+        let decoded = crate::decode_file_offer(&bytes).unwrap();
+        assert_eq!(decoded.transfer_id(), 7.0);
+        assert_eq!(decoded.total_size(), 12_345.0);
+        assert_eq!(decoded.chunk_size(), 4096);
+        assert_eq!(decoded.sha256(), sha.to_vec());
+        assert_eq!(decoded.name(), b"notes.txt".to_vec());
+    }
+
+    #[wasm_bindgen_test]
+    fn file_offer_bad_sha_len_is_js_error() {
+        // 31-byte digest must be rejected (wire field is exactly 32).
+        let result = crate::encode_file_offer(1.0, 1.0, 16, &[0u8; 31], b"f");
+        assert!(result.is_err(), "short sha256 must return error");
+    }
+
+    #[wasm_bindgen_test]
+    fn file_offer_zero_chunk_size_is_js_error() {
+        let result = crate::encode_file_offer(1.0, 1.0, 0, &[0u8; 32], b"f");
+        assert!(result.is_err(), "zero chunk_size must return error");
+    }
+
+    #[wasm_bindgen_test]
+    fn file_offer_oversized_chunk_size_is_js_error() {
+        let too_big = sh_protocol::file::MAX_FILE_CHUNK + 1;
+        let result = crate::encode_file_offer(1.0, 1.0, too_big, &[0u8; 32], b"f");
+        assert!(result.is_err(), "oversized chunk_size must return error");
+    }
+
+    #[wasm_bindgen_test]
+    fn file_offer_negative_id_is_js_error() {
+        let result = crate::encode_file_offer(-1.0, 1.0, 16, &[0u8; 32], b"f");
+        assert!(result.is_err(), "negative transfer_id must return error");
+    }
+
+    #[wasm_bindgen_test]
+    fn file_offer_fractional_size_is_js_error() {
+        let result = crate::encode_file_offer(1.0, 1.5, 16, &[0u8; 32], b"f");
+        assert!(result.is_err(), "fractional total_size must return error");
+    }
+
+    #[wasm_bindgen_test]
+    fn file_offer_above_safe_integer_is_js_error() {
+        // 2^53 is the first integer an f64 can no longer represent consecutively; reject it (and
+        // anything larger, incl. the `2^64 as f64` saturating edge) rather than encode a corrupt
+        // u64.
+        let two_pow_53 = 9_007_199_254_740_992.0; // 2^53
+        assert!(
+            crate::encode_file_offer(1.0, two_pow_53, 16, &[0u8; 32], b"f").is_err(),
+            "total_size above 2^53-1 must return error"
+        );
+        let two_pow_64 = 18_446_744_073_709_551_616.0; // 2^64
+        assert!(
+            crate::encode_file_chunk_header(two_pow_64, 0.0, 16, false).is_err(),
+            "transfer_id at 2^64 must return error (no silent u64::MAX saturation)"
+        );
+        // The largest accepted value (2^53 - 1) must still encode.
+        assert!(
+            crate::encode_file_accept(9_007_199_254_740_991.0, 0.0).is_ok(),
+            "2^53-1 must still be accepted"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn file_chunk_header_native_encode_matches_wasm_encode() {
+        use sh_protocol::file::FileChunkHeader;
+        // transfer_id/offset stay within the JS safe-integer range (<= 2^53); the bridge surface
+        // carries 64-bit fields as f64, so values above 2^53 are out of contract by design.
+        let native = FileChunkHeader {
+            transfer_id: 0x0001_0203_0405,
+            offset: 1_048_576,
+            len: 65536,
+            last: true,
+        }
+        .encode()
+        .unwrap();
+        let wasm_bytes =
+            crate::encode_file_chunk_header(0x0001_0203_0405_u64 as f64, 1_048_576.0, 65536, true)
+                .unwrap();
+        assert_eq!(
+            native.to_vec(),
+            wasm_bytes,
+            "native and wasm chunk-header encode must be byte-identical"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn file_chunk_header_roundtrip() {
+        let bytes = crate::encode_file_chunk_header(9.0, 2048.0, 512, false).unwrap();
+        assert_eq!(bytes.len(), 21);
+        let decoded = crate::decode_file_chunk_header(&bytes).unwrap();
+        assert_eq!(decoded.transfer_id(), 9.0);
+        assert_eq!(decoded.offset(), 2048.0);
+        assert_eq!(decoded.len(), 512);
+        assert!(!decoded.last());
+    }
+
+    #[wasm_bindgen_test]
+    fn file_chunk_header_zero_len_is_js_error() {
+        let result = crate::encode_file_chunk_header(1.0, 0.0, 0, false);
+        assert!(result.is_err(), "zero chunk len must return error");
+    }
+
+    #[wasm_bindgen_test]
+    fn file_chunk_header_decode_rejects_offset_above_safe_integer() {
+        // Hand-craft a 21-byte header whose offset (bytes 8..16, BE) is 2^53 — decode must reject it
+        // so the f64 getter never silently rounds (symmetric with the encode-side guard).
+        let mut bytes = crate::encode_file_chunk_header(1.0, 0.0, 16, false).unwrap();
+        let two_pow_53: u64 = 1 << 53;
+        // offset occupies bytes 8..16 (BE); use get_mut to stay clear of the indexing_slicing ban.
+        if let Some(slot) = bytes.get_mut(8..16) {
+            slot.copy_from_slice(&two_pow_53.to_be_bytes());
+        }
+        assert!(
+            crate::decode_file_chunk_header(&bytes).is_err(),
+            "offset above 2^53 must be rejected at decode"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn file_chunk_header_reserved_bits_decode_is_js_error() {
+        // Encode a valid header, then flip a reserved flag bit (bit 1) in the wire bytes.
+        let mut bytes = crate::encode_file_chunk_header(1.0, 0.0, 16, true).unwrap();
+        // The flags byte is the last of the 21-byte header; set a reserved bit on it.
+        *bytes.last_mut().unwrap() |= 0b0000_0010;
+        assert!(
+            crate::decode_file_chunk_header(&bytes).is_err(),
+            "reserved flag bit must return error"
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn file_accept_native_encode_matches_wasm_encode() {
+        use sh_protocol::file::FileAccept;
+        let native = FileAccept {
+            transfer_id: 0xDEAD_BEEF,
+            resume_offset: 4096,
+        }
+        .encode();
+        let wasm_bytes = crate::encode_file_accept(0xDEAD_BEEF_u64 as f64, 4096.0).unwrap();
+        assert_eq!(native.to_vec(), wasm_bytes);
+    }
+
+    #[wasm_bindgen_test]
+    fn file_accept_roundtrip() {
+        let bytes = crate::encode_file_accept(3.0, 1024.0).unwrap();
+        let decoded = crate::decode_file_accept(&bytes).unwrap();
+        assert_eq!(decoded.transfer_id(), 3.0);
+        assert_eq!(decoded.resume_offset(), 1024.0);
+    }
+
+    #[wasm_bindgen_test]
+    fn file_complete_native_encode_matches_wasm_encode() {
+        use sh_protocol::file::FileComplete;
+        for ok in [true, false] {
+            let native = FileComplete {
+                transfer_id: 42,
+                ok,
+            }
+            .encode();
+            let wasm_bytes = crate::encode_file_complete(42.0, ok).unwrap();
+            assert_eq!(native.to_vec(), wasm_bytes);
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn file_complete_roundtrip() {
+        let bytes = crate::encode_file_complete(99.0, true).unwrap();
+        let decoded = crate::decode_file_complete(&bytes).unwrap();
+        assert_eq!(decoded.transfer_id(), 99.0);
+        assert!(decoded.ok());
+    }
+
+    #[wasm_bindgen_test]
+    fn file_decoders_handle_empty_input() {
+        assert!(crate::decode_file_offer(&[]).is_err());
+        assert!(crate::decode_file_chunk_header(&[]).is_err());
+        assert!(crate::decode_file_accept(&[]).is_err());
+        assert!(crate::decode_file_complete(&[]).is_err());
+    }
+
+    #[wasm_bindgen_test]
+    fn file_decoders_handle_oversized_garbage() {
+        // 256 bytes of 0xFF — must return Err (not trap) for every length/bounds-checked decoder.
+        let garbage = [0xFFu8; 256];
+        // Offer: chunk_size bytes are 0xFFFFFFFF → exceeds MAX_FILE_CHUNK → error.
+        assert!(crate::decode_file_offer(&garbage).is_err());
+        // Chunk header: len 0xFFFFFFFF exceeds MAX_FILE_CHUNK → error.
+        assert!(crate::decode_file_chunk_header(&garbage).is_err());
+        // Complete: ok byte 0xFF is neither 0 nor 1 → error.
+        assert!(crate::decode_file_complete(&garbage).is_err());
+        // Accept: any 16 bytes are structurally valid; must not trap.
+        let _ = crate::decode_file_accept(&garbage);
     }
 }
