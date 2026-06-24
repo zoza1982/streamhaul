@@ -83,11 +83,12 @@ jobs:
         run: echo "No Cargo.toml yet — test gate is a no-op until Rust code lands."
 
   # ----------------------------------------------------------------------------
-  # WASM wire-parity bridge: build + test (Node runner, no browser required).
-  # This job guards crates/sh-wasm from rotting by running the codec parity
-  # tests via wasm-pack test --node on every PR/push.  It is Linux-only because
-  # wasm-pack + Node are sufficient for the wire-codec verification; browser-matrix
-  # testing (Chrome/FF/Safari) is deferred — see R-BROWSER-INTEROP / R-BROWSER-MATRIX.
+  # WASM bridges: build + test (Node runner, no browser required).
+  # Guards both sh-wasm (wire-codec parity) and sh-crypto-wasm (browser crypto
+  # bridge: identity, R-SIG-AUTH, Noise XK/IK + DTLS binding) from rotting on
+  # every PR/push.  Linux-only: wasm-pack + Node suffice for verification without
+  # a browser.  Browser-matrix testing (Chrome/FF/Safari) is deferred — see
+  # R-BROWSER-INTEROP / R-BROWSER-MATRIX / R-BROWSER-CRYPTO-LIVE (ADR-0019/0020).
   # ----------------------------------------------------------------------------
   wasm:
     name: wasm
@@ -100,12 +101,22 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-pack@0.13.1
-      - name: clippy (wasm target, panic-ban)
+
+      # --- sh-wasm: wire-codec parity bridge ---
+      - name: clippy sh-wasm (wasm target, panic-ban)
         run: cargo clippy --manifest-path crates/sh-wasm/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings
-      - name: wasm-pack test --node (wire-parity suite)
+      - name: wasm-pack test --node sh-wasm (wire-parity suite)
         run: wasm-pack test --node crates/sh-wasm
-      - name: wasm-pack build --target web (artifact smoke-check)
+      - name: wasm-pack build --target web sh-wasm (artifact smoke-check)
         run: wasm-pack build --target web crates/sh-wasm
+
+      # --- sh-crypto-wasm: browser crypto bridge (P5, ADR-0020) ---
+      - name: clippy sh-crypto-wasm (wasm target, panic-ban)
+        run: cargo clippy --manifest-path crates/sh-crypto-wasm/Cargo.toml --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - name: wasm-pack test --node sh-crypto-wasm (identity + R-SIG-AUTH + Noise XK/IK suite)
+        run: wasm-pack test --node crates/sh-crypto-wasm
+      - name: wasm-pack build --target web sh-crypto-wasm (artifact smoke-check)
+        run: wasm-pack build --target web crates/sh-crypto-wasm
 
   # ----------------------------------------------------------------------------
   # Security audit of dependencies.

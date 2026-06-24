@@ -2,7 +2,7 @@
 resolver = "2"
 # cargo-fuzz crates are their own workspaces and need a nightly toolchain; keep them out of the
 # main workspace so `cargo build/clippy/test --workspace` and CI never touch them.
-exclude = ["crates/sh-protocol/fuzz", "crates/sh-core/fuzz", "crates/sh-transport/fuzz", "crates/sh-codec-hw/fuzz", "crates/sh-crypto/fuzz", "crates/sh-signaling/fuzz", "crates/sh-ice/fuzz", "crates/sh-wasm"]
+exclude = ["crates/sh-protocol/fuzz", "crates/sh-core/fuzz", "crates/sh-transport/fuzz", "crates/sh-codec-hw/fuzz", "crates/sh-crypto/fuzz", "crates/sh-signaling/fuzz", "crates/sh-ice/fuzz", "crates/sh-wasm", "crates/sh-crypto-wasm"]
 members = [
     "crates/sh-types",
     "crates/sh-protocol",
