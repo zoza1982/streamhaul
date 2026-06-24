@@ -140,9 +140,10 @@ jobs:
       - name: Install Firefox (headless e2e)
         uses: browser-actions/setup-firefox@v1
         with:
-          # Pinned to match ADR-0021's proven pair (Firefox 152 + geckodriver 0.37.0);
+          # Pinned to the exact proven build (ADR-0021: Firefox 152.0.1 + geckodriver 0.37.0).
+          # `browser-actions/setup-firefox` needs a full version string (a bare "152" 404s);
           # `latest` could auto-advance into a geckodriver-incompatible Firefox.
-          firefox-version: "152"
+          firefox-version: "152.0.1"
       - name: Install geckodriver (pinned GitHub release)
         run: |
           set -euo pipefail
