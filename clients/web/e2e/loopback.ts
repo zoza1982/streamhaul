@@ -29,7 +29,16 @@ import { H264_KEYFRAME } from "../test/fixtures/h264-keyframe.generated.js";
 /** Result surface read by the Playwright spec. */
 export interface DemoResult {
   webCodecsAvailable: boolean;
+  /** Whether this Firefox build can WebCodecs-decode the H.264 fixture (OpenH264/ffmpeg present).
+   * `null` if support could not be probed. The pixel-decode assertions are gated on this. */
+  h264DecodeSupported: boolean | null;
+  /** Whether the loopback DataChannel connected over real DTLS (codec-independent). */
+  loopbackConnected: boolean;
   negotiatedCodec: number | null;
+  /** Count of valid SHP video frames parsed off the wire and handed to the decoder's `decode()`
+   * input. Codec-INDEPENDENT: proves transport + frame-delivery + the decode pipeline are wired,
+   * even on a Firefox build that cannot actually decode H.264 to pixels. */
+  framesReachedDecoder: number;
   framesDecoded: number;
   framesDropped: number;
   decodedWidth: number;
@@ -89,10 +98,31 @@ function once<T>(target: EventTarget, type: string, map: (e: Event) => T, timeou
   });
 }
 
+/** The avc1 codec string of the committed fixture (Baseline profile 0x42, level 0x1e). */
+const FIXTURE_CODEC = "avc1.42001e";
+
+/** Probe whether this browser can WebCodecs-decode the fixture's H.264 (OpenH264/ffmpeg present).
+ * Returns `null` if the API is missing or the probe throws. */
+async function probeH264DecodeSupport(): Promise<boolean | null> {
+  try {
+    const VD = (globalThis as unknown as {
+      VideoDecoder?: { isConfigSupported?: (c: { codec: string }) => Promise<{ supported?: boolean }> };
+    }).VideoDecoder;
+    if (VD?.isConfigSupported === undefined) return null;
+    const support = await VD.isConfigSupported({ codec: FIXTURE_CODEC });
+    return support.supported === true;
+  } catch {
+    return null;
+  }
+}
+
 async function run(): Promise<DemoResult> {
   const result: DemoResult = {
     webCodecsAvailable: isWebCodecsAvailable(),
+    h264DecodeSupported: null,
+    loopbackConnected: false,
     negotiatedCodec: null,
+    framesReachedDecoder: 0,
     framesDecoded: 0,
     framesDropped: 0,
     decodedWidth: 0,
@@ -105,6 +135,11 @@ async function run(): Promise<DemoResult> {
 
   try {
     const bridge: ShBridge = await loadBridge();
+
+    // Probe H.264 WebCodecs decode support up front. On a fresh Firefox without OpenH264/ffmpeg
+    // (e.g. Playwright's bundled Firefox in CI) this is false; the pixel-decode assertions are
+    // then gracefully skipped while the codec-INDEPENDENT proofs still run.
+    result.h264DecodeSupported = await probeH264DecodeSupport();
 
     // ── Codec negotiation (H.264 selected for the browser) ───────────────────
     // The browser builds its offer caps (advertising H.264 decode + is_browser); a real host
@@ -179,6 +214,10 @@ async function run(): Promise<DemoResult> {
         result.malformedFrameSurvived = true;
         return;
       }
+      // A valid SHP video frame reached the decoder input (codec-independent proof that
+      // transport + frame delivery + the decode pipeline are wired). Counted BEFORE pushAnnexB so
+      // it holds even on a Firefox build that cannot actually decode H.264 to pixels.
+      result.framesReachedDecoder += 1;
       decoder.pushAnnexB(parsed.payload, isH264Keyframe(parsed));
     });
 
@@ -194,17 +233,28 @@ async function run(): Promise<DemoResult> {
     viewer.set_dtls_pin(hostFp);
     await viewer.connect_as_offerer(answerSdp);
 
-    // ── Wait for the host to send the video; decode to canvas ────────────────
-    // Give ICE/DTLS time to converge and frames to flow.
+    // ── Wait for the host's video frame to reach the decoder, then (if decodable) paint ──
+    // The primary, codec-INDEPENDENT signal is `framesReachedDecoder >= 1` (the frame arrived over
+    // the real DataChannel and was handed to the decoder). When H.264 decode IS supported we also
+    // wait for a painted frame; when it is NOT, we stop as soon as the frame reached the decoder so
+    // the test does not hang waiting for pixels that this build cannot produce.
+    const wantPixels = result.h264DecodeSupported === true;
     await once(
-      // Resolve when the decoder has painted at least one frame, polled below.
-      makePoller(() => decoder.stats.framesDecoded > 0 || decoder.stats.framesDropped > 2),
+      makePoller(() => {
+        if (result.framesReachedDecoder < 1) return false;
+        if (!wantPixels) return true; // frame delivered; no decode expected on this build
+        return decoder.stats.framesDecoded > 0 || decoder.stats.framesDropped > 2;
+      }),
       "tick",
       () => undefined,
       30_000,
       "decode",
     ).catch(() => undefined);
 
+    result.loopbackConnected =
+      viewer.ice_connection_state() === "connected" ||
+      viewer.ice_connection_state() === "completed" ||
+      result.framesReachedDecoder >= 1; // a frame over the DTLS DataChannel ⇒ connected
     result.framesDecoded = decoder.stats.framesDecoded;
     result.framesDropped = decoder.stats.framesDropped;
     result.decodedWidth = decoder.stats.lastWidth;

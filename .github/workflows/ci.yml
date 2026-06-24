@@ -219,6 +219,13 @@ jobs:
         run: npm run build:wasm
       - name: Install Playwright Firefox (pinned via @playwright/test)
         run: npx playwright install firefox
+      - name: Install ffmpeg (best-effort H.264 decode for Firefox WebCodecs)
+        # Playwright's bundled Firefox has no OpenH264 codec on a fresh runner, so WebCodecs
+        # cannot decode H.264 to pixels. Installing a H.264-capable libavcodec MAY let Firefox
+        # decode (then the e2e's conditional pixel assertion runs in CI too). The e2e does NOT
+        # depend on this succeeding — if decode is still unavailable it skips only the pixel
+        # assertion and the codec-independent transport/control proofs still gate. ADR-0022.
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Build (strict tsc + vite)
         run: npm run build
       - name: Vitest (pure-logic unit tests)

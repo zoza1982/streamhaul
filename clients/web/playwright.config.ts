@@ -29,6 +29,12 @@ export default defineConfig({
             // Enable WebCodecs (VideoEncoder/VideoDecoder) in this Firefox build.
             "dom.media.webcodecs.enabled": true,
             "dom.media.webcodecs.image-decoder.enabled": true,
+            // Best-effort: prefer a system H.264 codec (ffmpeg/OpenH264) so WebCodecs can decode
+            // H.264 to pixels where the codec is installed. Where it is not (a fresh CI Firefox),
+            // the e2e gracefully skips only the pixel-decode assertion (see loopback.spec.ts).
+            "media.ffmpeg.enabled": true,
+            "media.gmp-gmpopenh264.enabled": true,
+            "media.navigator.mediadatadecoder_vpx_enabled": true,
           },
         },
       },
