@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Streamhaul loopback demo (e2e)</title>
+  </head>
+  <body style="margin: 0">
+    <!-- The viewer canvas the host paints into and the e2e reads pixels from.
+         Positioned at the viewport origin with the CSS size pinned to the 16x16 coded size, so
+         getBoundingClientRect() === {left:0, top:0, width:16, height:16} (integer-aligned). A
+         center click (8,8) then maps deterministically to (0x8000, 0x8000) in normalized host
+         coords — independent of layout and integer MouseEvent rounding — making the input-bytes
+         assertion exact and non-vacuous. -->
+    <canvas
+      id="screen"
+      width="16"
+      height="16"
+      tabindex="0"
+      style="position: fixed; top: 0; left: 0; width: 16px; height: 16px; display: block"
+    ></canvas>
+    <script type="module" src="./loopback.ts"></script>
+  </body>
+</html>
