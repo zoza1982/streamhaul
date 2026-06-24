@@ -1,0 +1,14 @@
+# Node / build artifacts
+node_modules/
+dist/
+
+# Generated wasm bridge output (built by scripts/build-wasm.mjs from the Rust crates;
+# the source of truth is crates/sh-wasm, crates/sh-crypto-wasm, crates/sh-web-client).
+src/wasm/
+
+# Playwright
+test-results/
+playwright-report/
+.playwright/
+
+# wasm-pack output staged inside the crates (kept out of the repo)

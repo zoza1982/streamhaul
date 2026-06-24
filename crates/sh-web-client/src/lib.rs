@@ -550,6 +550,19 @@ impl WebClient {
         s.to_owned()
     }
 
+    /// Close the underlying [`web_sys::RtcPeerConnection`], tearing down the DTLS session, the
+    /// DataChannel, and all ICE transports, and release the stored channel handle.
+    ///
+    /// Idempotent: calling `close()` on an already-closed connection is a no-op (the browser
+    /// tolerates it).  After this, the client must not be reused — construct a new [`WebClient`]
+    /// for a fresh session.  This exists so a viewer/UI can deterministically free the peer
+    /// connection on disconnect rather than leaking the ICE sockets and DTLS state until GC.
+    #[wasm_bindgen]
+    pub fn close(&mut self) {
+        self.pc.close();
+        self.channel = None;
+    }
+
     // ── internal ─────────────────────────────────────────────────────────────
 
     /// Enforce the DTLS pin against a remote SDP.  **Fail-closed**: if no pin has been set, this

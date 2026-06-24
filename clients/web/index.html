@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Streamhaul Web Viewer (P5-2)</title>
+    <style>
+      /* Functional-only styling; visual polish is deferred (ADR-0022). */
+      body { font-family: system-ui, sans-serif; margin: 1rem; background: #111; color: #ddd; }
+      #screen { background: #000; border: 1px solid #444; image-rendering: pixelated; max-width: 100%; }
+      .status { display: grid; grid-template-columns: max-content 1fr; gap: 0.25rem 1rem; margin: 0.5rem 0; }
+      .status dt { color: #888; }
+      .status dd { margin: 0; font-family: monospace; }
+      button { margin-right: 0.5rem; }
+      #error { color: #f66; font-family: monospace; min-height: 1.2em; }
+    </style>
+  </head>
+  <body>
+    <h1>Streamhaul Web Viewer</h1>
+    <div>
+      <button id="connect">Connect</button>
+      <button id="disconnect">Disconnect</button>
+    </div>
+    <dl class="status">
+      <dt>Connection</dt><dd id="phase">idle</dd>
+      <dt>ICE</dt><dd id="ice">new</dd>
+      <dt>Negotiated codec</dt><dd id="codec">—</dd>
+      <dt>WebCodecs</dt><dd id="webcodecs">—</dd>
+      <dt>Local DTLS fingerprint</dt><dd id="fingerprint">—</dd>
+    </dl>
+    <div id="error"></div>
+    <canvas id="screen" width="320" height="240" tabindex="0"></canvas>
+    <script type="module" src="/src/app.ts"></script>
+  </body>
+</html>

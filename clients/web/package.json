@@ -1,0 +1,24 @@
+{
+  "name": "@streamhaul/web-viewer",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Streamhaul browser viewer/control UI (P5-2): WebCodecs H.264 decode + canvas render (VIEW), DOM input capture -> SHP (CONTROL), H.264 negotiation. A thin TS shell over the Rust/wasm bridges (sh-wasm / sh-crypto-wasm / sh-web-client).",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "build": "npm run build:wasm && tsc --noEmit && vite build",
+    "dev": "npm run build:wasm && vite",
+    "preview": "vite preview",
+    "test:unit": "vitest run",
+    "test:e2e": "playwright test",
+    "test": "npm run build:wasm && tsc --noEmit && vitest run && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.55.1",
+    "@types/node": "20.17.6",
+    "typescript": "5.6.3",
+    "vite": "6.4.3",
+    "vitest": "4.1.9"
+  }
+}
