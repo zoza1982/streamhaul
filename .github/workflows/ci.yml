@@ -236,6 +236,72 @@ jobs:
         run: npx playwright test --project=firefox
 
   # ----------------------------------------------------------------------------
+  # Browser↔Native WebRTC interop e2e (P5-3, ADR-0023).
+  #
+  # Builds the two native binaries (`streamhaul-signaling`, `streamhaul-webrtc-host`),
+  # then drives a headless-Firefox RTCPeerConnection through the full native signaling +
+  # DTLS/DataChannel stack. Proves that the SdpBridgeBuilder + PinnedWebRtcTransport
+  # pipe works end-to-end with a real browser.
+  #
+  # Runs only on Linux (the binaries and geckodriver toolchain are Linux-only in CI).
+  # Windows/macOS browser↔native interop is deferred — R-BROWSER-MATRIX.
+  # ----------------------------------------------------------------------------
+  browser-native-e2e:
+    name: browser-native-e2e
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/web
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build native binaries (streamhaul-signaling + streamhaul-webrtc-host)
+        working-directory: .
+        run: cargo build --package streamhaul-signaling --package streamhaul-webrtc-host
+      - name: Add wasm32-unknown-unknown target
+        run: rustup target add wasm32-unknown-unknown
+      - name: Install wasm-pack (pinned, checksum-verified binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.13.1
+      - name: Setup Node (pinned)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install Firefox (headless e2e)
+        uses: browser-actions/setup-firefox@v1
+        with:
+          # Pinned to the proven build (ADR-0021/0022: Firefox 152.0.1 + geckodriver 0.37.0).
+          firefox-version: "152.0.1"
+      - name: Install geckodriver (pinned GitHub release)
+        working-directory: .
+        run: |
+          set -euo pipefail
+          GECKO_VERSION=v0.37.0
+          GECKO_SHA256=90d4e33bd9816684400c160d1309aaffec23a3f65103511d5a62d8501062e548
+          URL="https://github.com/mozilla/geckodriver/releases/download/${GECKO_VERSION}/geckodriver-${GECKO_VERSION}-linux64.tar.gz"
+          curl -fsSL "$URL" -o /tmp/geckodriver.tar.gz
+          echo "${GECKO_SHA256}  /tmp/geckodriver.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin
+          chmod +x /usr/local/bin/geckodriver
+          geckodriver --version
+      - name: npm ci
+        run: npm ci
+      - name: Build wasm bridges (--target web) + stage for the app
+        run: npm run build:wasm
+      - name: Install Playwright Firefox (pinned via @playwright/test)
+        run: npx playwright install firefox
+      - name: Build web app (strict tsc + vite)
+        run: npm run build
+      - name: Playwright browser↔native e2e (P5-3)
+        env:
+          CI: "1"
+          BROWSER_NATIVE_E2E: "1"
+          STREAMHAUL_STREAMHAUL_SIGNALING_BIN: "../../target/debug/streamhaul-signaling"
+          STREAMHAUL_STREAMHAUL_WEBRTC_HOST_BIN: "../../target/debug/streamhaul-webrtc-host"
+        run: npx playwright test --project=firefox e2e/browser-native.spec.ts
+
+  # ----------------------------------------------------------------------------
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:

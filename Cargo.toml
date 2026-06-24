@@ -18,6 +18,8 @@ members = [
     "crates/sh-core",
     "bins/streamhaul-host",
     "bins/streamhaul-client",
+    "bins/streamhaul-signaling",
+    "bins/streamhaul-webrtc-host",
 ]
 
 # Shared metadata inherited by every crate via `field.workspace = true`.
@@ -120,6 +122,9 @@ spake2 = { version = "=0.4.0", default-features = false }
 
 # async-trait 0.1: erasure of `async fn` in object-safe trait definitions.
 async-trait = "0.1"
+
+# anyhow 1.x: error context for binary entry points. Library crates use thiserror.
+anyhow = "1"
 
 # Workspace-wide lints enforce the CLAUDE.md panic-ban and safety posture.
 # Members opt in with `[lints] workspace = true`. CI runs clippy with `-D warnings`,

@@ -89,4 +89,13 @@ pub enum TransportError {
     /// and data-channel errors.
     #[error("webrtc: {0}")]
     Webrtc(String),
+
+    /// An ICE candidate string could not be parsed.
+    ///
+    /// Returned by [`PinnedWebRtcTransport::add_remote_candidate`] and
+    /// [`PinnedWebRtcTransport::add_local_host_candidate`] when the supplied candidate
+    /// string is rejected by str0m's ICE implementation. Callers outside `sh-transport`
+    /// do not need to import [`crate::webrtc::SdpBridgeError`] to handle these errors.
+    #[error("ICE candidate parse error: {0}")]
+    CandidateParseError(String),
 }

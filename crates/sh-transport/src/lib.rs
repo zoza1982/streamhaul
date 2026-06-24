@@ -40,7 +40,13 @@ pub use driver::{
 };
 pub use endpoint::{ClientEndpoint, ServerEndpoint};
 pub use error::TransportError;
-pub use webrtc::{PinnedWebRtcTransport, WebRtcChannel, WebRtcTransportBuilder};
+pub use webrtc::{
+    PinnedWebRtcTransport, SdpBridgeBuilder, SdpBridgeError, SdpBridgeResult, WebRtcChannel,
+    WebRtcTransportBuilder,
+};
+// Re-export the str0m fingerprint type so callers of SdpBridgeResult do not need a direct
+// str0m dependency to name `local_dtls_fingerprint` or `remote_dtls_fingerprint`.
+pub use str0m::crypto::Fingerprint as DtlsFingerprint;
 
 #[cfg(feature = "insecure-lan")]
 pub use insecure::{

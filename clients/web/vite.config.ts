@@ -15,6 +15,8 @@ export default defineConfig({
         main: resolve(import.meta.dirname, "index.html"),
         // The in-page browser-loopback demo driven by the Playwright e2e.
         loopback: resolve(import.meta.dirname, "e2e/loopback.html"),
+        // Browser↔native WebRTC interop test page (P5-3).
+        "browser-native": resolve(import.meta.dirname, "e2e/browser-native.html"),
       },
     },
   },

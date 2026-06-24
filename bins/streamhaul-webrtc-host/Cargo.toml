@@ -1,0 +1,26 @@
+[package]
+name = "streamhaul-webrtc-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+# streamhaul-webrtc-host: native WebRTC answerer for browser↔native interop testing (P5-3).
+# Connects to a streamhaul-signaling server, accepts a browser SDP offer, negotiates a DTLS
+# DataChannel, exchanges a simple echo frame, and exits. Intended for local integration tests.
+# NOT for production use.
+
+[dependencies]
+sh-transport = { path = "../../crates/sh-transport" }
+sh-signaling = { path = "../../crates/sh-signaling", features = ["insecure-lan"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+anyhow = { workspace = true }
+# str0m: exact-pinned to match sh-transport's version (see sh-transport/Cargo.toml).
+str0m = { version = "=0.20.0", default-features = false, features = ["rust-crypto"] }
+bytes = { workspace = true }
+
+[lints]
+workspace = true
