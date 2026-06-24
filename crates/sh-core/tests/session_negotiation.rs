@@ -51,7 +51,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 const NOW_SECS: i64 = 1_000_000_000;
 const STEP: Duration = Duration::from_millis(5);
-const DRIVE_STEPS: usize = 400;
+/// Safety ceiling on drive-loop iterations (each ~1ms real + 5ms virtual). At ~7000 the real
+/// cost approaches `ACCEPT_TIMEOUT`, so the async side ends the loop via `stop` long before this;
+/// it exists only so a genuinely stuck handshake can't spin forever.
+const MAX_DRIVE_STEPS: usize = 7000;
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Dummy identity fingerprints (64 lowercase hex chars each) used in tests.
@@ -380,10 +383,17 @@ async fn drive_and_check_connection(
 
     let drive_handle = tokio::task::spawn_blocking(move || {
         let mut now = start;
-        for _ in 0..DRIVE_STEPS {
-            if stop_d.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
+        // Pump until the async side signals `stop` (set after accept→send→recv completes or
+        // times out), NOT for a fixed step count. A fixed budget raced the DTLS handshake +
+        // data round-trip on slower runners: the loop could exhaust its steps and exit BEFORE
+        // the post-accept `send`/`recv` packets were driven through str0m, so `recv()` waited on
+        // data that was never pumped → spurious "honest path did not connect" failures (observed
+        // flaking on the macOS CI runner). `MAX_DRIVE_STEPS` is a safety ceiling so a genuinely
+        // stuck handshake can't spin forever; the 1ms yield lets the async runtime interleave and
+        // bounds CPU. Virtual time still advances by `STEP` per iteration for str0m's timers.
+        let mut steps = 0usize;
+        while !stop_d.load(std::sync::atomic::Ordering::Relaxed) && steps < MAX_DRIVE_STEPS {
+            steps += 1;
             now = match now.checked_add(STEP) {
                 Some(t) => t,
                 None => return,
@@ -406,6 +416,9 @@ async fn drive_and_check_connection(
                 }
                 Err(_) => return,
             }
+            // Yield so the async accept/send/recv task interleaves with this blocking pump and
+            // bounds CPU; the pump keeps running (advancing virtual time) until `stop` is set.
+            std::thread::sleep(Duration::from_millis(1));
         }
     });
 
