@@ -44,6 +44,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "test-
 sh-crypto = { path = "../sh-crypto" }
 x25519-dalek = { workspace = true }
 rand_core = { workspace = true }
+# P7 file-channel functional test only (dev-only): frames a real multi-chunk file with the
+# `sh-protocol::file` wire headers and streams it over a `ChannelSpec::file()` QUIC stream to
+# prove byte-identical reassembly over the real transport. No production transport→protocol dep.
+sh-protocol = { path = "../sh-protocol" }
 
 [lints]
 workspace = true

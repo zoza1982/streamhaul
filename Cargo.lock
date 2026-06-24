@@ -1744,6 +1744,7 @@ dependencies = [
  "rcgen 0.13.2",
  "rustls",
  "sh-crypto",
+ "sh-protocol",
  "sh-types",
  "str0m",
  "thiserror 2.0.18",

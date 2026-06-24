@@ -52,4 +52,14 @@ pub enum ProtocolError {
     /// The raw byte is preserved so callers can surface a diagnostic ("got 0x02, expected 0x01").
     #[error("unknown version byte: {0:#04x}")]
     UnknownVersion(u8),
+    /// A file chunk length or offered `chunk_size` is zero or exceeds [`crate::file::MAX_FILE_CHUNK`].
+    /// Bounds the per-chunk allocation a hostile peer can force (`sh-protocol::file`, P7).
+    #[error("file chunk size {0} is zero or exceeds the maximum")]
+    FileChunkTooLarge(u64),
+    /// A file-control field carried an out-of-range value at the **wire layer** — an unknown
+    /// [`crate::file::AbortCode`] discriminant, or a `FileComplete` `ok` byte that is neither 0 nor 1.
+    /// The raw value is preserved for diagnostics. Cross-message constraints (e.g.
+    /// `resume_offset ≤ total_size`) are validated by the orchestrator, not here.
+    #[error("invalid file-control field: {0}")]
+    InvalidFileField(u64),
 }

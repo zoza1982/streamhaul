@@ -8,7 +8,8 @@
 //!
 //! Covers the [`CommonHeader`], [`VideoHeader`], the [`InputEvent`] (P1-2), control-channel
 //! framing ([`encode_control`]/[`decode_control`], P1-2), the 25-byte [`NackFeedback`]
-//! message (P2-6), and the 4-byte [`capability`] codec-capability offer/answer frame (P2-5).
+//! message (P2-6), the 4-byte [`capability`] codec-capability offer/answer frame (P2-5), and the
+//! [`file`]-transfer control + chunk framing (P7, ADR-0024).
 //! Audio and remaining feedback types land with their phases. Each message type
 //! lives in its own module; the public surface is re-exported here.
 
@@ -18,6 +19,7 @@ mod common;
 mod control;
 mod error;
 mod feedback;
+pub mod file;
 mod input;
 pub mod transport_caps;
 mod video;
@@ -26,12 +28,46 @@ pub use common::{CommonHeader, Flags};
 pub use control::{decode_control, encode_control, ControlFrame, CONTROL_HEADER_LEN};
 pub use error::ProtocolError;
 pub use feedback::{NackFeedback, MAX_CUMULATIVE_LOST, NACK_FEEDBACK_LEN};
+pub use file::{
+    AbortCode, FileAbort, FileAccept, FileChunkHeader, FileComplete, FileOffer, CHUNK_FLAG_LAST,
+    FILE_CHUNK_HEADER_LEN, KIND_FILE_ABORT, KIND_FILE_ACCEPT, KIND_FILE_COMPLETE, KIND_FILE_OFFER,
+    MAX_FILE_CHUNK, MAX_FILE_NAME,
+};
 pub use input::{EventType, InputEvent, Modifiers};
 pub use transport_caps::{
     decode_transport_caps, encode_transport_caps, negotiate, NegotiationError, TransportCaps,
     KIND_TRANSPORT_CAPS_ANSWER, KIND_TRANSPORT_CAPS_OFFER, TRANSPORT_CAPS_LEN,
 };
 pub use video::{Codec, FrameType, Priority, VideoHeader};
+
+// Compile-time guard: every control-frame `kind` byte exported across the protocol modules shares a
+// single dispatch space on the reliable Control channel, so all must be distinct. Adding a colliding
+// constant fails the build here rather than silently misrouting control frames at runtime.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+const _: () = {
+    const KINDS: [u8; 8] = [
+        capability::KIND_CODEC_CAPS_OFFER,
+        capability::KIND_CODEC_CAPS_ANSWER,
+        transport_caps::KIND_TRANSPORT_CAPS_OFFER,
+        transport_caps::KIND_TRANSPORT_CAPS_ANSWER,
+        file::KIND_FILE_OFFER,
+        file::KIND_FILE_ACCEPT,
+        file::KIND_FILE_ABORT,
+        file::KIND_FILE_COMPLETE,
+    ];
+    let mut i = 0;
+    while i < KINDS.len() {
+        let mut j = i + 1;
+        while j < KINDS.len() {
+            assert!(
+                KINDS[i] != KINDS[j],
+                "duplicate control-frame KIND byte across sh-protocol modules"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// Current SHP protocol version, carried in the top two bits of byte 0 of every packet.
 pub const SHP_VERSION: u8 = 0b01;

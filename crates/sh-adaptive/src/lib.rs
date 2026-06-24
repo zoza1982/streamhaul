@@ -94,6 +94,7 @@ pub mod classifier;
 pub mod controller;
 pub mod gcc;
 pub mod loss_recovery;
+pub mod pacer;
 pub mod scream;
 pub mod stats;
 pub(crate) mod util;
@@ -109,5 +110,6 @@ pub use loss_recovery::{
     FecPolicy, FecPolicyConfig, GapDetector, GapReport, LossRecoveryController, LossState,
     NackRequest, RecoveryAction, RefreshStripe, RollingIntraRefresh,
 };
+pub use pacer::TokenBucket;
 pub use scream::{ScreamConfig, ScreamController};
 pub use stats::TransportStats;
