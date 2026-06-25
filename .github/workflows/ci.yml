@@ -302,6 +302,29 @@ jobs:
         run: npx playwright test --project=firefox e2e/browser-native.spec.ts
 
   # ----------------------------------------------------------------------------
+  # Linux X11 host platform (P6-2, ADR-0025): build + clippy + fmt + Xvfb tests.
+  #
+  # x11rb uses a pure-Rust RustConnection that speaks the X11 protocol directly over
+  # a Unix socket — no libxcb needed. Xvfb provides a real in-memory X server so the
+  # capture and XTEST injection integration tests (including the pointer round-trip)
+  # run for real in CI and are not skipped.
+  # ----------------------------------------------------------------------------
+  platform-linux:
+    name: platform-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Install Xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: cargo fmt check (sh-platform-linux)
+        run: cargo fmt -p sh-platform-linux -- --check
+      - name: cargo clippy (sh-platform-linux, deny warnings)
+        run: cargo clippy -p sh-platform-linux --all-targets --all-features -- -D warnings
+      - name: cargo test under Xvfb (sh-platform-linux)
+        run: xvfb-run -a cargo test -p sh-platform-linux
+
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:
