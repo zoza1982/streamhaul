@@ -1,0 +1,27 @@
+[package]
+name = "sh-platform-mac"
+description = "macOS host platform for Streamhaul: CoreGraphics screen capture + CGEvent input injection (P6-1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tracing.workspace = true
+bytes.workspace = true
+sh-types = { path = "../sh-types" }
+sh-protocol = { path = "../sh-protocol" }
+sh-media = { path = "../sh-media" }
+sh-input = { path = "../sh-input" }
+
+# macOS-only frameworks. Target-gated so the crate builds to an essentially empty crate on
+# Linux/Windows (the framework bindings are never pulled there). Pinned per CLAUDE.md §7; the
+# Servo-project `core-graphics`/`core-foundation` are the long-standing, vetted bindings. Any
+# `unsafe` lives inside them, not in our code.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "=0.24.0"
+core-foundation = "=0.10.0"
+
+[lints]
+workspace = true
