@@ -1,0 +1,23 @@
+[package]
+name = "sh-platform-linux"
+description = "Linux host platform for Streamhaul: X11 screen capture + XTEST input injection (P6-2)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tracing.workspace = true
+bytes.workspace = true
+sh-types = { path = "../sh-types" }
+sh-protocol = { path = "../sh-protocol" }
+sh-media = { path = "../sh-media" }
+sh-input = { path = "../sh-input" }
+# x11rb: pure-Rust, safe XCB bindings (no `unsafe` FFI to libX11/libXtst). Pinned per CLAUDE.md §7.
+# `image` enables GetImage helpers; `xtest` enables the XTEST injection extension. (The MIT-SHM
+# zero-copy capture path — feature `shm` — is a deferred follow-up; it pulls `allow-unsafe-code`.)
+x11rb = { version = "=0.13.1", features = ["image", "xtest"] }
+
+[lints]
+workspace = true
