@@ -325,6 +325,29 @@ jobs:
       - name: cargo test under Xvfb (sh-platform-linux)
         run: xvfb-run -a cargo test -p sh-platform-linux
 
+  # ----------------------------------------------------------------------------
+  # macOS host platform (P6-1, ADR-0026): compile + clippy + unit tests on a real macOS runner.
+  # This is "CI as the compiler": GitHub's macos-latest builds sh-platform-mac against
+  # the real CoreGraphics/CoreFoundation SDK, so the framework calls must type-check and link. The
+  # OS-independent keymap is unit-tested here too. Live capture/injection is TCC-gated and deferred to
+  # real hardware (R-MAC-TCC) — CI cannot grant Screen Recording / Accessibility headlessly.
+  # ----------------------------------------------------------------------------
+  platform-mac:
+    name: platform-mac
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: cargo fmt check (sh-platform-mac)
+        run: cargo fmt -p sh-platform-mac -- --check
+      - name: cargo clippy (sh-platform-mac, deny warnings)
+        run: cargo clippy -p sh-platform-mac --all-targets --all-features -- -D warnings
+      - name: cargo build (sh-platform-mac, real macOS SDK)
+        run: cargo build -p sh-platform-mac
+      - name: cargo test (sh-platform-mac — keymap + fail-closed construction)
+        run: cargo test -p sh-platform-mac
+
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:
