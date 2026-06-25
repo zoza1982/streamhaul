@@ -1,0 +1,31 @@
+[package]
+name = "sh-platform-win"
+description = "Windows host platform for Streamhaul: GDI screen capture + SendInput input injection (P6-Windows)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tracing.workspace = true
+bytes.workspace = true
+sh-types = { path = "../sh-types" }
+sh-protocol = { path = "../sh-protocol" }
+sh-media = { path = "../sh-media" }
+sh-input = { path = "../sh-input" }
+
+# Win32 bindings. Target-gated so the crate builds to just the OS-independent `keymap` on
+# Linux/macOS (winapi is never pulled there). `winapi` (not the newer `windows` crate) is chosen for
+# blind-compile stability — fixed C-ABI signatures across 0.3.x (ADR-0027). Pinned per CLAUDE.md §7.
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "=0.3.9", features = [
+    "winuser",
+    "wingdi",
+    "windef",
+    "minwindef",
+    "ntdef",
+] }
+
+[lints]
+workspace = true
