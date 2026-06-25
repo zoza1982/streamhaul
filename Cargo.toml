@@ -18,6 +18,7 @@ members = [
     "crates/sh-core",
     "crates/sh-platform-linux",
     "crates/sh-platform-mac",
+    "crates/sh-platform-win",
     "bins/streamhaul-host",
     "bins/streamhaul-client",
     "bins/streamhaul-signaling",

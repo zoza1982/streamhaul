@@ -348,6 +348,30 @@ jobs:
       - name: cargo test (sh-platform-mac — keymap + fail-closed construction)
         run: cargo test -p sh-platform-mac
 
+  # ----------------------------------------------------------------------------
+  # Windows host platform (P6-Windows, ADR-0027): compile + clippy + tests on a real Windows runner.
+  # "CI as the compiler": windows-latest builds sh-platform-win against the real Win32 SDK (GDI +
+  # SendInput via winapi), so the unsafe FFI must type-check and link. Unlike macOS, Windows has no
+  # per-app capture/inject permission gate within an interactive session, and the runner has an
+  # interactive desktop — so the smoke tests may exercise capture/SendInput end-to-end, not merely
+  # compile. Full interactive validation on a real desktop is R-WIN-INTERACTIVE.
+  # ----------------------------------------------------------------------------
+  platform-win:
+    name: platform-win
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: cargo fmt check (sh-platform-win)
+        run: cargo fmt -p sh-platform-win -- --check
+      - name: cargo clippy (sh-platform-win, deny warnings)
+        run: cargo clippy -p sh-platform-win --all-targets --all-features -- -D warnings
+      - name: cargo build (sh-platform-win, real Win32 SDK)
+        run: cargo build -p sh-platform-win
+      - name: cargo test (sh-platform-win — keymap + GDI/SendInput smoke)
+        run: cargo test -p sh-platform-win
+
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:
