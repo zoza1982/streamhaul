@@ -18,5 +18,12 @@ bytes = "1"
 sh-types = { path = "../sh-types" }
 sh-protocol = { path = "../sh-protocol" }
 sh-media = { path = "../sh-media" }
+# For the `EncoderFactory` type alias (the mode-switch seam OpenH264 slots into); pure-Rust, no C.
+sh-codec-hw = { path = "../sh-codec-hw" }
 # OpenH264 software encoder — builds the vendored C source via cc (+ nasm SIMD when present). Pinned.
 openh264 = "=0.9.3"
+
+[dev-dependencies]
+# Dev-only: the deterministic pipeline-compat test drives `fragment` + `Reassembler` (ADR-0029).
+# A dev-dependency, so it compiles only in the `codec-openh264` CI job — never in the workspace build.
+sh-core = { path = "../sh-core" }
