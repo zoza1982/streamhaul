@@ -74,9 +74,11 @@ FFI lives inside the vetted `openh264`/`openh264-sys2` crates. `cargo audit` mus
 - **Negative / trade-offs:** licensing-gated (patent posture above); software encode is CPU-heavy and
   not the low-latency destination (HW encode is, R-CODEC); v1 uses OpenH264's default rate control
   (bitrate/fps tuning from the allocator is a follow-up); requires a C toolchain to build the feature.
-- **Follow-ups:** wire `OpenH264Encoder` into the host pipeline (so the browser session gets real
-  video); feed the `RateAllocator` target into the encoder bitrate; HW encoders (R-CODEC); the
-  `rav1e`/AV1 royalty-free alternative if H.264 licensing is undesirable for a distribution.
+- **Follow-ups:** wiring into the pipeline + feeding the `RateAllocator` target is **done in
+  ADR-0029** (configurable encoder, `EncoderFactory`, native decoder, deterministic fragment-compat
+  test). Remaining: a workspace-excluded preview host binary + browser↔live-host glue that invoke the
+  factory; HW encoders (R-CODEC); the `rav1e`/AV1 royalty-free alternative if H.264 licensing is
+  undesirable for a distribution.
 
 ## Alternatives considered
 
