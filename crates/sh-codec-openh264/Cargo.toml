@@ -1,0 +1,22 @@
+[package]
+name = "sh-codec-openh264"
+description = "Software H.264 encoder (OpenH264) for Streamhaul. Licensing-gated, NOT in the default OSS build — see docs/adr/0028-software-h264-encoder.md."
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zoza1982/streamhaul"
+rust-version = "1.82"
+
+# This crate is EXCLUDED from the workspace (see the root Cargo.toml `exclude` list) so that
+# `cargo build/clippy/test --workspace --all-features` never compiles the vendored OpenH264 C source
+# on every OS / every run. It is built only by its dedicated `codec-openh264` CI job and by a build
+# that explicitly opts in. This mirrors the wasm crates' exclusion and enforces the licensing posture
+# (the default OSS workspace build literally never links an H.264 encoder). ADR-0028.
+
+[dependencies]
+bytes = "1"
+sh-types = { path = "../sh-types" }
+sh-protocol = { path = "../sh-protocol" }
+sh-media = { path = "../sh-media" }
+# OpenH264 software encoder — builds the vendored C source via cc (+ nasm SIMD when present). Pinned.
+openh264 = "=0.9.3"

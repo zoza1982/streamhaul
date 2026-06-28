@@ -22,6 +22,11 @@ OSS build legally clean while staying performant.
 - **Commercial/enterprise build:** adds **HEVC** (same OS-API pattern, plus a commercial HEVC license /
   enterprise device-license representation). Neither build bundles `x265`.
 - **Apple exception:** VideoToolbox has no AV1 *encode*; macOS OSS hosts fall back to H.264.
+- **Preview carve-out (ADR-0028):** the "never bundle `openh264`" rule above governs **distributable**
+  builds. A software OpenH264 encoder exists in the **workspace-excluded, off-by-default** crate
+  `sh-codec-openh264` purely as a CI-verifiable, browser-decodable preview path; the default OSS
+  workspace build never links it and the same patent posture (Cisco's grant covers only the pre-built
+  binary, not from-source) applies. See `docs/adr/0028-software-h264-encoder.md`.
 - **Negotiation:** OSS Game Mode `AV1 HW → H.264 HW(OS) → H.264 SW(last resort, rate-limited)`;
   commercial `HEVC HW → AV1 HW → H.264 HW(OS)`. Browsers always offer H.264 decode.
 

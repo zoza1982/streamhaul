@@ -372,6 +372,39 @@ jobs:
       - name: cargo test (sh-platform-win — keymap + GDI/SendInput smoke)
         run: cargo test -p sh-platform-win
 
+  # ----------------------------------------------------------------------------
+  # Software H.264 encoder (OpenH264) — the `sh-codec-openh264` crate is EXCLUDED from the workspace
+  # (ADR-0028) so `--workspace --all-features` never builds the vendored OpenH264 C source on every
+  # OS / every run. This dedicated job is the only place it is built: it compiles the vendored C
+  # (cc + nasm) and runs the encode→decode round-trip test. Licensing posture: see ADR-0028 / ADR-0004
+  # (patent-gated, NOT for the default OSS distribution).
+  # ----------------------------------------------------------------------------
+  codec-openh264:
+    name: codec-openh264
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Cheapest/pure-Rust checks first (no C toolchain needed) — fail fast before installing nasm
+      # and compiling the vendored OpenH264 source.
+      - name: cargo audit (excluded crate's own lockfile)
+        # The workspace `audit` job only covers the root Cargo.lock; this excluded crate has its
+        # own Cargo.lock (openh264/openh264-sys2/nasm-rs/cc), so it needs its own audit gate.
+        run: cargo audit --deny warnings --file crates/sh-codec-openh264/Cargo.lock
+      - name: cargo fmt check (sh-codec-openh264)
+        run: cargo fmt --manifest-path crates/sh-codec-openh264/Cargo.toml -- --check
+      - name: Install nasm (OpenH264 SIMD asm)
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: cargo clippy (sh-codec-openh264, deny warnings)
+        run: cargo clippy --manifest-path crates/sh-codec-openh264/Cargo.toml --all-targets -- -D warnings
+      - name: cargo test (sh-codec-openh264 — H.264 encode→decode round-trip)
+        run: cargo test --manifest-path crates/sh-codec-openh264/Cargo.toml
+
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:
