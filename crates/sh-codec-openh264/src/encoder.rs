@@ -3,7 +3,7 @@
 use bytes::Bytes;
 use openh264::encoder::{
     BitRate, Encoder, EncoderConfig as OhEncoderConfig, FrameRate, FrameType as OhFrameType,
-    RateControlMode, UsageType,
+    IntraFramePeriod, RateControlMode, UsageType,
 };
 use openh264::formats::{RgbSliceU8, YUVBuffer};
 use openh264::OpenH264API;
@@ -13,6 +13,10 @@ use sh_media::{
     VideoFrame,
 };
 use sh_protocol::{Codec, FrameType};
+
+/// Periodic-keyframe (GOP) interval in seconds for bitrate-mode streaming, so a receiver joining
+/// mid-stream or recovering from loss gets an IDR within this window (ADR-0035).
+const KEYFRAME_INTERVAL_SECS: u32 = 2;
 
 /// A software H.264 encoder backed by OpenH264. See the [crate docs](crate) for the licensing scope.
 pub struct OpenH264Encoder {
@@ -47,7 +51,10 @@ impl OpenH264Encoder {
     /// - `codec` must be [`Codec::H264`] (else [`MediaError::Unsupported`]).
     /// - `target_bitrate_kbps`: `Some(k)` → bitrate rate-control at `k` kbps; `None` → OpenH264's
     ///   default constant-quality mode.
-    /// - `target_fps` (when non-zero) → OpenH264's maximum frame rate (a rate-control hint).
+    /// - `target_fps` (when non-zero) → sets OpenH264's maximum frame rate (a rate-control hint)
+    ///   **and** the periodic-IDR interval to `target_fps × KEYFRAME_INTERVAL_SECS` encoded frames
+    ///   (~2 s at full frame rate; ADR-0035). `target_fps == 0` disables BOTH (no periodic keyframe);
+    ///   `request_keyframe()` still forces an IDR on demand regardless of this setting.
     /// - `resolution` is **not** passed here: OpenH264 adapts to each frame's actual dimensions, so
     ///   the field is informational at construction time and the real size comes from the frame.
     /// - Usage is always [`UsageType::ScreenContentRealTime`] (remote desktop).
@@ -84,8 +91,13 @@ impl OpenH264Encoder {
             None => oh.skip_frames(false),
         };
         let oh = if config.target_fps > 0 {
-            // u32 → f32 is lossless for any realistic frame rate (exact up to 2^24).
-            oh.max_frame_rate(FrameRate::from_hz(config.target_fps as f32))
+            // Emit a periodic IDR every `2 × fps` ENCODED frames (~2 s at full frame rate; longer if
+            // backpressure drops frames) so a receiver that joins mid-stream or recovers from loss
+            // gets a keyframe to decode from, instead of only the single IDR at stream start.
+            // `request_keyframe()` still forces an extra IDR on demand between these.
+            let gop = config.target_fps.saturating_mul(KEYFRAME_INTERVAL_SECS);
+            oh.max_frame_rate(FrameRate::from_hz(config.target_fps as f32)) // u32→f32: lossless for realistic fps
+                .intra_frame_period(IntraFramePeriod::from_num_frames(gop))
         } else {
             oh
         };
@@ -233,6 +245,33 @@ mod tests {
             target_fps: 30,
             target_bitrate_kbps: bitrate_kbps,
         }
+    }
+
+    #[test]
+    fn emits_periodic_keyframes_at_the_gop_interval() {
+        // fps = 4 → GOP = 2 s × 4 = 8 frames, so an IDR should recur roughly every 8 frames (not
+        // just the single one at stream start). Encode 20 differing frames and require ≥ 2 IDRs.
+        // The bitrate (2000 kbps) is deliberately oversized for a 64×48 frame so rate control never
+        // SKIPs the periodic IDR — keep it generous if this fixture's resolution/fps changes.
+        let cfg = EncoderConfig {
+            codec: Codec::H264,
+            resolution: Resolution::new(64, 48),
+            target_fps: 4,
+            target_bitrate_kbps: Some(2_000),
+        };
+        let mut enc = OpenH264Encoder::with_config(&cfg).unwrap();
+        let mut idr_count = 0;
+        for seq in 0..20 {
+            if let Some(pkt) = enc.encode(&synthetic_bgra_seq(64, 48, seq)).unwrap() {
+                if pkt.frame_type == FrameType::Idr {
+                    idr_count += 1;
+                }
+            }
+        }
+        assert!(
+            idr_count >= 2,
+            "expected periodic IDRs from the GOP, got only {idr_count}"
+        );
     }
 
     #[test]
