@@ -1,0 +1,38 @@
+[package]
+name = "streamhaul-preview"
+description = "Preview host/client that stream the REAL screen as OpenH264 video over QUIC. Licensing-gated, NOT in the default OSS build — see docs/adr/0028-software-h264-encoder.md / ADR-0030."
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zoza1982/streamhaul"
+rust-version = "1.82"
+
+# EXCLUDED from the workspace (root Cargo.toml `exclude` list): it depends on the workspace-excluded
+# `sh-codec-openh264` crate, which builds the vendored OpenH264 C from source. Keeping this crate out
+# of the workspace means `cargo build/clippy/test --workspace --all-features` never compiles that C and
+# the default OSS build links no H.264 encoder (ADR-0028/0029). Built only by its dedicated CI job.
+
+[[bin]]
+name = "streamhaul-preview-host"
+path = "src/bin/preview_host.rs"
+
+[[bin]]
+name = "streamhaul-preview-client"
+path = "src/bin/preview_client.rs"
+
+[dependencies]
+sh-core = { path = "../../crates/sh-core" }
+sh-media = { path = "../../crates/sh-media" }
+sh-transport = { path = "../../crates/sh-transport", features = ["insecure-lan"] }
+sh-types = { path = "../../crates/sh-types" }
+sh-protocol = { path = "../../crates/sh-protocol" }
+sh-codec-openh264 = { path = "../../crates/sh-codec-openh264" }
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+# Real screen capture is X11-only (Linux). On other targets the host binary falls back to the
+# synthetic capturer so it still builds and runs.
+[target.'cfg(target_os = "linux")'.dependencies]
+sh-platform-linux = { path = "../../crates/sh-platform-linux" }

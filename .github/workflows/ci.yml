@@ -405,6 +405,57 @@ jobs:
       - name: cargo test (sh-codec-openh264 — H.264 encode→decode round-trip)
         run: cargo test --manifest-path crates/sh-codec-openh264/Cargo.toml
 
+  # ----------------------------------------------------------------------------
+  # Preview host/client (ADR-0030): real-screen OpenH264 video over QUIC. EXCLUDED from the workspace
+  # (depends on sh-codec-openh264 / vendored OpenH264 C). The deterministic loopback test uses the
+  # synthetic capturer; a separate Xvfb smoke runs the real X11-capture binaries end to end.
+  preview:
+    name: preview
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Install nasm (OpenH264) + Xvfb (real X11 capture)
+        run: sudo apt-get update && sudo apt-get install -y nasm xvfb
+      - name: Install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (preview crate's own lockfile)
+        run: cargo audit --deny warnings --file bins/streamhaul-preview/Cargo.lock
+      - name: cargo fmt check (streamhaul-preview)
+        run: cargo fmt --manifest-path bins/streamhaul-preview/Cargo.toml -- --check
+      - name: cargo clippy (streamhaul-preview, deny warnings)
+        run: cargo clippy --manifest-path bins/streamhaul-preview/Cargo.toml --all-targets -- -D warnings
+      - name: cargo test (deterministic synthetic→OpenH264→QUIC loopback)
+        run: cargo test --manifest-path bins/streamhaul-preview/Cargo.toml
+      - name: Build preview binaries
+        run: cargo build --manifest-path bins/streamhaul-preview/Cargo.toml --bins
+      - name: Xvfb smoke — real X11 capture → OpenH264 → QUIC → decode
+        run: |
+          set -euo pipefail
+          BIN=bins/streamhaul-preview/target/debug
+          # Pin the X screen to depth-24 (the X11 capturer rejects other depths) at an even size.
+          xvfb-run -a --server-args "-screen 0 1280x720x24" bash -c '
+            set -euo pipefail
+            "'"$BIN"'/streamhaul-preview-host" --bind 127.0.0.1:0 --frames 30 --fps 30 --bitrate-kbps 4000 > host.log 2>&1 &
+            HOST_PID=$!
+            ADDR=""
+            for i in $(seq 1 100); do
+              ADDR=$(grep -oP "PREVIEW_HOST_ADDR=\K.*" host.log || true)
+              [ -n "$ADDR" ] && break
+              sleep 0.2
+            done
+            if [ -z "$ADDR" ]; then echo "host never printed PREVIEW_HOST_ADDR"; cat host.log; exit 1; fi
+            echo "host listening at $ADDR"
+            # On client failure, still dump the host log (the real diagnostics) before exiting.
+            "'"$BIN"'/streamhaul-preview-client" "$ADDR" --frames 30 --recv-timeout 30 --out-dir . \
+              || { echo "--- host log (client failed) ---"; cat host.log; exit 1; }
+            wait "$HOST_PID" || true
+            echo "--- host log ---"; cat host.log
+          '
+
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:

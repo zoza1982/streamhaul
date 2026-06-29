@@ -62,10 +62,16 @@ manual-only binary.
 
 ### Real-time decisions (from the realtime-systems-engineer review)
 
-- **Single frame-drop mechanism:** OpenH264's own `enable_skip_frame` is **disabled**
-  (`skip_frames(false)`). The pipeline's backpressure/pacing is the only frame-drop path, so encoder
-  skips can't silently create non-contiguous frame ids (indistinguishable from packet loss) or swallow
-  a forced IDR under bitrate pressure.
+- **Rate control + frame skip are two complementary layers (not competitors):** the pipeline's
+  backpressure drops *whole* frames at the input (coarse); OpenH264's `enable_skip_frame` caps the
+  size of a *single* encoded frame when QP alone can't fit the per-frame bit budget (fine). OpenH264
+  **cannot honor a bitrate target with skip disabled** (`RC_BITRATE_MODE` requires it), and one
+  high-change screen frame emitted over-budget can blow the congestion window (queueing/loss). So
+  `with_config` enables skip **only when a bitrate target is set**; constant-quality mode (no budget)
+  keeps it off so the pipeline is the sole drop authority. **This is OpenH264-specific** — HW encoders
+  (NVENC/VA-API/VideoToolbox) honor a bitrate via VBV + per-frame QP and must NOT copy this logic.
+  *(An earlier draft disabled skip globally; that was wrong — it silently made the bitrate target a
+  no-op. Corrected after a runtime check + realtime-systems-engineer re-review.)*
 - **Keyframe-request durability:** `request_keyframe()` arms a flag that is cleared **only when a real
   IDR packet is emitted** — never on a skipped/empty/errored encode. A loss-recovery keyframe request
   is therefore never lost.
@@ -91,6 +97,11 @@ manual-only binary.
   - **Dynamic resolution change:** OpenH264 re-initializes internally when frame dimensions change,
     a synchronous stall (~ms) on the encode thread. Tested for correctness (a valid IDR is produced);
     the latency spike is a known preview limitation.
+  - **Encoder-skip vs. loss disambiguation (protocol):** when RC skip drops a frame, the receiver
+    sees a `frame_id` gap indistinguishable from QUIC datagram loss. Until the packet header carries an
+    explicit `skipped_frames` count, the receiver must NOT use `frame_id` continuity as a loss signal —
+    it relies on the `Reassembler`'s partial-frame timeout instead. (The keyframe-durability fix means
+    the one hard consequence — a lost forced IDR — is already resolved.)
   - **Real QUIC path (before the live path ships):** the deterministic test covers fragmentation +
     reassembly but NOT datagram **loss** (a lost fragment ⇒ the frame never reassembles; reassembler
     timeout/eviction must be verified), **reordering** (intra-frame datagram order isn't guaranteed),
