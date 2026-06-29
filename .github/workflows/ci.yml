@@ -553,6 +553,11 @@ jobs:
       - name: cargo fuzz check (every excluded fuzz crate)
         run: |
           set -euo pipefail
+          # Pin the sanitizer target to the gnu host triple. cargo-fuzz's *default* target varies
+          # by environment (it resolved to x86_64-unknown-linux-musl on the runner — whose static
+          # libc is incompatible with -Zsanitizer=address and isn't installed), so we force the
+          # gnu target: it ships with the toolchain and its dynamic glibc is ASan-compatible.
+          TARGET=x86_64-unknown-linux-gnu
           # Auto-discover every crates/*/fuzz workspace so a newly added fuzz crate cannot be
           # silently omitted (the exact rot this job exists to prevent). `set -e` + the bare
           # `cargo fuzz check` means any target that stops compiling fails the job.
@@ -563,7 +568,7 @@ jobs:
             found=$((found + 1))
             c="$(basename "$(dirname "${fuzz_dir}")")"
             echo "::group::cargo fuzz check ${c}"
-            cargo +nightly fuzz check --fuzz-dir "${fuzz_dir}"
+            cargo +nightly fuzz check --fuzz-dir "${fuzz_dir}" --target "${TARGET}"
             echo "::endgroup::"
           done
           # Guard against a silent no-op (e.g. a path/layout change that matches nothing).
