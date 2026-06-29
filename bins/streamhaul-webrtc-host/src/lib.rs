@@ -30,10 +30,10 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use bytes::Bytes;
 use sh_crypto::{DtlsCommitment, HandshakeOutcome, NoiseHandshake, SoftwareKeystore};
-use sh_input::InputInjector;
+use sh_input::{InputInjector, RateLimiter};
 use sh_protocol::{
-    Codec, CommonHeader, Flags, FrameType, InputEvent, Priority, VideoHeader, INPUT_EVENT_LEN,
-    MAX_FRAME_ID,
+    Codec, CommonHeader, EventType, Flags, FrameType, InputEvent, Priority, VideoHeader,
+    INPUT_EVENT_LEN, MAX_FRAME_ID,
 };
 use sh_signaling::backoff::ExponentialBackoff;
 use sh_signaling::envelope::{MessageKind, SessionId, SignalingEnvelope};
@@ -79,6 +79,17 @@ const MAX_INPUT_PER_FRAME: usize = 256;
 /// Bounded depth of the channel feeding the dedicated injection thread. A full queue drops further
 /// events (backpressure) rather than blocking the video loop — the natural flood/rate-limit point.
 const INPUT_QUEUE_DEPTH: usize = 256;
+
+/// Sustained cap (events/second) on injected **drop-safe high-rate** input — `PointerMove` and
+/// `Wheel` (see [`admit_input`]) — as a hostile-input DoS guard. Well above any human rate (browsers
+/// coalesce moves to ~60–120/s; trackpad scroll adds tens/s) but throttles a synthetic flood before
+/// it reaches the OS injection API. State-transition events (`Button`/`Key`) are never rate-limited
+/// (a dropped release would stick — ADR-0034).
+const MAX_THROTTLED_INPUT_PER_SEC: u32 = 500;
+
+/// Burst allowance for the hostile-input rate limiter: a short idle period banks up to this many
+/// events so a normal flick of the mouse / scroll gesture passes unthrottled.
+const THROTTLED_INPUT_BURST: u32 = 120;
 
 // ── VideoFrameSource trait ──────────────────────────────────────────────────────────────────────
 
@@ -1074,6 +1085,11 @@ async fn run_video_stream(
 
     let mut sent: usize = 0;
     let mut sequence: u16 = 0;
+    // Hostile-input DoS guard: throttle drop-safe high-rate input (pointer-move + wheel; see the
+    // const docs and `admit_input`). `throttled_events` counts events shed so a sustained flood is
+    // observable in the logs (never per-event — §7).
+    let mut input_limiter = RateLimiter::new(MAX_THROTTLED_INPUT_PER_SEC, THROTTLED_INPUT_BURST);
+    let mut throttled_events: u64 = 0;
     // Captures an error that ends the stream early. We do NOT `?`-propagate from inside the loop:
     // the teardown below (close the input queue + await the injection thread so `release_all`
     // finishes) must run on *every* exit path, or an abnormal stream end could return before the
@@ -1148,9 +1164,17 @@ async fn run_video_stream(
             match tokio::time::timeout(Duration::ZERO, channel.recv()).await {
                 Ok(Ok(Some(bytes))) => {
                     if let Some(event) = decode_input(&bytes) {
-                        // Non-blocking enqueue to the injection thread; a full queue drops the
-                        // event (backpressure) rather than stalling video pacing.
-                        let _ = input_tx.try_send(event);
+                        // Rate-limit drop-safe high-rate floods (pointer-move + wheel); state
+                        // transitions (Button/Key) always pass (see `admit_input`). Gating the
+                        // high-rate events here, before the bounded queue, also relieves queue
+                        // pressure on the Button/Key events.
+                        if admit_input(&event, &mut input_limiter, Instant::now()) {
+                            // Non-blocking enqueue to the injection thread; a full queue drops the
+                            // event (backpressure) rather than stalling video pacing.
+                            let _ = input_tx.try_send(event);
+                        } else {
+                            throttled_events = throttled_events.saturating_add(1);
+                        }
                     }
                 }
                 Ok(Ok(None)) => {
@@ -1172,6 +1196,12 @@ async fn run_video_stream(
     // wait for it — so we await explicitly to make the stuck-button release a hard guarantee.
     drop(input_tx);
     let _ = inject_task.await;
+    if throttled_events > 0 {
+        warn!(
+            throttled_events,
+            "throttled high-rate input events (pointer-move/wheel — hostile-input guard)"
+        );
+    }
     match stream_err {
         Some(e) => {
             warn!(
@@ -1184,6 +1214,40 @@ async fn run_video_stream(
             info!(frames = sent, "video stream complete");
             Ok(())
         }
+    }
+}
+
+/// Decide whether a decoded input event is admitted past the hostile-input rate limiter.
+///
+/// Events are classified by **drop-safety**, not by a single variant:
+///
+/// - **Rate-limited** — `PointerMove` and `Wheel`. Both are stateless, high-rate flood vectors that
+///   are safe to shed: a move carries an absolute position (the next move supersedes a dropped one),
+///   and a wheel event is one self-contained scroll notch (dropping it loses at most a notch, never
+///   any held state). These are the events a hostile client can spam fastest, so they go through the
+///   bucket.
+/// - **Always admitted** — `Button` and `Key`. These are state *transitions*; dropping a *release*
+///   would leave the controlled machine with a button or key stuck down — the exact hazard
+///   [`sh_input::InputInjector::release_all`] exists to close (ADR-0034). They never touch the
+///   limiter, so they never consume tokens and can never be throttled.
+/// - **Always admitted (for now)** — `Touch` and `Pen`. These carry contact/lift state via
+///   `pressure`, so they are *not* purely drop-safe, and they are `Unsupported` on every injector
+///   today. They are admitted unthrottled until a deliberate contact-aware policy lands (tracked
+///   follow-up) — they must not be silently shed by the move/wheel bucket.
+///
+/// NOTE: the "absolute position ⇒ drop-safe" property of `PointerMove` holds because this protocol's
+/// `pointer_x`/`pointer_y` are absolute normalized coords. A future relative/pointer-lock input mode
+/// would NOT be drop-safe and must revisit this classification.
+///
+/// Returns `true` to enqueue the event for injection, `false` to drop it.
+fn admit_input(event: &InputEvent, limiter: &mut RateLimiter, now: Instant) -> bool {
+    match event.event_type {
+        // Stateless, high-rate, drop-safe vectors → rate-limited.
+        EventType::PointerMove | EventType::Wheel => limiter.allow(now),
+        // State transitions (a dropped release would stick) → always admitted.
+        EventType::Button | EventType::Key => true,
+        // Contact events carry lift/contact state and are Unsupported today → admit, don't shed.
+        EventType::Touch | EventType::Pen => true,
     }
 }
 
@@ -1426,5 +1490,72 @@ mod tests {
         assert!(super::decode_input(&[]).is_none());
         // A 16-byte but malformed event (bad event-type / reserved bits) → None, never a panic.
         assert!(super::decode_input(&[0xFF; INPUT_EVENT_LEN]).is_none());
+    }
+
+    #[test]
+    fn admit_input_throttles_drop_safe_events_but_never_state_transitions() {
+        use sh_input::RateLimiter;
+        use sh_protocol::{EventType, InputEvent, Modifiers};
+        use std::time::Instant;
+
+        let ev = |event_type| InputEvent {
+            event_type,
+            modifiers: Modifiers::empty(),
+            pointer_x: 0,
+            pointer_y: 0,
+            button_mask: 0x01,
+            key_code: 0x04,
+            scroll_x: 0,
+            scroll_y: 1,
+            pressure: 0,
+        };
+
+        // Both drop-safe high-rate vectors (PointerMove AND Wheel) share the bucket and are
+        // throttled. A Wheel flood must NOT bypass the guard by relabeling its event type.
+        for et in [EventType::PointerMove, EventType::Wheel] {
+            let mut limiter = RateLimiter::new(500, 1); // burst 1
+            let now = Instant::now();
+            assert!(
+                super::admit_input(&ev(et), &mut limiter, now),
+                "{et:?}: first event (burst token) admitted"
+            );
+            assert!(
+                !super::admit_input(&ev(et), &mut limiter, now),
+                "{et:?}: second event at the same instant throttled"
+            );
+        }
+
+        // Critical safety property: with the bucket fully empty, every state-transition event still
+        // passes — dropping a Button/Key release would leave it stuck (ADR-0034). Touch/Pen also
+        // pass (they carry contact state and are not purely drop-safe).
+        let mut limiter = RateLimiter::new(500, 1);
+        let now = Instant::now();
+        assert!(super::admit_input(
+            &ev(EventType::PointerMove),
+            &mut limiter,
+            now
+        )); // drain token
+        assert!(!super::admit_input(
+            &ev(EventType::PointerMove),
+            &mut limiter,
+            now
+        )); // bucket empty
+        for et in [
+            EventType::Button,
+            EventType::Key,
+            EventType::Touch,
+            EventType::Pen,
+        ] {
+            assert!(
+                super::admit_input(&ev(et), &mut limiter, now),
+                "{et:?} must bypass the rate limiter even when the bucket is empty"
+            );
+        }
+        // The always-admitted events consumed no tokens, so a move is still throttled.
+        assert!(!super::admit_input(
+            &ev(EventType::PointerMove),
+            &mut limiter,
+            now
+        ));
     }
 }

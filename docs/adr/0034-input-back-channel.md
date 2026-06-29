@@ -66,8 +66,23 @@ Add a browser→host input back-channel on the **same** "shp" DataChannel.
   overrides assert the tracked-state bookkeeping on their CI runners, with live OS-effect validation
   deferred to hardware per R-MAC-TCC / R-WIN-INTERACTIVE.) Still deferred: *mid-session* gap
   detection (a button-up dropped mid-stream stays stuck until session end; needs input sequence
-  numbers). No explicit rate-limiting beyond the queue depth yet.
+  numbers).
   Coordinates are normalized (0..=65535); per-monitor mapping is the injector's responsibility
   (`CoordMapper`).
-- **Follow-ups:** a dedicated Input channel/task for lower latency; input rate-limiting; clipboard;
-  multi-monitor coordinate mapping; macOS/Windows injectors on the preview host.
+- **Hostile-input rate-limiting (DONE):** beyond the bounded queue, the host caps injected
+  **drop-safe high-rate** events with a token-bucket [`sh_input::RateLimiter`] (default 500/s
+  sustained, burst 120 — well above any human rate). Events are classified by **drop-safety**, not
+  by a single variant: `PointerMove` (absolute position — the next move supersedes a dropped one)
+  and `Wheel` (a self-contained scroll notch, no held state) are throttled; `Button`/`Key` state
+  transitions **always** pass — dropping a release would re-introduce the stuck-state this ADR
+  closes — as do `Touch`/`Pen` (which carry contact state and are `Unsupported` today). Gating the
+  high-rate events *before* the bounded queue relieves queue pressure on the state transitions. The
+  limiter takes the clock as a parameter (`allow(now)`) so it is deterministically unit-tested;
+  `admit_input` proves state transitions bypass it even when the bucket is empty, and that a `Wheel`
+  flood can't bypass the guard by relabeling its event type.
+- **Follow-ups:** a **discrete-event aggregate rate cap that preserves releases** (coalesce
+  redundant same-state `Button`/`Key` events / bound them without ever shedding a release) — closes
+  the remaining bounded discrete-event flood DoS (today capped only by the queue depth + per-frame
+  drain + serial injection; security-engineer-assessed as low severity, deferred not blocking); a
+  dedicated Input channel/task for lower latency; clipboard; multi-monitor coordinate mapping;
+  macOS/Windows injectors on the preview host.
