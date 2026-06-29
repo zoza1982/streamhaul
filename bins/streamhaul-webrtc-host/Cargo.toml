@@ -10,6 +10,18 @@ rust-version.workspace = true
 # Connects to a streamhaul-signaling server, accepts a browser SDP offer, negotiates a DTLS
 # DataChannel, exchanges a simple echo frame, and exits. Intended for local integration tests.
 # NOT for production use.
+#
+# As of ADR-0032 this crate is both a library (src/lib.rs — connection logic + VideoFrameSource)
+# and a binary (src/main.rs — thin arg-parse shell). The library is used by the workspace-excluded
+# `streamhaul-webrtc-preview` crate which provides the live X11-capture OpenH264 frame source.
+
+[lib]
+name = "streamhaul_webrtc_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "streamhaul-webrtc-host"
+path = "src/main.rs"
 
 [dependencies]
 sh-transport = { path = "../../crates/sh-transport" }

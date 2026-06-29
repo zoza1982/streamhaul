@@ -456,6 +456,37 @@ jobs:
             echo "--- host log ---"; cat host.log
           '
 
+  # ----------------------------------------------------------------------------
+  # Live WebRTC preview host (ADR-0032): real-screen X11 + OpenH264 over the WebRTC DataChannel.
+  # EXCLUDED from the workspace (depends on sh-codec-openh264 / vendored OpenH264 C). The
+  # deterministic test uses SyntheticCapturer (no display); full browser↔live-host e2e is deferred.
+  # ----------------------------------------------------------------------------
+  webrtc-preview:
+    name: webrtc-preview
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add rustfmt + clippy
+        run: rustup component add rustfmt clippy
+      - name: Install nasm (OpenH264 SIMD asm)
+        run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Rust build cache (OpenH264 vendored C compile is expensive)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bins/streamhaul-webrtc-preview -> target"
+      - name: Install cargo-audit (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: cargo audit (webrtc-preview crate's own lockfile)
+        run: cargo audit --deny warnings --file bins/streamhaul-webrtc-preview/Cargo.lock
+      - name: cargo fmt check (streamhaul-webrtc-preview)
+        run: cargo fmt --manifest-path bins/streamhaul-webrtc-preview/Cargo.toml -- --check
+      - name: cargo clippy (streamhaul-webrtc-preview, deny warnings)
+        run: cargo clippy --manifest-path bins/streamhaul-webrtc-preview/Cargo.toml --all-targets -- -D warnings
+      - name: cargo test (deterministic SyntheticCapturer→OpenH264→SHP)
+        run: cargo test --manifest-path bins/streamhaul-webrtc-preview/Cargo.toml
+
   # Security audit of dependencies.
   # ----------------------------------------------------------------------------
   audit:
