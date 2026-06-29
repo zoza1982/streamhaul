@@ -115,8 +115,18 @@ impl<C: ScreenCapturer> ScreenCapturer for DownscaleCapturer<C> {
             )));
         }
 
-        // Nearest-neighbor BGRA downscale: for each output pixel (dx, dy), sample input (dx*f, dy*f).
+        // DownscaleCapturer assumes packed BGRA (stride = width × 4). Verify the invariant so
+        // a capturer that pads rows produces a clear error rather than silently corrupt output.
         let src_stride = src_w.saturating_mul(4);
+        let expected_len = src_stride.saturating_mul(src_h);
+        if frame.data.len() != expected_len {
+            return Err(MediaError::Capture(format!(
+                "DownscaleCapturer: packed stride assumed (width×4={src_stride}×{src_h}={expected_len} bytes) \
+                 but frame.data.len()={} — row-padded frames are unsupported",
+                frame.data.len()
+            )));
+        }
+        // Nearest-neighbor BGRA downscale: for each output pixel (dx, dy), sample input (dx*f, dy*f).
         let dst_stride = dst_w.saturating_mul(4);
         let mut out = vec![0u8; dst_stride.saturating_mul(dst_h)];
 
@@ -208,8 +218,11 @@ impl<C: ScreenCapturer> LiveFrameSource<C> {
     ///
     /// # Errors
     ///
-    /// Returns an error if [`OpenH264Encoder::with_config`] cannot be initialised.
+    /// Returns an error if `fps == 0`, `bitrate_kbps == 0`, or if [`OpenH264Encoder::with_config`]
+    /// cannot be initialised.
     pub fn new(capturer: C, bitrate_kbps: u32, fps: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(fps > 0, "fps must be > 0");
+        anyhow::ensure!(bitrate_kbps > 0, "bitrate_kbps must be > 0");
         let res = capturer.resolution();
         let cfg = EncoderConfig {
             codec: Codec::H264,
@@ -225,23 +238,54 @@ impl<C: ScreenCapturer> LiveFrameSource<C> {
     }
 }
 
+/// Maximum consecutive `Ok(None)` responses from the capturer before `next_frame` gives up.
+///
+/// 100 × 100 ms = 10 s of idle screen. Avoids hanging the async streaming task indefinitely if
+/// the underlying capturer never produces a new frame (e.g. a damage-based capturer on an
+/// unmoving display, or encoder misconfiguration that causes every frame to be skipped).
+const MAX_CAPTURE_SKIPS: u32 = 100;
+
+/// Maximum consecutive encoder skips (`Ok(None)`) before `next_frame` gives up.
+///
+/// Protects against `--bitrate-kbps` values so small that the rate-control budget is never met.
+const MAX_ENCODER_SKIPS: u32 = 60;
+
 impl<C: ScreenCapturer> VideoFrameSource for LiveFrameSource<C> {
     fn next_frame(&mut self) -> anyhow::Result<(FrameType, Vec<u8>)> {
         let capture_timeout = Duration::from_millis(100);
+        let mut encoder_skips: u32 = 0;
         loop {
-            // Capture: retry on `Ok(None)` (no new frame within the deadline).
-            let frame = loop {
-                match self.capturer.next_frame(capture_timeout) {
-                    Ok(Some(f)) => break f,
-                    Ok(None) => continue, // no frame yet — retry
-                    Err(e) => return Err(anyhow::anyhow!("capture failed: {e}")),
+            // Capture: retry on `Ok(None)` (no new frame within the deadline) up to the cap.
+            let frame = {
+                let mut capture_skips: u32 = 0;
+                loop {
+                    match self.capturer.next_frame(capture_timeout) {
+                        Ok(Some(f)) => break f,
+                        Ok(None) => {
+                            capture_skips = capture_skips.saturating_add(1);
+                            anyhow::ensure!(
+                                capture_skips < MAX_CAPTURE_SKIPS,
+                                "capture produced no frame after {MAX_CAPTURE_SKIPS} retries \
+                                 ({} ms); display may be frozen or capturer misconfigured",
+                                u64::from(MAX_CAPTURE_SKIPS).saturating_mul(100)
+                            );
+                        }
+                        Err(e) => return Err(anyhow::anyhow!("capture failed: {e}")),
+                    }
                 }
             };
 
             // Encode: if the encoder skips the frame (RC warm-up / budget), capture the next one.
             match self.encoder.encode(&frame) {
                 Ok(Some(pkt)) => return Ok((pkt.frame_type, pkt.data.to_vec())),
-                Ok(None) => continue, // skipped — retry with next frame
+                Ok(None) => {
+                    encoder_skips = encoder_skips.saturating_add(1);
+                    anyhow::ensure!(
+                        encoder_skips < MAX_ENCODER_SKIPS,
+                        "encoder skipped {MAX_ENCODER_SKIPS} consecutive frames; \
+                         check --bitrate-kbps (too low?) or frame dimensions"
+                    );
+                }
                 Err(e) => return Err(anyhow::anyhow!("encode failed: {e}")),
             }
         }
@@ -271,10 +315,11 @@ mod tests {
 
     #[test]
     fn downscale_factor_rounds_up() {
-        // 1921 / 960 = 2.00104...; ceil = 3.
+        // 1921 / 960 = 2.00104...; ceil = 3.  output = (1921/3, 1080/3) = (640, 360).
         let cap = SyntheticCapturer::new(Resolution::new(1921, 1080), 30);
         let dc = DownscaleCapturer::new(cap, 960);
         assert_eq!(dc.factor(), 3);
+        assert_eq!(dc.resolution(), Resolution::new(640, 360));
     }
 
     #[test]

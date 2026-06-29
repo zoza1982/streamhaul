@@ -81,6 +81,7 @@ impl Args {
                         .context("--bitrate-kbps requires a value")?
                         .parse()
                         .context("--bitrate-kbps must be a positive integer")?;
+                    anyhow::ensure!(bitrate_kbps > 0, "--bitrate-kbps must be > 0");
                 }
                 "--fps" => {
                     fps = args
@@ -190,5 +191,11 @@ async fn run_linux(args: Args) -> anyhow::Result<()> {
         source: Box::new(live_source),
     };
 
-    run_webrtc_host(config, mode).await
+    run_webrtc_host(config, mode, |fp| {
+        // Print HOST_DTLS_FP= before blocking on signaling so test harnesses can parse it.
+        println!("HOST_DTLS_FP={fp}");
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
+    })
+    .await
 }

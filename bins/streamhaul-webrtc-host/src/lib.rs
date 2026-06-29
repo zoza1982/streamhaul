@@ -215,14 +215,19 @@ pub enum StreamMode {
 /// Connect to `config.signaling_url`, complete the identity-bound Noise XK handshake, negotiate
 /// a WebRTC DataChannel, and run `mode` (echo or video streaming), then return.
 ///
-/// Prints `HOST_DTLS_FP=<64-char-hex>` to stdout before connecting to signaling so test harnesses
-/// can parse the fingerprint without waiting for the full connection sequence.
+/// `on_fingerprint` is called with the host's 64-hex-char DTLS fingerprint immediately after it
+/// is derived — before any network I/O — so the caller can publish it (e.g. `println!`) or record
+/// it. The callback must not block the tokio runtime.
 ///
 /// # Errors
 ///
 /// Returns an error if signaling, the Noise handshake, SDP negotiation, or the DataChannel
 /// exchange fails.
-pub async fn run_webrtc_host(config: HostConfig, mode: StreamMode) -> anyhow::Result<()> {
+pub async fn run_webrtc_host(
+    config: HostConfig,
+    mode: StreamMode,
+    on_fingerprint: impl FnOnce(&str),
+) -> anyhow::Result<()> {
     // ── Step 1: create Rtc and obtain the local DTLS fingerprint ─────────────────────────────
     //
     // We must get the fingerprint BEFORE connecting to signaling so we can register
@@ -244,13 +249,9 @@ pub async fn run_webrtc_host(config: HostConfig, mode: StreamMode) -> anyhow::Re
         .try_into()
         .context("local DTLS fingerprint is not 32 bytes (expected SHA-256)")?;
 
-    // Print in a machine-readable form so the test harness can parse it.
-    println!("HOST_DTLS_FP={local_fp_hex}");
-    // Flush immediately so the harness sees the line before we block on signaling.
-    {
-        use std::io::Write as _;
-        std::io::stdout().flush().ok();
-    }
+    // Deliver the fingerprint to the caller before any network I/O.
+    // The caller decides how to publish it (e.g. println! + stdout flush in the binary).
+    on_fingerprint(&local_fp_hex);
 
     // ── Step 2: connect to the signaling server ───────────────────────────────────────────────
     let backoff = ExponentialBackoff::new(100, 5_000, 10);
@@ -432,7 +433,8 @@ pub fn parse_session_id(hex: &str) -> anyhow::Result<SessionId> {
             u8::from_str_radix(s, 16).with_context(|| format!("invalid hex in session-id: {s}"))?;
         bytes.push(b);
     }
-    // Safety: hex is exactly 32 chars, so chunks(2) produces exactly 16 items.
+    // The `if` above guarantees `hex.len() == 32`, so `chunks(2)` produces exactly 16 items;
+    // `try_into()` on a `Vec<u8>` of length 16 into `[u8; 16]` is infallible.
     let arr: [u8; 16] = bytes
         .try_into()
         .map_err(|_| anyhow::anyhow!("session-id length mismatch (internal error)"))?;
@@ -684,57 +686,73 @@ async fn run_noise_responder(
     Ok((browser_fp, browser_dtls_pin))
 }
 
-/// Receive a single signaling envelope with a bounded [`SIGNALING_STEP_TIMEOUT`] deadline.
-async fn recv_bounded(sig: &mut SignalingClient, step: &str) -> anyhow::Result<SignalingEnvelope> {
-    let received = tokio::time::timeout(SIGNALING_STEP_TIMEOUT, sig.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("timed out waiting for signaling message ({step})"))?
-        .with_context(|| format!("signaling recv failed ({step})"))?;
-    received.ok_or_else(|| anyhow::anyhow!("signaling connection closed before {step}"))
-}
-
 /// Wait for a `MessageKind::Noise` envelope carrying `NOISE_SUB_HELLO`; returns the browser's
 /// `from_fp`.
+///
+/// The entire filter loop runs inside a single [`SIGNALING_STEP_TIMEOUT`] window so a hostile peer
+/// that sends junk on every iteration cannot hold the loop open indefinitely by arriving just
+/// before a per-iteration expiry.
 async fn recv_noise_hello(sig: &mut SignalingClient) -> anyhow::Result<String> {
-    loop {
-        let env = recv_bounded(sig, "Noise hello").await?;
-        if env.kind == MessageKind::Noise {
-            match env.payload.first().copied() {
-                Some(NOISE_SUB_HELLO) => return Ok(env.from_fp),
-                Some(other) => {
-                    debug!(
-                        sub = other,
-                        "ignoring non-hello Noise sub-type before hello"
-                    );
+    tokio::time::timeout(SIGNALING_STEP_TIMEOUT, async {
+        loop {
+            let env = sig
+                .recv()
+                .await
+                .context("signaling recv failed (Noise hello)")?
+                .ok_or_else(|| anyhow::anyhow!("signaling connection closed before Noise hello"))?;
+            if env.kind == MessageKind::Noise {
+                match env.payload.first().copied() {
+                    Some(NOISE_SUB_HELLO) => return Ok(env.from_fp),
+                    Some(other) => {
+                        debug!(
+                            sub = other,
+                            "ignoring non-hello Noise sub-type before hello"
+                        );
+                    }
+                    None => warn!("empty Noise payload (ignored)"),
                 }
-                None => warn!("empty Noise payload (ignored)"),
+            } else {
+                debug!(kind = ?env.kind, "ignoring non-Noise signaling message before hello");
             }
-        } else {
-            debug!(kind = ?env.kind, "ignoring non-Noise signaling message before hello");
         }
-    }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for Noise hello"))?
 }
 
 /// Wait for a `MessageKind::Noise` envelope carrying `NOISE_SUB_MSG` from `expected_fp`; returns
 /// the opaque Noise body.
+///
+/// The entire filter loop runs inside a single [`SIGNALING_STEP_TIMEOUT`] window (same rationale
+/// as [`recv_noise_hello`]).
 async fn recv_noise_msg(sig: &mut SignalingClient, expected_fp: &str) -> anyhow::Result<Vec<u8>> {
-    loop {
-        let env = recv_bounded(sig, "Noise handshake message").await?;
-        if env.kind == MessageKind::Noise && env.from_fp == expected_fp {
-            match env.payload.split_first() {
-                Some((&NOISE_SUB_MSG, body)) => return Ok(body.to_vec()),
-                Some((&other, _)) => {
-                    debug!(
-                        sub = other,
-                        "ignoring unexpected Noise sub-type during exchange"
-                    );
+    tokio::time::timeout(SIGNALING_STEP_TIMEOUT, async {
+        loop {
+            let env = sig
+                .recv()
+                .await
+                .context("signaling recv failed (Noise handshake message)")?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("signaling connection closed before Noise handshake message")
+                })?;
+            if env.kind == MessageKind::Noise && env.from_fp == expected_fp {
+                match env.payload.split_first() {
+                    Some((&NOISE_SUB_MSG, body)) => return Ok(body.to_vec()),
+                    Some((&other, _)) => {
+                        debug!(
+                            sub = other,
+                            "ignoring unexpected Noise sub-type during exchange"
+                        );
+                    }
+                    None => warn!("empty Noise payload during exchange (ignored)"),
                 }
-                None => warn!("empty Noise payload during exchange (ignored)"),
+            } else {
+                debug!(kind = ?env.kind, "ignoring unrelated signaling message during Noise exchange");
             }
-        } else {
-            debug!(kind = ?env.kind, "ignoring unrelated signaling message during Noise exchange");
         }
-    }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for Noise handshake message"))?
 }
 
 /// Send a `MessageKind::Noise` envelope with `sub_type` prefixed onto `body`.
@@ -760,16 +778,27 @@ async fn send_noise(
 }
 
 /// Wait for a `MessageKind::Offer` envelope from `expected_fp`; returns the offer SDP text.
+///
+/// The entire filter loop runs inside a single [`SIGNALING_STEP_TIMEOUT`] window (same rationale
+/// as [`recv_noise_hello`]).
 async fn receive_offer(sig: &mut SignalingClient, expected_fp: &str) -> anyhow::Result<String> {
-    loop {
-        let env = recv_bounded(sig, "SDP offer").await?;
-        if env.kind == MessageKind::Offer && env.from_fp == expected_fp {
-            let offer_sdp =
-                String::from_utf8(env.payload.to_vec()).context("offer payload is not UTF-8")?;
-            return Ok(offer_sdp);
+    tokio::time::timeout(SIGNALING_STEP_TIMEOUT, async {
+        loop {
+            let env = sig
+                .recv()
+                .await
+                .context("signaling recv failed (SDP offer)")?
+                .ok_or_else(|| anyhow::anyhow!("signaling connection closed before SDP offer"))?;
+            if env.kind == MessageKind::Offer && env.from_fp == expected_fp {
+                let offer_sdp = String::from_utf8(env.payload.to_vec())
+                    .context("offer payload is not UTF-8")?;
+                return Ok(offer_sdp);
+            }
+            debug!(kind = ?env.kind, "ignoring non-offer signaling message");
         }
-        debug!(kind = ?env.kind, "ignoring non-offer signaling message");
-    }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out waiting for SDP offer"))?
 }
 
 /// Forward `Candidate` messages from signaling to the transport until `EndOfCandidates` or
@@ -909,7 +938,21 @@ async fn run_video_stream(
         // encode() narrows them to their low 32 wire bits.
         let frame_id = u32::try_from(n & u64::from(MAX_FRAME_ID)).unwrap_or(0);
         let ts_us = n.wrapping_mul(per_us);
-        let shp = build_shp_video_frame(sequence, frame_id, ts_us, frame_type, &payload)?;
+        let shp = match build_shp_video_frame(sequence, frame_id, ts_us, frame_type, &payload) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // Encoded frame exceeded the SHP 16-bit payload_len cap (> 64 KiB). This is a
+                // transient condition (the next frame may be smaller) — drop the frame and wait
+                // for the next tick rather than aborting the entire stream. SHP fragmentation
+                // (the permanent fix) is a deferred follow-up; see ADR-0032.
+                warn!(
+                    bytes = payload.len(),
+                    error = %e,
+                    "frame exceeds SHP 64 KiB cap — dropping; reduce --max-width or --bitrate-kbps"
+                );
+                continue;
+            }
+        };
         // A send failure here means the browser closed the DataChannel — a NORMAL end of stream
         // (the viewer got what it needed and disconnected), not a host error. Treat it as a
         // clean end so the host exits 0 instead of logging a misleading failure.

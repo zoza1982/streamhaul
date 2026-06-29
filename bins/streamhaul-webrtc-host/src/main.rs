@@ -140,5 +140,13 @@ async fn main() -> anyhow::Result<()> {
         StreamMode::Echo
     };
 
-    streamhaul_webrtc_host::run_webrtc_host(config, mode).await
+    streamhaul_webrtc_host::run_webrtc_host(config, mode, |fp| {
+        // Print HOST_DTLS_FP= in a machine-readable form before blocking on signaling, so
+        // test harnesses can parse the fingerprint. Flush immediately so the harness sees
+        // the line before we connect.
+        println!("HOST_DTLS_FP={fp}");
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
+    })
+    .await
 }

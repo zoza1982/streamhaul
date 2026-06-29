@@ -470,6 +470,10 @@ jobs:
         run: rustup component add rustfmt clippy
       - name: Install nasm (OpenH264 SIMD asm)
         run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Rust build cache (OpenH264 vendored C compile is expensive)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bins/streamhaul-webrtc-preview -> target"
       - name: Install cargo-audit (prebuilt)
         uses: taiki-e/install-action@v2
         with:
