@@ -49,7 +49,8 @@ import {
 } from "../src/signaling/envelope.js";
 // VIDEO mode (?video=1): parse inbound SHP video frames and decode them with WebCodecs, proving
 // the browser can render the H.264 stream the native host produces (P5-3 Stage 2 + ADR-0031).
-import { parseVideoFrame, isH264Keyframe } from "../src/protocol/frame.js";
+import { parseVideoFrame } from "../src/protocol/frame.js";
+import { VideoFragmentReassembler, isKeyframe } from "../src/protocol/reassembler.js";
 import { CanvasH264Decoder, isWebCodecsAvailable } from "../src/view/decoder.js";
 
 /** avc1 codec string of the baked fixture (H.264 Baseline 0x42, level 0x1e / 3.0 — OpenH264 output,
@@ -90,7 +91,8 @@ export interface InteropResult {
   pinUsedHex: string | null;
   /** True iff the MITM SDP-fingerprint swap was REJECTED by the fail-closed pin gate. */
   mitmRejected: boolean;
-  /** VIDEO mode: count of inbound frames that parsed as valid SHP video frames. */
+  /** VIDEO mode: count of COMPLETE access units that reached the decoder (multi-fragment frames
+   * count once, only after their final fragment is reassembled — not per inbound fragment). */
   framesReachedDecoder: number;
   /** VIDEO mode: count of frames the WebCodecs decoder successfully decoded. */
   framesDecoded: number;
@@ -266,14 +268,21 @@ async function runInteropTest(): Promise<InteropResult> {
       const canvas = document.getElementById("screen") as HTMLCanvasElement;
       decoder = new CanvasH264Decoder(canvas);
       const dec = decoder; // narrow to non-null for the closure
+      // The host fragments large H.264 access units across several SHP messages; reassemble them
+      // before decoding. One reassembler for the whole stream (fragment state is per-session).
+      const reassembler = new VideoFragmentReassembler();
       viewer!.on_frame((frame: Uint8Array) => {
         // `bridge` is in scope (loaded above). parseVideoFrame returns null for a non-video /
         // malformed frame (never throws) — drop those without counting them.
         const parsed = parseVideoFrame(bridge, frame);
         if (!parsed) return;
+        // Feed the fragment to the reassembler. A non-null result is a COMPLETE access unit; a
+        // partial (still-buffering) fragment returns null and must NOT count as a decoded frame.
+        const complete = reassembler.push(parsed);
+        if (!complete) return;
         result.framesReachedDecoder += 1;
         try {
-          dec.pushAnnexB(parsed.payload, isH264Keyframe(parsed));
+          dec.pushAnnexB(complete.payload, isKeyframe(complete));
         } catch {
           /* ignore decode errors — a hostile/garbage frame must not crash the viewer */
         }

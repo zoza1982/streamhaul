@@ -57,7 +57,7 @@ interface InteropResult {
   pinUsedHex: string | null;
   /** True iff the MITM SDP-fingerprint swap was rejected by the fail-closed pin gate. */
   mitmRejected: boolean;
-  /** VIDEO mode: count of inbound frames that parsed as valid SHP video frames. */
+  /** VIDEO mode: count of COMPLETE reassembled access units that reached the decoder. */
   framesReachedDecoder: number;
   /** VIDEO mode: count of frames the WebCodecs decoder successfully decoded. */
   framesDecoded: number;
@@ -355,7 +355,11 @@ test("identity-bound browser↔native LIVE H.264 video (P5-3 Stage 2 + ADR-0031)
 }) => {
   // Spawn the host in VIDEO mode: it streams 90 baked H.264 frames at 30 fps as SHP video frames
   // over the "shp" DataChannel (first frame is an IDR), instead of echoing the HELLO frame.
-  await startHost(["--stream-video", "--frames", "90", "--fps", "30"]);
+  //
+  // `--max-fragment-bytes 4096` forces the host to SPLIT each ~9 KB fixture frame into 2-3 SHP
+  // fragments, so the browser's reassembler is exercised end to end (the assertions below now prove
+  // the browser correctly reassembles fragmented frames before decoding them).
+  await startHost(["--stream-video", "--frames", "90", "--fps", "30", "--max-fragment-bytes", "4096"]);
   const hostFp = process.env["_TEST_HOST_FP"]!;
 
   // video=1: the in-page driver parses the inbound SHP video frames and decodes them via WebCodecs.

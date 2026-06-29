@@ -39,6 +39,7 @@ struct Args {
     stream_video: bool,
     frames: usize,
     fps: u32,
+    max_fragment_bytes: usize,
 }
 
 impl Args {
@@ -53,6 +54,8 @@ impl Args {
         let mut stream_video = false;
         let mut frames: usize = 120;
         let mut fps: u32 = 30;
+        // Default to the SHP wire cap; a test can pass a small value to force fragmentation.
+        let mut max_fragment_bytes: usize = usize::from(u16::MAX);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -84,6 +87,19 @@ impl Args {
                         .context("--fps must be an integer")?;
                     anyhow::ensure!(fps > 0, "--fps must be a positive integer (> 0)");
                 }
+                "--max-fragment-bytes" => {
+                    max_fragment_bytes = args
+                        .next()
+                        .context("--max-fragment-bytes requires a value")?
+                        .parse()
+                        .context("--max-fragment-bytes must be an integer")?;
+                    // Floor at 1 KiB: a value so small that a frame needs > 255 fragments would
+                    // drop every frame (silent black stream). 1 KiB is well below the e2e's 4096.
+                    anyhow::ensure!(
+                        max_fragment_bytes >= 1024,
+                        "--max-fragment-bytes must be >= 1024"
+                    );
+                }
                 other => {
                     warn!(flag = other, "unknown flag (ignored)");
                 }
@@ -97,6 +113,7 @@ impl Args {
             stream_video,
             frames,
             fps,
+            max_fragment_bytes,
         })
     }
 }
@@ -134,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         StreamMode::Video {
             frames: args.frames,
             fps: args.fps,
+            max_fragment_bytes: args.max_fragment_bytes,
             source: Box::new(BakedFrameSource::new()),
         }
     } else {

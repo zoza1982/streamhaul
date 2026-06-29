@@ -9,7 +9,8 @@
 import { Session, type SessionState } from "./client/session.js";
 import { CanvasH264Decoder, isWebCodecsAvailable } from "./view/decoder.js";
 import { attachInputCapture } from "./control/input-capture.js";
-import { parseVideoFrame, isH264Keyframe } from "./protocol/frame.js";
+import { parseVideoFrame } from "./protocol/frame.js";
+import { VideoFragmentReassembler, isKeyframe } from "./protocol/reassembler.js";
 import { loadBridge } from "./bridge/index.js";
 import { mountFileTransferUi } from "./file/ui.js";
 
@@ -48,13 +49,23 @@ async function main(): Promise<void> {
   // VIEW: route inbound video frames through the decoder. on_frame binds to the offerer's "shp"
   // DataChannel, which `create_offer` creates — so it must be registered AFTER the offer, inside
   // the connect handler (registering it at startup would throw "no DataChannel").
+  //
+  // Large H.264 access units arrive split across several SHP fragments (shared frame_id, sequenced
+  // by frag_index, marker on the last). A FRESH reassembler is created per connection (inside
+  // wireView) so a disconnect mid-frame can't leak a stale partial into the next session; only a
+  // COMPLETE access unit is handed to the decoder. A single-fragment frame completes immediately.
   const wireView = (): void => {
+    const reassembler = new VideoFragmentReassembler();
     session.onFrame((frame: Uint8Array) => {
       const parsed = parseVideoFrame(bridge, frame);
       if (parsed === null) {
         return; // hostile / non-video frame — dropped, session continues
       }
-      decoder.pushAnnexB(parsed.payload, isH264Keyframe(parsed));
+      const complete = reassembler.push(parsed);
+      if (complete === null) {
+        return; // more fragments still needed for this frame
+      }
+      decoder.pushAnnexB(complete.payload, isKeyframe(complete));
     });
   };
 

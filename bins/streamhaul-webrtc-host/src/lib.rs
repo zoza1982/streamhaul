@@ -15,7 +15,8 @@
 //! - [`StreamMode`] — echo or video streaming.
 //! - [`run_webrtc_host`] — entry point: connect, negotiate, stream.
 //! - [`parse_session_id`] — parse a 32-hex-char session ID string.
-//! - [`build_shp_video_frame`] — assemble one SHP video frame from Annex-B payload bytes.
+//! - [`build_shp_video_frame`] — assemble one (single) SHP video frame from Annex-B payload bytes.
+//! - [`build_shp_video_fragments`] — split a large frame into reassemblable SHP fragments (ADR-0033).
 //!
 //! # Security note
 //!
@@ -214,6 +215,10 @@ pub enum StreamMode {
         frames: usize,
         /// Target frame rate (frames per second). Must be > 0 (enforced by [`run_webrtc_host`]).
         fps: u32,
+        /// Maximum bytes per SHP fragment (clamped to the 64 KiB wire cap). Frames larger than this
+        /// are split into multiple fragments the receiver reassembles. Use the wire cap (65535) in
+        /// production; tests pass a small value to force fragmentation of small frames.
+        max_fragment_bytes: usize,
         /// The frame source; [`VideoFrameSource::next_frame`] is called once per tick.
         source: Box<dyn VideoFrameSource>,
     },
@@ -396,8 +401,18 @@ pub async fn run_webrtc_host(
             StreamMode::Video {
                 frames,
                 fps,
+                max_fragment_bytes,
                 mut source,
-            } => run_video_stream(&transport_for_accept, frames, fps, &mut *source).await,
+            } => {
+                run_video_stream(
+                    &transport_for_accept,
+                    frames,
+                    fps,
+                    max_fragment_bytes,
+                    &mut *source,
+                )
+                .await
+            }
         }
     });
 
@@ -463,14 +478,35 @@ pub fn build_shp_video_frame(
     frame_type: FrameType,
     payload: &[u8],
 ) -> anyhow::Result<Bytes> {
-    let payload_len = u16::try_from(payload.len())
-        .context("video frame exceeds SHP 16-bit payload-length cap")?;
+    // A single (non-fragmented) frame: frag 0 of 1. Byte-identical to the historical layout.
+    build_one_fragment(sequence, frame_id, ts_us, frame_type, payload, 0, 1)
+}
+
+/// Assemble one SHP fragment: `CommonHeader(9) || VideoHeader(12) || chunk`.
+///
+/// For `total_frags == 1` this is a single, non-fragmented frame (flags both clear, marker set) —
+/// byte-identical to a frame with no fragmentation. For `total_frags > 1`, the `fragment` flag is
+/// set on every fragment and `last_fragment`/`marker` are set on the final one.
+fn build_one_fragment(
+    sequence: u16,
+    frame_id: u32,
+    ts_us: u64,
+    frame_type: FrameType,
+    chunk: &[u8],
+    frag_index: u8,
+    total_frags: u8,
+) -> anyhow::Result<Bytes> {
+    let payload_len =
+        u16::try_from(chunk.len()).context("SHP fragment exceeds 16-bit payload-length cap")?;
+    let is_multi = total_frags > 1;
+    // The last fragment is the one whose index is total_frags - 1 (checked_sub avoids underflow).
+    let is_last = total_frags.checked_sub(1) == Some(frag_index);
     // `encode()` narrows both timestamps to their low 32 wire bits, so a u64 input is fine.
     let common = CommonHeader {
         channel: ChannelId::Video,
         flags: Flags {
-            fragment: false,
-            last_fragment: false,
+            fragment: is_multi,
+            last_fragment: is_multi && is_last,
         },
         sequence,
         timestamp_us: TimestampUs(ts_us),
@@ -479,13 +515,13 @@ pub fn build_shp_video_frame(
     .encode();
     let video = VideoHeader {
         frame_id: FrameId(u64::from(frame_id)),
-        frag_index: 0,
-        total_frags: 1,
+        frag_index,
+        total_frags,
         codec: Codec::H264,
         frame_type,
         priority: Priority::High,
         monitor_id: 0,
-        marker: true,
+        marker: is_last,
         encode_ts_us: TimestampUs(ts_us),
     }
     .encode()
@@ -494,12 +530,71 @@ pub fn build_shp_video_frame(
     let cap = common
         .len()
         .saturating_add(video.len())
-        .saturating_add(payload.len());
+        .saturating_add(chunk.len());
     let mut buf = Vec::with_capacity(cap);
     buf.extend_from_slice(&common);
     buf.extend_from_slice(&video);
-    buf.extend_from_slice(payload);
+    buf.extend_from_slice(chunk);
     Ok(Bytes::from(buf))
+}
+
+/// Split an encoded access unit into one or more SHP video fragments, each ≤ `max_fragment_bytes`
+/// (clamped to the SHP 16-bit `payload_len` cap). Reassembled in order by the receiver via the
+/// video header's `frag_index`/`total_frags`/`marker`.
+///
+/// Fragments share `frame_id` + `frame_type`; `sequence` increments per fragment from
+/// `sequence_start`. This removes the hard 64 KiB per-frame limit (ADR-0033), so full-resolution
+/// frames no longer need downscaling.
+///
+/// # Errors
+/// Returns an error if the frame would need more than 255 fragments (the 8-bit `total_frags` cap —
+/// ~16 MiB at the 64 KiB chunk size, far beyond any real frame) or a header fails to encode.
+pub fn build_shp_video_fragments(
+    sequence_start: u16,
+    frame_id: u32,
+    ts_us: u64,
+    frame_type: FrameType,
+    payload: &[u8],
+    max_fragment_bytes: usize,
+) -> anyhow::Result<Vec<Bytes>> {
+    let chunk_size = max_fragment_bytes.clamp(1, usize::from(u16::MAX));
+    // div_ceil, min 1 fragment even for an (unexpected) empty payload.
+    let total = payload.len().div_ceil(chunk_size).max(1);
+    let total_frags =
+        u8::try_from(total).context("encoded frame needs more than 255 SHP fragments")?;
+
+    let mut out = Vec::with_capacity(total);
+    // Empty payload → a single empty fragment (keeps `total >= 1` consistent).
+    if payload.is_empty() {
+        out.push(build_one_fragment(
+            sequence_start,
+            frame_id,
+            ts_us,
+            frame_type,
+            &[],
+            0,
+            total_frags,
+        )?);
+        return Ok(out);
+    }
+    for (i, chunk) in payload.chunks(chunk_size).enumerate() {
+        // i < total <= 255 (checked above), so this never errors — but propagate rather than fall
+        // back to a wrong index that would emit a corrupt fragment.
+        let frag_index =
+            u8::try_from(i).context("frag_index overflow (invariant: i < total_frags)")?;
+        // sequence wraps per fragment (u16 wire field); the receiver reassembles by frame_id.
+        let seq = sequence_start.wrapping_add(frag_index.into());
+        out.push(build_one_fragment(
+            seq,
+            frame_id,
+            ts_us,
+            frame_type,
+            chunk,
+            frag_index,
+            total_frags,
+        )?);
+    }
+    Ok(out)
 }
 
 // ── Private implementation ──────────────────────────────────────────────────────────────────────
@@ -909,6 +1004,7 @@ async fn run_video_stream(
     transport: &PinnedWebRtcTransport,
     frames_to_send: usize,
     fps: u32,
+    max_fragment_bytes: usize,
     source: &mut dyn VideoFrameSource,
 ) -> anyhow::Result<()> {
     info!("waiting for browser to open DataChannel (video mode)");
@@ -945,36 +1041,38 @@ async fn run_video_stream(
         // encode() narrows them to their low 32 wire bits.
         let frame_id = u32::try_from(n & u64::from(MAX_FRAME_ID)).unwrap_or(0);
         let ts_us = n.wrapping_mul(per_us);
-        let shp = match build_shp_video_frame(sequence, frame_id, ts_us, frame_type, &payload) {
-            Ok(bytes) => bytes,
+        // Fragment the access unit into ≤ `max_fragment_bytes` SHP messages (ADR-0033). Removes the
+        // hard 64 KiB per-frame cap; the receiver reassembles by frame_id. The only error is a
+        // frame needing > 255 fragments (pathological, ~16 MiB) — drop + re-arm a keyframe.
+        let fragments = match build_shp_video_fragments(
+            sequence,
+            frame_id,
+            ts_us,
+            frame_type,
+            &payload,
+            max_fragment_bytes,
+        ) {
+            Ok(f) => f,
             Err(e) => {
-                // Encoded frame exceeded the SHP 16-bit payload_len cap (> 64 KiB). This is a
-                // transient condition (the next frame may be smaller) — drop the frame and wait
-                // for the next tick rather than aborting the entire stream. SHP fragmentation
-                // (the permanent fix) is a deferred follow-up; see ADR-0032.
-                warn!(
-                    bytes = payload.len(),
-                    error = %e,
-                    "frame exceeds SHP 64 KiB cap — dropping; reduce --max-width or --bitrate-kbps"
-                );
-                // Re-arm a keyframe: if the dropped frame was the IDR, the encoder has already
-                // cleared its keyframe flag, so without this the stream would carry only P-frames
-                // referencing a keyframe the receiver never got (nothing decodes). The next frame
-                // is now forced back to an IDR (which may also drop if still oversize, but the
-                // stream self-heals once a frame fits rather than silently never decoding).
+                warn!(bytes = payload.len(), error = %e, "frame needs > 255 fragments — dropping");
                 source.request_keyframe();
                 continue;
             }
         };
-        // A send failure here means the browser closed the DataChannel — a NORMAL end of stream
-        // (the viewer got what it needed and disconnected), not a host error. Treat it as a
-        // clean end so the host exits 0 instead of logging a misleading failure.
-        if let Err(e) = channel.send(shp).await {
-            info!(frames = sent, error = %e, "peer closed channel — ending video stream");
-            return Ok(());
+        // fragments.len() <= 255 (the total_frags u8 cap), so this never errors — but propagate
+        // rather than fall back to a wrong count that would corrupt every later sequence number.
+        let num_frags =
+            u16::try_from(fragments.len()).context("fragment count exceeded u16 (invariant)")?;
+        // Send every fragment in order. A send failure means the browser closed the DataChannel — a
+        // NORMAL end of stream (the viewer disconnected), not a host error: exit 0.
+        for frag in fragments {
+            if let Err(e) = channel.send(frag).await {
+                info!(frames = sent, error = %e, "peer closed channel — ending video stream");
+                return Ok(());
+            }
         }
         sent = sent.saturating_add(1);
-        sequence = sequence.wrapping_add(1);
+        sequence = sequence.wrapping_add(num_frags);
     }
 
     info!(frames = sent, "video stream complete");
@@ -984,12 +1082,19 @@ async fn run_video_stream(
 // ── Unit tests (moved from src/main.rs — behavior must be identical) ────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation
+)]
 mod tests {
     use super::{
-        build_shp_video_frame, parse_baked_frames, BAKED_H264, NOISE_SUB_HELLO,
-        NOISE_SUB_HOST_STATIC_PUB, NOISE_SUB_MSG,
+        build_shp_video_fragments, build_shp_video_frame, parse_baked_frames, BAKED_H264,
+        NOISE_SUB_HELLO, NOISE_SUB_HOST_STATIC_PUB, NOISE_SUB_MSG,
     };
+    use bytes::Bytes;
     use sh_protocol::{Codec, CommonHeader, FrameType, VideoHeader, COMMON_HEADER_LEN};
     use sh_types::ChannelId;
 
@@ -1076,5 +1181,89 @@ mod tests {
         // SHP CommonHeader.payload_len is u16; a >64 KiB payload must error, not truncate/panic.
         let big = vec![0u8; usize::from(u16::MAX) + 1];
         assert!(build_shp_video_frame(0, 0, 0, FrameType::Predicted, &big).is_err());
+    }
+
+    /// Reassemble fragments the way the browser does: concatenate payloads in order, validating the
+    /// video-header frag fields. Returns the rebuilt Annex-B + the decoded first/last headers.
+    fn reassemble(fragments: &[Bytes]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (i, frag) in fragments.iter().enumerate() {
+            let common = CommonHeader::decode(&frag[..COMMON_HEADER_LEN]).expect("common");
+            assert_eq!(common.channel, ChannelId::Video);
+            let vh = VideoHeader::decode(&frag[COMMON_HEADER_LEN..COMMON_HEADER_LEN + 12])
+                .expect("video header");
+            assert_eq!(usize::from(vh.frag_index), i, "frag_index in order");
+            assert_eq!(usize::from(vh.total_frags), fragments.len(), "total_frags");
+            let is_last = i + 1 == fragments.len();
+            assert_eq!(vh.marker, is_last, "marker only on last fragment");
+            out.extend_from_slice(&frag[COMMON_HEADER_LEN + 12..]);
+        }
+        out
+    }
+
+    #[test]
+    fn fragments_single_is_byte_identical_to_build_shp_video_frame() {
+        // A frame that fits the cap → exactly one fragment, byte-for-byte the same as the
+        // single-frame builder (so the existing browser-native baked e2e is unchanged).
+        let payload = vec![0u8, 0, 0, 1, 0x65, 0xAB, 0xCD];
+        let single = build_shp_video_frame(7, 5, 1234, FrameType::Idr, &payload).unwrap();
+        let frags =
+            build_shp_video_fragments(7, 5, 1234, FrameType::Idr, &payload, usize::from(u16::MAX))
+                .unwrap();
+        assert_eq!(frags.len(), 1);
+        assert_eq!(
+            frags[0], single,
+            "single fragment must equal the non-fragmented frame"
+        );
+    }
+
+    #[test]
+    fn fragments_split_large_payload_and_reassemble_exactly() {
+        // 200 KB payload at the 64 KiB cap → 4 fragments that reassemble to the original bytes.
+        let payload: Vec<u8> = (0..200_000usize).map(|i| (i % 256) as u8).collect();
+        let frags =
+            build_shp_video_fragments(100, 9, 0, FrameType::Idr, &payload, usize::from(u16::MAX))
+                .unwrap();
+        assert_eq!(frags.len(), 4, "200000 / 65535 = 4 fragments");
+        // Sequences increment per fragment from the start value.
+        for (i, frag) in frags.iter().enumerate() {
+            let common = CommonHeader::decode(&frag[..COMMON_HEADER_LEN]).unwrap();
+            assert_eq!(common.sequence, 100u16.wrapping_add(i as u16));
+            assert!(
+                common.flags.fragment,
+                "multi-fragment frames set the fragment flag"
+            );
+        }
+        assert_eq!(
+            reassemble(&frags),
+            payload,
+            "reassembled bytes must equal the original"
+        );
+    }
+
+    #[test]
+    fn fragments_force_small_chunks_reassemble() {
+        // A small payload with a tiny max_fragment_bytes (as the e2e does) → many fragments.
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 256) as u8).collect();
+        let frags =
+            build_shp_video_fragments(0, 1, 0, FrameType::Predicted, &payload, 100).unwrap();
+        assert_eq!(frags.len(), 10);
+        assert_eq!(reassemble(&frags), payload);
+    }
+
+    #[test]
+    fn fragments_exceeding_255_error() {
+        // 256 one-byte fragments would need total_frags = 256 > the 8-bit cap → error.
+        let payload = vec![0u8; 256];
+        assert!(build_shp_video_fragments(0, 0, 0, FrameType::Idr, &payload, 1).is_err());
+    }
+
+    #[test]
+    fn fragments_empty_payload_produces_one_empty_fragment() {
+        // The explicit is_empty() branch: chunks() on [] yields nothing, so a single empty
+        // fragment is emitted (total_frags = 1, reassembles to empty).
+        let frags = build_shp_video_fragments(0, 0, 0, FrameType::Idr, &[], 1000).unwrap();
+        assert_eq!(frags.len(), 1);
+        assert!(reassemble(&frags).is_empty());
     }
 }
