@@ -87,6 +87,15 @@ pub trait VideoFrameSource: Send {
     ///
     /// Returns an error on capture or encode failure.
     fn next_frame(&mut self) -> anyhow::Result<(FrameType, Vec<u8>)>;
+
+    /// Request that the **next** produced frame be a keyframe (IDR).
+    ///
+    /// The streamer calls this when it has to DROP a frame (e.g. an oversize IDR that exceeds the
+    /// SHP 64 KiB cap): an encoder clears its armed-keyframe flag the moment it emits the IDR, so
+    /// without re-arming, a dropped keyframe would leave the stream with no decodable keyframe
+    /// (the receiver renders nothing). The default is a no-op — correct for sources whose frames
+    /// are independently decodable or never dropped (e.g. [`BakedFrameSource`]).
+    fn request_keyframe(&mut self) {}
 }
 
 // ── Baked H.264 fixture ─────────────────────────────────────────────────────────────────────────
@@ -203,7 +212,7 @@ pub enum StreamMode {
     Video {
         /// Total number of SHP video frames to send.
         frames: usize,
-        /// Target frame rate (frames per second). Must be > 0.
+        /// Target frame rate (frames per second). Must be > 0 (enforced by [`run_webrtc_host`]).
         fps: u32,
         /// The frame source; [`VideoFrameSource::next_frame`] is called once per tick.
         source: Box<dyn VideoFrameSource>,
@@ -222,7 +231,7 @@ pub enum StreamMode {
 /// # Errors
 ///
 /// Returns an error if signaling, the Noise handshake, SDP negotiation, or the DataChannel
-/// exchange fails.
+/// exchange fails, or if a [`StreamMode::Video`] is given with `frames == 0` or `fps == 0`.
 pub async fn run_webrtc_host(
     config: HostConfig,
     mode: StreamMode,
@@ -912,17 +921,15 @@ async fn run_video_stream(
         frames_to_send > 0,
         "--frames must be > 0 in video stream mode"
     );
+    anyhow::ensure!(fps > 0, "StreamMode::Video fps must be > 0");
     info!(
         target = frames_to_send,
         fps, "streaming H.264 video frames to browser"
     );
 
-    // `checked_div` (not `/`) satisfies the arithmetic-side-effects lint; `fps.max(1)` guarantees a
-    // non-zero divisor, so the `unwrap_or` fallback is unreachable.
-    let per_us = 1_000_000u64
-        .checked_div(u64::from(fps.max(1)))
-        .unwrap_or(1)
-        .max(1);
+    // `checked_div` (not `/`) satisfies the arithmetic-side-effects lint; the `fps > 0` guard above
+    // makes the divisor non-zero, so the `unwrap_or` fallback is unreachable.
+    let per_us = 1_000_000u64.checked_div(u64::from(fps)).unwrap_or(1).max(1);
     let mut ticker = tokio::time::interval(Duration::from_micros(per_us));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -950,6 +957,12 @@ async fn run_video_stream(
                     error = %e,
                     "frame exceeds SHP 64 KiB cap — dropping; reduce --max-width or --bitrate-kbps"
                 );
+                // Re-arm a keyframe: if the dropped frame was the IDR, the encoder has already
+                // cleared its keyframe flag, so without this the stream would carry only P-frames
+                // referencing a keyframe the receiver never got (nothing decodes). The next frame
+                // is now forced back to an IDR (which may also drop if still oversize, but the
+                // stream self-heals once a frame fits rather than silently never decoding).
+                source.request_keyframe();
                 continue;
             }
         };

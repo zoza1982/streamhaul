@@ -55,6 +55,15 @@ use streamhaul_webrtc_host::VideoFrameSource;
 /// # Wrap order
 ///
 /// `X11ScreenCapturer → DownscaleCapturer → EvenDimCapturer → LiveFrameSource`
+///
+/// # Assumptions
+///
+/// The inner capturer's [`resolution`](ScreenCapturer::resolution) must be **cheap** (it is read
+/// more than once per frame to derive the downscale factor) and **stable** for the adapter's
+/// lifetime (the factor is computed from it while the per-frame copy uses the actual frame's
+/// dimensions). A mid-stream resolution change is defended against — the packed-stride check in
+/// [`next_frame`](Self::next_frame) rejects a frame whose size doesn't match its declared
+/// dimensions — but a stable source (e.g. `X11ScreenCapturer` on a fixed display) is expected.
 pub struct DownscaleCapturer<C> {
     inner: C,
     max_width: u32,
@@ -290,6 +299,12 @@ impl<C: ScreenCapturer> VideoFrameSource for LiveFrameSource<C> {
             }
         }
     }
+
+    fn request_keyframe(&mut self) {
+        // Force the next encoded frame back to an IDR — the streamer calls this after dropping an
+        // oversize frame so the stream recovers a decodable keyframe (see `VideoFrameSource`).
+        self.encoder.request_keyframe();
+    }
 }
 
 #[cfg(test)]
@@ -352,6 +367,31 @@ mod tests {
         assert!(
             payload.len() <= usize::from(u16::MAX),
             "frame must fit in SHP 64 KB cap: {} bytes",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn downscaled_oversize_frame_encodes_within_shp_cap() {
+        // Exercise the REAL downscale copy path (factor > 1) through the encoder + size cap: a large
+        // 1920×1440 source at --max-width 480 → factor 4 → 480×360, then encode. Asserts the encoded
+        // frame is a valid Annex-B IDR that fits the SHP 64 KiB cap (the whole point of downscaling).
+        let cap = SyntheticCapturer::new(Resolution::new(1920, 1440), 30);
+        let dc = DownscaleCapturer::new(cap, 480);
+        assert_eq!(dc.factor(), 4);
+        assert_eq!(dc.resolution(), Resolution::new(480, 360));
+        let even = EvenDimCapturer::new(dc);
+        let mut src = LiveFrameSource::new(even, 2_000, 30).expect("LiveFrameSource init");
+
+        let (frame_type, payload) = src.next_frame().expect("first frame must succeed");
+        assert_eq!(frame_type, FrameType::Idr);
+        assert!(
+            payload.starts_with(&[0, 0, 0, 1]) || payload.starts_with(&[0, 0, 1]),
+            "payload must be Annex-B"
+        );
+        assert!(
+            payload.len() <= usize::from(u16::MAX),
+            "downscaled frame must fit the SHP 64 KiB cap: {} bytes",
             payload.len()
         );
     }
