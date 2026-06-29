@@ -39,6 +39,7 @@
 //! | [`TargetRect`] | Virtual-desktop bounds (supports negative origins for multi-monitor) |
 //! | [`NoopInjector`] | Accepts and drops every event — useful as a placeholder |
 //! | [`RecordingInjector`] | Records every injected event for test assertions |
+//! | [`RateLimiter`] | Token-bucket rate cap for hostile pointer-move floods (host side) |
 //! | [`InputError`] | `thiserror`-derived error for injection failures |
 
 #![deny(missing_docs)]
@@ -47,10 +48,12 @@ mod coord;
 mod error;
 mod injector;
 mod noop;
+mod rate_limiter;
 mod recording;
 
 pub use coord::{CoordMapper, MappedPoint, TargetRect};
 pub use error::InputError;
 pub use injector::InputInjector;
 pub use noop::NoopInjector;
+pub use rate_limiter::RateLimiter;
 pub use recording::RecordingInjector;
