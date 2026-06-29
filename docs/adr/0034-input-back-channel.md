@@ -55,12 +55,19 @@ Add a browser→host input back-channel on the **same** "shp" DataChannel.
   is up — same as video).
 - **Negative / trade-offs:** input latency is bounded by the frame interval (the sequential
   drain-between-frames); a dedicated low-latency input path (a separate Input channel + task) is a
-  follow-up if needed. The bounded injection queue **drops events under a sustained flood** — and
-  since input has press/release pairing, a dropped key-up/button-up could leave a key or modifier
-  *stuck* on the controlled desktop. The threat is bounded (the peer is already DTLS-pinned +
-  authenticated, and a human can't overflow the queue), but a robust fix — tracking pressed state at
-  the inject seam and auto-releasing on gaps / session end — is a tracked follow-up. No explicit
-  rate-limiting beyond the queue depth yet. Coordinates are normalized (0..=65535); per-monitor
-  mapping is the injector's responsibility (`CoordMapper`).
+  follow-up if needed. The bounded injection queue **drops events under a sustained flood** — and a
+  dropped button-up could leave a mouse button *stuck*. **Mitigated:** the injection thread calls
+  `InputInjector::release_all()` on session end, so a disconnect can't leave a button held. This is
+  implemented on **all three OS backends** — `XTestInjector` (Linux), `CgEventInjector` (macOS), and
+  `SendInputInjector` (Windows) each release any button still set in their `prev_button_mask`. On
+  every backend keys/modifiers are emitted as **atomic press+release pairs** so they never latch —
+  the latched mouse-button state is the only stuck-state surface, and it is now released everywhere.
+  (The Linux path is verified end-to-end against the X server via `QueryPointer`; the macOS/Windows
+  overrides assert the tracked-state bookkeeping on their CI runners, with live OS-effect validation
+  deferred to hardware per R-MAC-TCC / R-WIN-INTERACTIVE.) Still deferred: *mid-session* gap
+  detection (a button-up dropped mid-stream stays stuck until session end; needs input sequence
+  numbers). No explicit rate-limiting beyond the queue depth yet.
+  Coordinates are normalized (0..=65535); per-monitor mapping is the injector's responsibility
+  (`CoordMapper`).
 - **Follow-ups:** a dedicated Input channel/task for lower latency; input rate-limiting; clipboard;
   multi-monitor coordinate mapping; macOS/Windows injectors on the preview host.

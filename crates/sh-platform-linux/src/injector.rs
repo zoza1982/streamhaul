@@ -50,6 +50,16 @@ const BUTTON_RELEASE: u8 = 5;
 const KEY_PRESS: u8 = 2;
 const KEY_RELEASE: u8 = 3;
 
+/// Button bit-mask → X11 button-number mapping, shared by the `Button` inject arm and
+/// `release_all`. Only bits 0–2 are defined; bits 3–7 are reserved and silently ignored.
+/// `(mask, x11_button)` pairs — avoids arithmetic that would trip
+/// `clippy::arithmetic_side_effects`.
+const BUTTON_MAP: [(u8, u8); 3] = [(0x01, 1), (0x02, 2), (0x04, 3)];
+
+/// Mask of the button bits this injector actually tracks (bits 0–2). Reserved bits 3–7 are
+/// ignored, so `prev_button_mask & DEFINED_BUTTON_BITS == 0` means nothing is really held.
+const DEFINED_BUTTON_BITS: u8 = 0x07;
+
 /// An [`InputInjector`] that synthesises X11 events via the XTEST extension.
 ///
 /// Construct once per session. The constructor **fails closed** if the X server does not
@@ -275,11 +285,7 @@ impl InputInjector for XTestInjector {
                 let prev = self.prev_button_mask;
                 let changed = curr ^ prev;
 
-                // Button bit-to-X11-button mapping (see module-level docs).
-                // Only bits 0–2 are defined; bits 3–7 are silently ignored.
-                // (mask, x11_button) pairs — avoids arithmetic that triggers
-                // the `clippy::arithmetic_side_effects` lint.
-                const BUTTON_MAP: [(u8, u8); 3] = [(0x01, 1), (0x02, 2), (0x04, 3)];
+                // Button bit-to-X11-button mapping: module-level `BUTTON_MAP`.
                 // Record the new mask as the baseline BEFORE sending, so a mid-loop send error does
                 // not leave `prev` stale (which would re-send an already-applied press next event).
                 // The X server only observes these requests at the `flush()` below, so the order of
@@ -420,6 +426,32 @@ impl InputInjector for XTestInjector {
         }
 
         Ok(())
+    }
+
+    /// Release every mouse button still held down (per `prev_button_mask`) and reset the tracked
+    /// state. Called on session end so a button whose release event was lost can't leave the X
+    /// session with a button stuck. Best-effort: X errors are ignored (the session is ending);
+    /// keys/modifiers are emitted as atomic press+release pairs in `inject`, so they never latch
+    /// and need no release here.
+    fn release_all(&mut self) {
+        let held = self.prev_button_mask;
+        // Only bits 0–2 map to real buttons; if no defined bit is set there is nothing to
+        // release (and we avoid a spurious `flush`).
+        if held & DEFINED_BUTTON_BITS == 0 {
+            return;
+        }
+        self.prev_button_mask = 0;
+        for (mask, x_button) in BUTTON_MAP {
+            if held & mask == 0 {
+                continue;
+            }
+            debug!(x_button, "XTestInjector: release_all releasing held button");
+            // Best-effort: ignore the result, the session is ending.
+            let _ = self
+                .conn
+                .xtest_fake_input(BUTTON_RELEASE, x_button, 0, self.root, 0, 0, 0);
+        }
+        let _ = self.conn.flush();
     }
 }
 
@@ -879,5 +911,81 @@ mod tests {
             matches!(inj.inject(&ev), Err(InputError::Unsupported { .. })),
             "unknown HID must return Unsupported"
         );
+    }
+
+    #[test]
+    fn release_all_releases_held_buttons_and_resets_state() {
+        if std::env::var_os("DISPLAY").is_none() {
+            return;
+        }
+        let mut inj = make_injector();
+        // Separate connection for QueryPointer, so we observe the X server's view of button
+        // state (not just the injector's tracked field).
+        let (conn, screen_num) = x11rb::connect(None).expect("connect for query_pointer");
+        let root = conn.setup().roots[screen_num].root;
+
+        // X11 QueryPointer `mask`: button N occupies bit (7 + N). Buttons 1/2/3 → 0x100/0x200/0x400.
+        const SERVER_BUTTON_BITS: u16 = 0x0100 | 0x0200 | 0x0400;
+        let server_buttons = || -> u16 {
+            conn.sync().expect("sync");
+            let mask = conn
+                .query_pointer(root)
+                .expect("QueryPointer send")
+                .reply()
+                .expect("QueryPointer reply")
+                .mask;
+            u16::from(mask) & SERVER_BUTTON_BITS
+        };
+
+        // The injector posts XTEST events on its OWN connection and only `flush()`es (no round-trip),
+        // while we read state on connection B. X gives no cross-client ordering guarantee, so we must
+        // force a round-trip on the injector's connection to be sure the server has applied its events
+        // before connection B queries — otherwise the assertions below could race (CI flake).
+        let sync_injector =
+            |inj: &XTestInjector| inj.conn.sync().expect("injector connection sync");
+
+        // Press all three mouse buttons at once (bits 0,1,2) — now tracked as held.
+        let down = InputEvent {
+            event_type: EventType::Button,
+            modifiers: Modifiers::empty(),
+            pointer_x: 0,
+            pointer_y: 0,
+            button_mask: 0x07,
+            key_code: 0,
+            scroll_x: 0,
+            scroll_y: 0,
+            pressure: 0,
+        };
+        inj.inject(&down).expect("buttons-down inject");
+        sync_injector(&inj);
+        assert_eq!(
+            inj.prev_button_mask, 0x07,
+            "all three buttons must be tracked as held"
+        );
+        assert_eq!(
+            server_buttons(),
+            SERVER_BUTTON_BITS,
+            "X server must show all three buttons pressed before release_all"
+        );
+
+        // Session ends with the buttons still held (release events 'lost'): release_all must clear
+        // the held state AND make the X server release every button, so nothing is left stuck.
+        inj.release_all();
+        sync_injector(&inj);
+        assert_eq!(
+            inj.prev_button_mask, 0,
+            "release_all must clear tracked held buttons"
+        );
+        assert_eq!(
+            server_buttons(),
+            0,
+            "X server must show all buttons released after release_all"
+        );
+
+        // Idempotent: a second call on a clean state is a no-op (no panic, state stays clear).
+        inj.release_all();
+        sync_injector(&inj);
+        assert_eq!(inj.prev_button_mask, 0);
+        assert_eq!(server_buttons(), 0);
     }
 }

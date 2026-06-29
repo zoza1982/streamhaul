@@ -43,6 +43,10 @@ const FLAG_CONTROL: u64 = 0x0004_0000; // kCGEventFlagMaskControl
 const FLAG_ALTERNATE: u64 = 0x0008_0000; // kCGEventFlagMaskAlternate (Option)
 const FLAG_COMMAND: u64 = 0x0010_0000; // kCGEventFlagMaskCommand
 
+/// Mask of the button bits this injector tracks (bits 0–2). Reserved bits 3–7 are ignored, so
+/// `prev_button_mask & DEFINED_BUTTON_BITS == 0` means nothing is really held.
+const DEFINED_BUTTON_BITS: u8 = 0x07;
+
 /// An [`InputInjector`] that synthesises macOS input via CoreGraphics `CGEvent`.
 ///
 /// Construct once per session. The constructor **fails closed** if the HID event source cannot be
@@ -229,6 +233,41 @@ impl InputInjector for CgEventInjector {
         }
         Ok(())
     }
+
+    /// Release every mouse button still held down (per `prev_button_mask`) and reset the tracked
+    /// state. Called on session end so a button whose release event was lost can't leave the
+    /// controlled machine with a button stuck. Best-effort: a missing event source or a failed
+    /// `CGEvent` is ignored (the session is ending). Keys/modifiers are emitted as atomic
+    /// press+release pairs in `inject`, so they never latch and need no release here.
+    fn release_all(&mut self) {
+        let held = self.prev_button_mask;
+        // Only bits 0–2 map to real buttons; nothing tracked means nothing to release.
+        if held & DEFINED_BUTTON_BITS == 0 {
+            return;
+        }
+        // Best-effort: without an event source there is nothing we can post — leave the tracked
+        // state intact so a later call could still retry (the session is ending anyway).
+        let Ok(source) = event_source() else {
+            return;
+        };
+        // Reset only now that we know we can post: makes a re-entrant/idempotent call a cheap
+        // early-return, and a partial mid-loop failure still leaves the mask clean.
+        self.prev_button_mask = 0;
+        // (mask, button, up_type) — same buttons as the Button inject arm.
+        const RELEASE_MAP: [(u8, CGMouseButton, CGEventType); 3] = [
+            (0x01, CGMouseButton::Left, CGEventType::LeftMouseUp),
+            (0x02, CGMouseButton::Center, CGEventType::OtherMouseUp),
+            (0x04, CGMouseButton::Right, CGEventType::RightMouseUp),
+        ];
+        for (mask, button, up) in RELEASE_MAP {
+            if held & mask == 0 {
+                continue;
+            }
+            debug!("CgEventInjector: release_all releasing held button");
+            // Best-effort: ignore the result, the session is ending.
+            let _ = self.post_mouse(&source, up, button);
+        }
+    }
 }
 
 // macOS runtime smoke tests. These run on the macos-latest CI runner. They construct the injector
@@ -285,6 +324,34 @@ mod mac_tests {
             inj.inject(&ev(EventType::Touch)),
             Err(InputError::Unsupported { .. })
         ));
+    }
+
+    #[test]
+    fn release_all_clears_tracked_buttons_and_is_idempotent() {
+        // Without Accessibility permission the posts are no-ops, so (like the other mac smoke
+        // tests) we assert the injector's tracked state, not an OS effect. This guards the
+        // bookkeeping that prevents a stuck button when a session ends mid-press.
+        let mut inj = CgEventInjector::new().expect("construct injector on main display");
+        // Press all three buttons (bits 0,1,2) — now tracked as held.
+        inj.inject(&InputEvent {
+            button_mask: 0x07,
+            ..ev(EventType::Button)
+        })
+        .unwrap();
+        assert_eq!(
+            inj.prev_button_mask, 0x07,
+            "buttons must be tracked as held"
+        );
+
+        inj.release_all();
+        assert_eq!(
+            inj.prev_button_mask, 0,
+            "release_all must clear held buttons"
+        );
+
+        // Idempotent: a second call on a clean state stays clear (and must not panic).
+        inj.release_all();
+        assert_eq!(inj.prev_button_mask, 0);
     }
 
     #[test]
