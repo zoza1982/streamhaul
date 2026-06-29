@@ -1,0 +1,62 @@
+[package]
+name = "streamhaul-webrtc-preview"
+description = "Workspace-excluded preview binary: streams the real X11 screen as live OpenH264 H.264 video over the identity-bound WebRTC DataChannel (ADR-0032). Licensing-gated — NOT in the default OSS build."
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/zoza1982/streamhaul"
+rust-version = "1.82"
+
+# EXCLUDED from the workspace (root Cargo.toml `exclude` list):
+#  1. It depends on `sh-codec-openh264` which builds the vendored OpenH264 C source.
+#  2. Keeping it out of the workspace means `cargo build/clippy/test --workspace --all-features`
+#     never compiles that C and the default OSS build links no H.264 encoder (ADR-0028/0029).
+# Built only by its dedicated `webrtc-preview` CI job (and locally on demand).
+
+[lib]
+name = "streamhaul_webrtc_preview"
+path = "src/lib.rs"
+
+[[bin]]
+name = "streamhaul-webrtc-preview"
+path = "src/main.rs"
+
+[dependencies]
+# The connection-logic library extracted in ADR-0032 (lib + bin split of streamhaul-webrtc-host).
+streamhaul-webrtc-host = { path = "../streamhaul-webrtc-host" }
+# EvenDimCapturer: reused from ADR-0030 (crops frames to even dims for OpenH264 4:2:0).
+streamhaul-preview = { path = "../streamhaul-preview" }
+# OpenH264 software encoder — builds vendored C. This is the excluded-crate dep (ADR-0028/0029).
+sh-codec-openh264 = { path = "../../crates/sh-codec-openh264" }
+# Media traits (ScreenCapturer, VideoEncoder, VideoFrame, SyntheticCapturer for tests).
+sh-media = { path = "../../crates/sh-media" }
+# SHP framing types (FrameType, CommonHeader, COMMON_HEADER_LEN).
+sh-protocol = { path = "../../crates/sh-protocol" }
+sh-types = { path = "../../crates/sh-types" }
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+
+# Real screen capture is X11-only (Linux). On other targets the binary errors out cleanly.
+[target.'cfg(target_os = "linux")'.dependencies]
+sh-platform-linux = { path = "../../crates/sh-platform-linux" }
+
+# Mirror the workspace lints exactly (this crate is excluded so cannot inherit them).
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"
+arithmetic_side_effects = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
