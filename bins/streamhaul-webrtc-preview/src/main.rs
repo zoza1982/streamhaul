@@ -43,6 +43,8 @@ struct Args {
     fps: u32,
     /// Total number of SHP video frames to send before exiting.
     frames: usize,
+    /// Maximum bytes per SHP fragment (frames larger than this are fragmented; ADR-0033).
+    max_fragment_bytes: usize,
 }
 
 impl Args {
@@ -50,10 +52,14 @@ impl Args {
         let mut signaling_url = "ws://127.0.0.1:8765".to_owned();
         let mut session_id_hex = "0".repeat(32);
         let mut bind = "127.0.0.1:0".to_owned();
-        let mut max_width: u32 = 960;
+        // Default to 4K: SHP fragmentation (ADR-0033) removed the 64 KiB per-frame cap, so typical
+        // displays now stream at full resolution. `--max-width` remains a bandwidth/CPU knob.
+        let mut max_width: u32 = 3840;
         let mut bitrate_kbps: u32 = 4_000;
         let mut fps: u32 = 30;
         let mut frames: usize = 120;
+        // Default to the SHP wire cap; the encoder's frames are fragmented to fit.
+        let mut max_fragment_bytes: usize = usize::from(u16::MAX);
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -91,6 +97,19 @@ impl Args {
                         .context("--fps must be a positive integer")?;
                     anyhow::ensure!(fps > 0, "--fps must be > 0");
                 }
+                "--max-fragment-bytes" => {
+                    max_fragment_bytes = args
+                        .next()
+                        .context("--max-fragment-bytes requires a value")?
+                        .parse()
+                        .context("--max-fragment-bytes must be an integer")?;
+                    // Floor at 1 KiB (see streamhaul-webrtc-host): a tiny value would need > 255
+                    // fragments per frame and drop every frame.
+                    anyhow::ensure!(
+                        max_fragment_bytes >= 1024,
+                        "--max-fragment-bytes must be >= 1024"
+                    );
+                }
                 "--frames" => {
                     frames = args
                         .next()
@@ -112,6 +131,7 @@ impl Args {
             bitrate_kbps,
             fps,
             frames,
+            max_fragment_bytes,
         })
     }
 }
@@ -165,9 +185,10 @@ async fn run_linux(args: Args) -> anyhow::Result<()> {
     // Build the capture chain:
     //   X11ScreenCapturer → DownscaleCapturer (≤ max_width px wide) → EvenDimCapturer → LiveFrameSource
     //
-    // DownscaleCapturer: keeps encoded IDRs under the SHP 16-bit payload_len cap (64 KiB).
+    // DownscaleCapturer: an OPTIONAL bandwidth/CPU knob. ADR-0033 SHP fragmentation removed the
+    //   64 KiB-per-frame correctness requirement, so this no longer caps resolution (default
+    //   max_width=3840 / 4K passes typical displays through). Lower --max-width to save bandwidth.
     //   Factor = ceil(screen_width / max_width), so a 1920-wide screen at max_width=960 → factor 2.
-    //   Fragmentation (the correct long-term fix) is deferred; see ADR-0032.
     //
     // EvenDimCapturer: satisfies OpenH264's 4:2:0 chroma requirement for even dimensions.
     //   Reused from ADR-0030 (streamhaul_preview::EvenDimCapturer).
@@ -188,6 +209,7 @@ async fn run_linux(args: Args) -> anyhow::Result<()> {
     let mode = StreamMode::Video {
         frames: args.frames,
         fps: args.fps,
+        max_fragment_bytes: args.max_fragment_bytes,
         source: Box::new(live_source),
     };
 
