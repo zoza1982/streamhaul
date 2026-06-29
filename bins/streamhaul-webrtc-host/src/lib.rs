@@ -1057,6 +1057,9 @@ async fn run_video_stream(
                 debug!(error = %e, "input injection failed");
             }
         }
+        // Session ended (queue closed): release any held buttons so a lost button-up event can't
+        // leave the controlled machine with a button stuck down (ADR-0034 follow-up).
+        injector.release_all();
     });
     info!(
         target = frames_to_send,
@@ -1071,9 +1074,20 @@ async fn run_video_stream(
 
     let mut sent: usize = 0;
     let mut sequence: u16 = 0;
+    // Captures an error that ends the stream early. We do NOT `?`-propagate from inside the loop:
+    // the teardown below (close the input queue + await the injection thread so `release_all`
+    // finishes) must run on *every* exit path, or an abnormal stream end could return before the
+    // held buttons are released (ADR-0034 stuck-button guarantee).
+    let mut stream_err: Option<anyhow::Error> = None;
     'stream: while sent < frames_to_send {
         ticker.tick().await;
-        let (frame_type, payload) = source.next_frame()?;
+        let (frame_type, payload) = match source.next_frame() {
+            Ok(v) => v,
+            Err(e) => {
+                stream_err = Some(e);
+                break 'stream;
+            }
+        };
         let n = sent as u64;
         // frame_id is a 24-bit wire field; mask into range. (`try_from` rather than `as u32` to
         // satisfy the cast-truncation lint; the mask guarantees it fits, so this never errors.)
@@ -1099,10 +1113,18 @@ async fn run_video_stream(
                 continue;
             }
         };
-        // fragments.len() <= 255 (the total_frags u8 cap), so this never errors — but propagate
-        // rather than fall back to a wrong count that would corrupt every later sequence number.
-        let num_frags =
-            u16::try_from(fragments.len()).context("fragment count exceeded u16 (invariant)")?;
+        // fragments.len() <= 255 (the total_frags u8 cap), so this never errors — but end the stream
+        // (running the teardown) rather than fall back to a wrong count that would corrupt every
+        // later sequence number.
+        let num_frags = match u16::try_from(fragments.len())
+            .context("fragment count exceeded u16 (invariant)")
+        {
+            Ok(v) => v,
+            Err(e) => {
+                stream_err = Some(e);
+                break 'stream;
+            }
+        };
         // Send every fragment in order. A send failure means the browser closed the DataChannel — a
         // NORMAL end of stream (the viewer disconnected), not a host error: exit 0.
         for frag in fragments {
@@ -1144,11 +1166,25 @@ async fn run_video_stream(
         }
     }
 
-    info!(frames = sent, "video stream complete");
-    // Close the input queue and let the injection thread drain + exit cleanly.
+    // Teardown — runs on EVERY exit (normal completion, peer close, or `stream_err`): close the
+    // input queue and await the injection thread so its final `release_all()` completes before we
+    // return. Dropping the `JoinHandle` would NOT cancel the blocking task, but it also wouldn't
+    // wait for it — so we await explicitly to make the stuck-button release a hard guarantee.
     drop(input_tx);
     let _ = inject_task.await;
-    Ok(())
+    match stream_err {
+        Some(e) => {
+            warn!(
+                frames = sent,
+                "video stream ended with error (held input released)"
+            );
+            Err(e)
+        }
+        None => {
+            info!(frames = sent, "video stream complete");
+            Ok(())
+        }
+    }
 }
 
 /// Decode one inbound DataChannel message as an [`InputEvent`], or `None` if it is not one.

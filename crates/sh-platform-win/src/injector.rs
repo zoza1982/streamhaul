@@ -63,6 +63,10 @@ const BUTTON_MAP: [(u8, DWORD, DWORD); 3] = [
     (0x04, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
 ];
 
+/// Mask of the button bits this injector tracks (bits 0–2). Reserved bits 3–7 are ignored, so
+/// `prev_button_mask & DEFINED_BUTTON_BITS == 0` means nothing is really held.
+const DEFINED_BUTTON_BITS: u8 = 0x07;
+
 /// An [`InputInjector`] that synthesises Windows input via `SendInput`.
 ///
 /// Construct once per session via [`SendInputInjector::new`]. The struct holds only `Send` data
@@ -296,6 +300,37 @@ impl InputInjector for SendInputInjector {
         }
         Ok(())
     }
+
+    /// Release every mouse button still held down (per `prev_button_mask`) and reset the tracked
+    /// state. Called on session end so a button whose release event was lost can't leave the
+    /// controlled machine with a button stuck. Best-effort: `SendInput` failures are ignored (the
+    /// session is ending). Keys/modifiers are emitted as atomic press+release pairs in `inject`,
+    /// so they never latch and need no release here.
+    fn release_all(&mut self) {
+        let held = self.prev_button_mask;
+        // Only bits 0–2 map to real buttons; nothing tracked means nothing to release.
+        if held & DEFINED_BUTTON_BITS == 0 {
+            return;
+        }
+        // Reset BEFORE the sends so a re-entrant/idempotent call is a cheap early-return.
+        self.prev_button_mask = 0;
+        // §7: log only the kind — never the mask value.
+        for (mask, _down_flag, up_flag) in BUTTON_MAP {
+            if held & mask == 0 {
+                continue;
+            }
+            debug!("SendInputInjector: release_all releasing held button");
+            // Best-effort: ignore the result, the session is ending.
+            let _ = send_mouse(MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: up_flag,
+                time: 0,
+                dwExtraInfo: 0,
+            });
+        }
+    }
 }
 
 // Windows runtime smoke tests. These run on the `windows-latest` CI runner, which provides an
@@ -378,5 +413,33 @@ mod win_tests {
             inj.inject(&ev(EventType::Pen)),
             Err(InputError::Unsupported { .. })
         ));
+    }
+
+    #[test]
+    fn release_all_clears_tracked_buttons_and_is_idempotent() {
+        // `SendInput` may be dropped by UIPI, so (like the other win smoke tests) we assert the
+        // injector's tracked state, not an OS effect. This guards the bookkeeping that prevents a
+        // stuck button when a session ends mid-press.
+        let mut inj = SendInputInjector::new().expect("construct SendInputInjector");
+        // Press all three buttons (bits 0,1,2) — now tracked as held.
+        inj.inject(&InputEvent {
+            button_mask: 0x07,
+            ..ev(EventType::Button)
+        })
+        .unwrap();
+        assert_eq!(
+            inj.prev_button_mask, 0x07,
+            "buttons must be tracked as held"
+        );
+
+        inj.release_all();
+        assert_eq!(
+            inj.prev_button_mask, 0,
+            "release_all must clear held buttons"
+        );
+
+        // Idempotent: a second call on a clean state stays clear (and must not panic).
+        inj.release_all();
+        assert_eq!(inj.prev_button_mask, 0);
     }
 }

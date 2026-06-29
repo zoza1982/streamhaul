@@ -46,4 +46,22 @@ pub trait InputInjector: Send {
     /// - [`InputError::ZeroSizeAxis`] if the injector was constructed with an invalid target rect
     ///   (implementations should validate at construction time, not here).
     fn inject(&mut self, event: &InputEvent) -> Result<(), InputError>;
+
+    /// Release any input state this injector is **holding down** — pressed mouse buttons (and, for
+    /// backends that latch them, modifiers/keys) — returning the OS to a neutral state.
+    ///
+    /// The host calls this when a remote-control session ends (the client disconnected) so a button
+    /// whose "release" event was lost in transit can't leave the controlled machine with a button
+    /// stuck down. It is **best-effort** and idempotent: failures are swallowed (the session is
+    /// already ending) and re-calling it on already-neutral state is a cheap no-op.
+    ///
+    /// The classifier for whether an injector must override this is its **state model**, not its
+    /// device scope. The OS backends (`sh-platform-{linux,mac,win}`) hold latched mouse-button
+    /// state (`prev_button_mask`) and so override this to release any held button — even though
+    /// they also handle keyboard input, which they emit as self-contained atomic press+release
+    /// pairs that never latch. The **default is a no-op**, correct only for injectors that emit
+    /// every event as an atomic press+release pair and hold no OS-level latched state (e.g.
+    /// [`crate::NoopInjector`], [`crate::RecordingInjector`]). A new backend that latches any state
+    /// (buttons, modifiers, keys) **must** override this and release it.
+    fn release_all(&mut self) {}
 }
