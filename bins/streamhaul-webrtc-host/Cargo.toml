@@ -13,6 +13,10 @@ rust-version.workspace = true
 
 [dependencies]
 sh-transport = { path = "../../crates/sh-transport" }
+# sh-protocol: SHP CommonHeader/VideoHeader encoders to frame the baked H.264 clip the host streams
+# to the browser (ADR-0031). No codec dep — the clip is pre-encoded bytes, so the OSS build links
+# no H.264 encoder (ADR-0028/0029).
+sh-protocol = { path = "../../crates/sh-protocol" }
 sh-signaling = { path = "../../crates/sh-signaling", features = ["insecure-lan"] }
 # sh-crypto: the identity-bound Noise XK handshake + BindCert (P5-3 Stage 2, ADR-0014/0023). The
 # host runs the responder side, commits its own DTLS fingerprint, and extracts the browser's
