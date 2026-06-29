@@ -27,9 +27,34 @@
 //! **Noise/BindCert ↔ DTLS** layer, which is independent of (and not a substitute for) the
 //! signaling-peer authentication (R-SIG-AUTH) deferred on this path.
 
+use std::io::Write as _;
+
 use anyhow::Context as _;
+use sh_input::{InputError, InputInjector};
+use sh_protocol::InputEvent;
 use streamhaul_webrtc_host::{parse_session_id, BakedFrameSource, HostConfig, StreamMode};
 use tracing::{info, warn};
+
+/// An [`InputInjector`] that does not touch the OS — it prints a machine-readable `INPUT_INJECTED`
+/// line per event to stdout. The workspace `streamhaul-webrtc-host` runs in CI with no display, so
+/// it cannot inject for real; this proves browser→host input was received + decoded (the e2e greps
+/// for the line). The live `streamhaul-webrtc-preview` binary uses a real X11 injector instead.
+#[derive(Default)]
+struct StdoutInputLogger {
+    count: u64,
+}
+
+impl InputInjector for StdoutInputLogger {
+    fn inject(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        self.count = self.count.saturating_add(1);
+        println!(
+            "INPUT_INJECTED seq={} type={:?}",
+            self.count, event.event_type
+        );
+        std::io::stdout().flush().ok();
+        Ok(())
+    }
+}
 
 /// Parsed command-line arguments.
 struct Args {
@@ -153,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
             fps: args.fps,
             max_fragment_bytes: args.max_fragment_bytes,
             source: Box::new(BakedFrameSource::new()),
+            input: Box::new(StdoutInputLogger::default()),
         }
     } else {
         StreamMode::Echo

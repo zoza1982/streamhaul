@@ -102,6 +102,8 @@ export interface InteropResult {
    * `VideoDecoder.isConfigSupported`). `null` = couldn't probe. API presence ≠ codec support, so the
    * decode assertion is gated on this, not on `webCodecs`. */
   h264DecodeSupported: boolean | null;
+  /** VIDEO mode: count of synthetic input events the browser sent to the host (remote control). */
+  inputSent: number;
   /** Error message, if any. */
   error: string | null;
 }
@@ -155,6 +157,7 @@ async function runInteropTest(): Promise<InteropResult> {
     framesDecoded: 0,
     webCodecs: false,
     h264DecodeSupported: null,
+    inputSent: 0,
     error: null,
   };
 
@@ -374,6 +377,27 @@ async function runInteropTest(): Promise<InteropResult> {
       ]);
 
       result.connected = true;
+
+      // CONTROL: send a few synthetic input events (browser→host) to prove remote control. The host
+      // decodes each 16-byte InputEvent off the DataChannel and injects it; the spec asserts the
+      // host's `INPUT_INJECTED` log. EventType.PointerMove = 0; normalized coords in 0..=65535.
+      // `send_frame` writes raw bytes to the single "shp" RTCDataChannel — the same call serves both
+      // the video-test frames and input events (they share the one channel; the host demuxes by size).
+      for (let i = 0; i < 5; i++) {
+        try {
+          const ev = bridge.encode_input_event(0, 0, 10_000 + i * 100, 20_000, 0, 0, 0, 0, 0);
+          viewer.send_frame(ev);
+          result.inputSent += 1;
+        } catch {
+          /* channel closed / not writable — best-effort, the host-side assertion is authoritative */
+        }
+      }
+      // Keep the session alive long enough for the input to be transmitted, drained by the host
+      // (it polls between video frames), and injected — otherwise the `finally` `viewer.close()`
+      // (which fires as soon as this function returns, e.g. when H.264 decode is unsupported and the
+      // decode-wait below is skipped) can tear down DTLS/SCTP before the input bytes leave the wire.
+      await new Promise((r) => window.setTimeout(r, 1_500));
+
       // Decode is asserted by the spec only when H.264 decode is actually SUPPORTED (probed via
       // VideoDecoder.isConfigSupported — API presence alone is not enough; headless Firefox may lack
       // the codec). When supported, poll up to 3 s for an async decode output to land (a fixed sleep
