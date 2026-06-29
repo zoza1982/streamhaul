@@ -28,6 +28,9 @@
  *   - `…&mitm=1`                      — a man-in-the-middle SWAPS the host's answer SDP
  *     `a=fingerprint` after the BindCert committed a different one → `connect_as_offerer` MUST
  *     ABORT with a pin mismatch (non-vacuous MITM rejection).
+ *   - `…&video=1`                     — the host streams baked H.264 SHP video frames (ADR-0031);
+ *     the browser parses + WebCodecs-decodes them. Assert `framesReachedDecoder >= 1` (and
+ *     `framesDecoded >= 1` only when `h264DecodeSupported` is true).
  *
  * # Security note
  *
@@ -44,6 +47,36 @@ import {
   MessageKind,
   ENVELOPE_HEADER_LEN,
 } from "../src/signaling/envelope.js";
+// VIDEO mode (?video=1): parse inbound SHP video frames and decode them with WebCodecs, proving
+// the browser can render the H.264 stream the native host produces (P5-3 Stage 2 + ADR-0031).
+import { parseVideoFrame, isH264Keyframe } from "../src/protocol/frame.js";
+import { CanvasH264Decoder, isWebCodecsAvailable } from "../src/view/decoder.js";
+
+/** avc1 codec string of the baked fixture (H.264 Baseline 0x42, level 0x1e / 3.0 — OpenH264 output,
+ * matching the loopback e2e's probe). Used only to probe decode SUPPORT; the real decode path
+ * derives the exact codec string from the stream's SPS. */
+const FIXTURE_CODEC = "avc1.42001e";
+
+/** Probe whether this browser can actually decode the fixture's H.264 — `null` if it can't be
+ * determined. API presence (`isWebCodecsAvailable`) is NOT the same as codec support: headless
+ * Firefox exposes `VideoDecoder` but may lack the H.264 codec, so the decode assertion is gated on
+ * this probe (mirrors `loopback.ts`). */
+async function probeH264DecodeSupport(): Promise<boolean | null> {
+  try {
+    const VD = (
+      globalThis as unknown as {
+        VideoDecoder?: {
+          isConfigSupported?: (c: { codec: string }) => Promise<{ supported?: boolean }>;
+        };
+      }
+    ).VideoDecoder;
+    if (VD?.isConfigSupported === undefined) return null;
+    const support = await VD.isConfigSupported({ codec: FIXTURE_CODEC });
+    return support.supported === true;
+  } catch {
+    return null;
+  }
+}
 
 /** The result written to `window.__interopResult` after the test completes. */
 export interface InteropResult {
@@ -57,6 +90,16 @@ export interface InteropResult {
   pinUsedHex: string | null;
   /** True iff the MITM SDP-fingerprint swap was REJECTED by the fail-closed pin gate. */
   mitmRejected: boolean;
+  /** VIDEO mode: count of inbound frames that parsed as valid SHP video frames. */
+  framesReachedDecoder: number;
+  /** VIDEO mode: count of frames the WebCodecs decoder successfully decoded. */
+  framesDecoded: number;
+  /** VIDEO mode: whether the running browser exposes the WebCodecs `VideoDecoder` API. */
+  webCodecs: boolean;
+  /** VIDEO mode: whether this browser can actually DECODE the fixture's H.264 (probed via
+   * `VideoDecoder.isConfigSupported`). `null` = couldn't probe. API presence ≠ codec support, so the
+   * decode assertion is gated on this, not on `webCodecs`. */
+  h264DecodeSupported: boolean | null;
   /** Error message, if any. */
   error: string | null;
 }
@@ -106,17 +149,28 @@ async function runInteropTest(): Promise<InteropResult> {
     frameHex: null,
     pinUsedHex: null,
     mitmRejected: false,
+    framesReachedDecoder: 0,
+    framesDecoded: 0,
+    webCodecs: false,
+    h264DecodeSupported: null,
     error: null,
   };
 
   let ws: WebSocket | null = null;
   let viewer: WebClient | null = null;
+  // VIDEO mode only: the WebCodecs H.264 decoder painting into the hidden canvas. Held here so the
+  // `finally` block can close it (release codec/GPU resources) regardless of how the run ends.
+  let decoder: CanvasH264Decoder | null = null;
 
   try {
     const params = new URLSearchParams(window.location.search);
     const sessionHex = params.get("session") ?? "0".repeat(32);
     const hostFp = params.get("host_fp") ?? "";
     const mitm = params.get("mitm") === "1";
+    // VIDEO mode: instead of echoing a HELLO frame, the host streams baked H.264 SHP video
+    // frames; the browser parses + decodes them and we assert frames reached the decoder.
+    const video = params.get("video") === "1";
+    result.webCodecs = isWebCodecsAvailable();
 
     if (!/^[0-9a-f]{64}$/.test(hostFp)) {
       result.error = `host_fp must be 64 lowercase hex chars, got ${hostFp.length}`;
@@ -203,11 +257,34 @@ async function runInteropTest(): Promise<InteropResult> {
         });
       }
     };
-    // Attach the DataChannel frame sink BEFORE connecting so no echo is missed.
-    const echoPromise = new Promise<Uint8Array>((resolve) => {
-      // viewer is non-null in this scope.
-      viewer!.on_frame((frame: Uint8Array) => resolve(frame));
-    });
+    // Attach the DataChannel frame sink BEFORE connecting so no frame is missed.
+    // - ECHO/MITM mode: resolve `echoPromise` on the FIRST inbound frame (the host's echo).
+    // - VIDEO mode: register a PERSISTENT handler that parses each SHP video frame and feeds it to
+    //   the WebCodecs decoder, counting frames that reached the decoder and frames decoded.
+    let echoPromise: Promise<Uint8Array> | null = null;
+    if (video) {
+      const canvas = document.getElementById("screen") as HTMLCanvasElement;
+      decoder = new CanvasH264Decoder(canvas);
+      const dec = decoder; // narrow to non-null for the closure
+      viewer!.on_frame((frame: Uint8Array) => {
+        // `bridge` is in scope (loaded above). parseVideoFrame returns null for a non-video /
+        // malformed frame (never throws) — drop those without counting them.
+        const parsed = parseVideoFrame(bridge, frame);
+        if (!parsed) return;
+        result.framesReachedDecoder += 1;
+        try {
+          dec.pushAnnexB(parsed.payload, isH264Keyframe(parsed));
+        } catch {
+          /* ignore decode errors — a hostile/garbage frame must not crash the viewer */
+        }
+        result.framesDecoded = dec.stats.framesDecoded;
+      });
+    } else {
+      echoPromise = new Promise<Uint8Array>((resolve) => {
+        // viewer is non-null in this scope.
+        viewer!.on_frame((frame: Uint8Array) => resolve(frame));
+      });
+    }
 
     // ── 6. Send the offer FIRST, then trickle candidates. ──
     // The native host's `receive_offer` loop drops any non-Offer envelope, so candidates sent
@@ -258,28 +335,64 @@ async function runInteropTest(): Promise<InteropResult> {
       }
     });
 
-    // ── 8. Once the DataChannel opens, send the HELLO frame so the host echoes it. ──
+    // ── 8. Once the DataChannel opens, send the HELLO frame. ──
     // NOTE: the offerer's own channel-open is not exposed by WebClient (`on_data_channel` is the
     // ANSWERER's `ondatachannel`, which does not fire for the offerer's `createDataChannel`
     // channel). We therefore use the first successful `send_frame` as the open signal, and treat a
     // never-opens condition as a DISTINCT failure (rejects below) instead of masking it as the
-    // generic echo timeout.
+    // generic timeout. In VIDEO mode we STILL send HELLO so the host's `accept_channel()` resolves
+    // and it starts streaming (the host ignores the HELLO body in video mode).
     const sentFrame = sendFrameWhenOpen(viewer, SHP_HELLO_FRAME, 30_000);
-    // Surface a never-opens rejection if it loses the race to the echo (so it isn't unhandled).
+    // Surface a never-opens rejection if it loses the race below (so it isn't unhandled).
     sentFrame.catch(() => undefined);
 
-    // ── 9. Wait for the DataChannel echo (proves the identity-bound session connected). ──
-    // Race the echo against (a) a channel-never-opened rejection and (b) an overall deadline, so a
-    // failure to open the channel surfaces its specific cause rather than a generic timeout.
-    const echoFrame = await Promise.race([
-      echoPromise,
-      sentFrame.then(() => new Promise<Uint8Array>(() => {})), // never resolves on its own; lets its rejection win
-      timeoutReject<Uint8Array>(30_000, "timed out waiting for echo frame"),
-    ]);
+    if (video) {
+      // ── 9a. VIDEO mode: wait until at least one SHP video frame reached the decoder. ──
+      // Poll every 100 ms up to 30 s. Race against the channel-never-opened rejection so a failure
+      // to open surfaces its specific cause rather than a generic timeout.
+      const deadline = Date.now() + 30_000;
+      const framesArrived = (async (): Promise<void> => {
+        while (result.framesReachedDecoder < 1) {
+          if (Date.now() > deadline) {
+            throw new Error("timed out waiting for a video frame from the native host");
+          }
+          await new Promise((r) => window.setTimeout(r, 100));
+        }
+      })();
+      await Promise.race([
+        framesArrived,
+        sentFrame.then(() => new Promise<void>(() => {})), // never resolves on its own; lets its rejection win
+      ]);
 
-    result.connected = true;
-    result.echoed = true;
-    result.frameHex = toHex(echoFrame);
+      result.connected = true;
+      // Decode is asserted by the spec only when H.264 decode is actually SUPPORTED (probed via
+      // VideoDecoder.isConfigSupported — API presence alone is not enough; headless Firefox may lack
+      // the codec). When supported, poll up to 3 s for an async decode output to land (a fixed sleep
+      // can under-report on a slow box); when unsupported/unknown, skip the wait.
+      result.h264DecodeSupported = await probeH264DecodeSupport();
+      if (result.h264DecodeSupported === true && decoder !== null) {
+        const decodeDeadline = Date.now() + 3_000;
+        while (decoder.stats.framesDecoded < 1 && Date.now() < decodeDeadline) {
+          await new Promise((r) => window.setTimeout(r, 100));
+        }
+        result.framesDecoded = decoder.stats.framesDecoded;
+      }
+    } else {
+      // ── 9b. ECHO/MITM mode: wait for the DataChannel echo (proves the session connected). ──
+      // Race the echo against (a) a channel-never-opened rejection and (b) an overall deadline, so
+      // a failure to open the channel surfaces its specific cause rather than a generic timeout.
+      // `echoPromise` is non-null in this branch (constructed above when !video).
+      const echo = echoPromise ?? Promise.reject(new Error("echo promise missing"));
+      const echoFrame = await Promise.race([
+        echo,
+        sentFrame.then(() => new Promise<Uint8Array>(() => {})), // never resolves on its own; lets its rejection win
+        timeoutReject<Uint8Array>(30_000, "timed out waiting for echo frame"),
+      ]);
+
+      result.connected = true;
+      result.echoed = true;
+      result.frameHex = toHex(echoFrame);
+    }
   } catch (e) {
     result.error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
   } finally {
@@ -290,6 +403,12 @@ async function runInteropTest(): Promise<InteropResult> {
     }
     try {
       viewer?.close();
+    } catch {
+      /* ignore */
+    }
+    // VIDEO mode only: release the WebCodecs decoder / canvas resources if one was constructed.
+    try {
+      decoder?.close();
     } catch {
       /* ignore */
     }

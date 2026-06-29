@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use bytes::Bytes;
 use sh_crypto::{DtlsCommitment, HandshakeOutcome, NoiseHandshake, SoftwareKeystore};
+use sh_protocol::{Codec, CommonHeader, Flags, FrameType, Priority, VideoHeader, MAX_FRAME_ID};
 use sh_signaling::backoff::ExponentialBackoff;
 use sh_signaling::envelope::{MessageKind, SessionId, SignalingEnvelope};
 use sh_signaling::SignalingClient;
@@ -47,6 +48,7 @@ use sh_transport::channel::Transport;
 use sh_transport::driver::{spawn_webrtc_driver, AsyncUdpSocket as _, TokioUdpSocket};
 use sh_transport::webrtc::SdpBridgeBuilder;
 use sh_transport::{PinnedWebRtcTransport, TransportError};
+use sh_types::{ChannelId, FrameId, TimestampUs};
 use str0m::Rtc;
 use tracing::{debug, info, warn};
 
@@ -261,8 +263,14 @@ async fn main() -> anyhow::Result<()> {
     // Accept the next DataChannel in a separate task so we can simultaneously pump
     // trickle candidates from the signaling channel.
     let transport_for_accept = Arc::clone(&transport);
-    let accept_task: tokio::task::JoinHandle<anyhow::Result<()>> =
-        tokio::spawn(async move { run_data_channel(&transport_for_accept).await });
+    let (stream_video, frames, fps) = (args.stream_video, args.frames, args.fps);
+    let accept_task: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+        if stream_video {
+            run_video_stream(&transport_for_accept, frames, fps).await
+        } else {
+            run_data_channel(&transport_for_accept).await
+        }
+    });
 
     // Pump trickle ICE candidates until we see end-of-candidates or the browser disconnects.
     pump_candidates(&mut sig_client, &transport).await?;
@@ -295,16 +303,26 @@ struct Args {
     session_id: SessionId,
     /// Local UDP bind address.
     bind: String,
+    /// Stream the baked H.264 clip as SHP video frames instead of the echo exchange (ADR-0031).
+    stream_video: bool,
+    /// Number of video frames to stream in `--stream-video` mode.
+    frames: usize,
+    /// Frame pacing for `--stream-video` mode.
+    fps: u32,
 }
 
 impl Args {
-    /// Parse `--signaling-url`, `--session-id`, and `--bind` from [`std::env::args`].
+    /// Parse flags from [`std::env::args`]: `--signaling-url`, `--session-id`, `--bind`,
+    /// `--stream-video`, `--frames`, `--fps`.
     fn parse_from_env() -> anyhow::Result<Self> {
         let mut signaling_url = "ws://127.0.0.1:8765".to_owned();
         let mut session_id_hex = "0".repeat(32);
         // Default to loopback so the local ICE candidate is a concrete, routable address.
         // 0.0.0.0 is rejected by str0m's ICE implementation (`is_valid_ip` rejects unspecified).
         let mut bind = "127.0.0.1:0".to_owned();
+        let mut stream_video = false;
+        let mut frames: usize = 120;
+        let mut fps: u32 = 30;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -318,6 +336,24 @@ impl Args {
                 "--bind" => {
                     bind = args.next().context("--bind requires a value")?;
                 }
+                "--stream-video" => {
+                    stream_video = true;
+                }
+                "--frames" => {
+                    frames = args
+                        .next()
+                        .context("--frames requires a value")?
+                        .parse()
+                        .context("--frames must be an integer frame count")?;
+                }
+                "--fps" => {
+                    fps = args
+                        .next()
+                        .context("--fps requires a value")?
+                        .parse()
+                        .context("--fps must be an integer")?;
+                    anyhow::ensure!(fps > 0, "--fps must be a positive integer (> 0)");
+                }
                 other => {
                     warn!(flag = other, "unknown flag (ignored)");
                 }
@@ -329,6 +365,9 @@ impl Args {
             signaling_url,
             session_id,
             bind,
+            stream_video,
+            frames,
+            fps,
         })
     }
 }
@@ -732,9 +771,181 @@ async fn run_data_channel(transport: &PinnedWebRtcTransport) -> anyhow::Result<(
     Ok(())
 }
 
+// ── Baked H.264 video streaming (ADR-0031) ──────────────────────────────────────
+//
+// A small, real H.264 Annex-B clip pre-encoded by OpenH264 (the excluded `sh-codec-openh264`
+// crate's `gen_browser_fixture` example, which pins `openh264 = "=0.9.3"`) and checked in as bytes.
+// Re-run that example to regenerate the fixture. Streaming it as SHP video frames
+// lets the browser decode & render REAL video from this native host — proving the browser↔host video
+// transport end to end — WITHOUT the default OSS build linking any H.264 encoder (the clip is just
+// bytes). Live screen capture + on-host OpenH264 is the excluded preview host (next step). Fixture
+// layout (little-endian, repeated to EOF): [u32 payload_len][u8 frame_type][payload_len bytes].
+const BAKED_H264: &[u8] = include_bytes!("../fixtures/sample_h264.shv");
+
+/// One pre-encoded H.264 access unit from the baked fixture.
+struct BakedFrame {
+    frame_type: FrameType,
+    payload: &'static [u8],
+}
+
+/// Parse the baked fixture into per-frame Annex-B access units. Malformed/truncated trailing bytes
+/// are ignored (the fixture is build-time data, but parse defensively rather than panic).
+fn parse_baked_frames(mut data: &'static [u8]) -> Vec<BakedFrame> {
+    let mut frames = Vec::new();
+    while let Some(len_bytes) = data.get(..4) {
+        let Ok(len_arr) = <[u8; 4]>::try_from(len_bytes) else {
+            break;
+        };
+        let len = u32::from_le_bytes(len_arr) as usize;
+        let Some(frame_type_byte) = data.get(4) else {
+            break;
+        };
+        let frame_type = match frame_type_byte {
+            1 => FrameType::Idr,
+            2 => FrameType::IntraRefresh,
+            _ => FrameType::Predicted,
+        };
+        let Some(rest) = data.get(5..) else { break };
+        let Some(payload) = rest.get(..len) else {
+            break;
+        };
+        frames.push(BakedFrame {
+            frame_type,
+            payload,
+        });
+        let Some(next) = rest.get(len..) else { break };
+        data = next;
+    }
+    frames
+}
+
+/// Assemble one SHP video frame: `CommonHeader(9) || VideoHeader(12) || Annex-B payload`, matching
+/// exactly what the browser's `parseVideoFrame` expects (single non-fragmented frame).
+fn build_shp_video_frame(
+    sequence: u16,
+    frame_id: u32,
+    ts_us: u64,
+    frame_type: FrameType,
+    payload: &[u8],
+) -> anyhow::Result<Bytes> {
+    let payload_len = u16::try_from(payload.len())
+        .context("video frame exceeds SHP 16-bit payload-length cap")?;
+    // `encode()` narrows both timestamps to their low 32 wire bits, so a u64 input is fine.
+    let common = CommonHeader {
+        channel: ChannelId::Video,
+        flags: Flags {
+            fragment: false,
+            last_fragment: false,
+        },
+        sequence,
+        timestamp_us: TimestampUs(ts_us),
+        payload_len,
+    }
+    .encode();
+    let video = VideoHeader {
+        frame_id: FrameId(u64::from(frame_id)),
+        frag_index: 0,
+        total_frags: 1,
+        codec: Codec::H264,
+        frame_type,
+        priority: Priority::High,
+        monitor_id: 0,
+        marker: true,
+        encode_ts_us: TimestampUs(ts_us),
+    }
+    .encode()
+    .context("encode video header")?;
+
+    let cap = common
+        .len()
+        .saturating_add(video.len())
+        .saturating_add(payload.len());
+    let mut buf = Vec::with_capacity(cap);
+    buf.extend_from_slice(&common);
+    buf.extend_from_slice(&video);
+    buf.extend_from_slice(payload);
+    Ok(Bytes::from(buf))
+}
+
+/// Accept the browser's DataChannel and stream the baked H.264 clip as SHP video frames, paced to
+/// `fps` and looping the clip until `frames_to_send` have been sent.
+///
+/// # Errors
+/// Returns an error if the channel cannot be accepted, the fixture is empty/invalid, or a send fails.
+async fn run_video_stream(
+    transport: &PinnedWebRtcTransport,
+    frames_to_send: usize,
+    fps: u32,
+) -> anyhow::Result<()> {
+    info!("waiting for browser to open DataChannel (video mode)");
+    let mut channel = transport
+        .accept_channel()
+        .await
+        .context("failed to accept DataChannel")?;
+
+    let baked = parse_baked_frames(BAKED_H264);
+    anyhow::ensure!(!baked.is_empty(), "baked H.264 fixture parsed to 0 frames");
+    anyhow::ensure!(
+        frames_to_send > 0,
+        "--frames must be > 0 in --stream-video mode"
+    );
+    info!(
+        clip_frames = baked.len(),
+        target = frames_to_send,
+        fps,
+        "streaming baked H.264 to browser"
+    );
+
+    // `checked_div` (not `/`) satisfies the arithmetic-side-effects lint; `fps.max(1)` guarantees a
+    // non-zero divisor, so the `unwrap_or` fallback is unreachable.
+    let per_us = 1_000_000u64
+        .checked_div(u64::from(fps.max(1)))
+        .unwrap_or(1)
+        .max(1);
+    let mut ticker = tokio::time::interval(Duration::from_micros(per_us));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut sent: usize = 0;
+    let mut sequence: u16 = 0;
+    while sent < frames_to_send {
+        for bf in &baked {
+            if sent >= frames_to_send {
+                break;
+            }
+            ticker.tick().await;
+            let n = sent as u64;
+            // frame_id is a 24-bit wire field; mask into range. (`try_from` rather than `as u32` to
+            // satisfy the cast-truncation lint; the mask guarantees it fits, so this never errors.)
+            // Timestamps advance monotonically (WebCodecs wants increasing chunk timestamps);
+            // encode() narrows them to their low 32 wire bits.
+            let frame_id = u32::try_from(n & u64::from(MAX_FRAME_ID)).unwrap_or(0);
+            let ts_us = n.wrapping_mul(per_us);
+            let shp = build_shp_video_frame(sequence, frame_id, ts_us, bf.frame_type, bf.payload)?;
+            // A send failure here means the browser closed the DataChannel — a NORMAL end of stream
+            // (the viewer got what it needed and disconnected), not a host error. Treat it as a
+            // clean end so the host exits 0 instead of logging a misleading failure.
+            if let Err(e) = channel.send(shp).await {
+                info!(frames = sent, error = %e, "peer closed channel — ending video stream");
+                return Ok(());
+            }
+            sent = sent.saturating_add(1);
+            sequence = sequence.wrapping_add(1);
+        }
+    }
+
+    info!(frames = sent, "video stream complete");
+    Ok(())
+}
+
 #[cfg(test)]
+#[allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{NOISE_SUB_HELLO, NOISE_SUB_HOST_STATIC_PUB, NOISE_SUB_MSG};
+    use super::{
+        build_shp_video_frame, parse_baked_frames, BAKED_H264, NOISE_SUB_HELLO,
+        NOISE_SUB_HOST_STATIC_PUB, NOISE_SUB_MSG,
+    };
+    use sh_protocol::{Codec, CommonHeader, FrameType, VideoHeader, COMMON_HEADER_LEN};
+    use sh_types::ChannelId;
 
     /// The Noise sub-type wire values are a cross-language contract with the browser driver
     /// (`clients/web/e2e/browser-native.ts`). Pin the exact numeric values here so a change on the
@@ -748,5 +959,76 @@ mod tests {
             "NOISE_SUB_HOST_STATIC_PUB wire value changed"
         );
         assert_eq!(NOISE_SUB_MSG, 0x02, "NOISE_SUB_MSG wire value changed");
+    }
+
+    #[test]
+    fn baked_fixture_parses_with_leading_idr() {
+        let frames = parse_baked_frames(BAKED_H264);
+        assert!(!frames.is_empty(), "baked fixture must contain frames");
+        assert_eq!(
+            frames[0].frame_type,
+            FrameType::Idr,
+            "the first baked frame must be an IDR so the browser can configure its decoder"
+        );
+        // Every frame must be Annex-B (starts with a 0x000001 / 0x00000001 start code) and fit the
+        // SHP 16-bit payload cap.
+        for f in &frames {
+            assert!(
+                f.payload.len() <= usize::from(u16::MAX),
+                "frame exceeds SHP cap"
+            );
+            assert!(
+                f.payload.starts_with(&[0, 0, 0, 1]) || f.payload.starts_with(&[0, 0, 1]),
+                "payload is not Annex-B"
+            );
+        }
+    }
+
+    #[test]
+    fn built_shp_frame_round_trips_through_sh_protocol_decoders() {
+        // The host's framing must match what the browser decodes — assert it round-trips through the
+        // SAME sh-protocol decoders the browser's wasm bridge runs.
+        let payload = &[0u8, 0, 0, 1, 0x67, 0x42]; // fake Annex-B-ish bytes
+        let frame =
+            build_shp_video_frame(7, 5, 1234, FrameType::Idr, payload).expect("build frame");
+
+        let common = CommonHeader::decode(&frame[..COMMON_HEADER_LEN]).expect("common header");
+        assert_eq!(common.channel, ChannelId::Video);
+        assert_eq!(common.sequence, 7);
+        assert_eq!(usize::from(common.payload_len), payload.len());
+
+        let video = VideoHeader::decode(&frame[COMMON_HEADER_LEN..COMMON_HEADER_LEN + 12])
+            .expect("video header");
+        assert_eq!(video.frame_id.0, 5);
+        assert_eq!(video.codec, Codec::H264);
+        assert_eq!(video.frame_type, FrameType::Idr);
+        assert!(video.marker);
+        assert_eq!(video.total_frags, 1);
+
+        // The payload follows the 21-byte header prefix, byte-exact.
+        assert_eq!(&frame[COMMON_HEADER_LEN + 12..], payload);
+    }
+
+    #[test]
+    fn parse_baked_frames_handles_malformed_input() {
+        // Empty / sub-header / truncated-payload / declared-len-overruns inputs must all parse to a
+        // finite (possibly empty) list without panicking or looping forever.
+        assert!(parse_baked_frames(&[]).is_empty());
+        assert!(parse_baked_frames(&[0, 0]).is_empty()); // < 4-byte length prefix
+        assert!(parse_baked_frames(&[1, 0, 0, 0]).is_empty()); // length but no frame_type byte
+                                                               // Declares len=10 but only 2 payload bytes follow → dropped (no OOB).
+        assert!(parse_baked_frames(&[10, 0, 0, 0, 1, 0xAA, 0xBB]).is_empty());
+        // One valid frame (len=2, IDR, [0xAA,0xBB]) followed by a truncated second frame.
+        let one = parse_baked_frames(&[2, 0, 0, 0, 1, 0xAA, 0xBB, 0, 0]);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].frame_type, FrameType::Idr);
+        assert_eq!(one[0].payload, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn build_shp_video_frame_rejects_oversize_payload() {
+        // SHP CommonHeader.payload_len is u16; a >64 KiB payload must error, not truncate/panic.
+        let big = vec![0u8; usize::from(u16::MAX) + 1];
+        assert!(build_shp_video_frame(0, 0, 0, FrameType::Predicted, &big).is_err());
     }
 }

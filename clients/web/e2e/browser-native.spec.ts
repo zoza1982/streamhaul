@@ -17,10 +17,11 @@
  *
  * # Test setup
  *
- * 1. `beforeEach` spawns `streamhaul-signaling` and `streamhaul-webrtc-host`.
- * 2. Reads `HOST_DTLS_FP=<hex>` from host stdout.
- * 3. Navigates to `/e2e/browser-native.html?session=<hex>&host_fp=<hex>`.
- * 4. Polls `window.__interopResult` for up to 30 s.
+ * 1. `beforeEach` spawns ONLY `streamhaul-signaling` on a dynamic port.
+ * 2. Each test calls `startHost([...extraArgs])` to spawn `streamhaul-webrtc-host` with
+ *    mode-specific flags (echo, MITM, or `--stream-video`), then reads `HOST_DTLS_FP=<hex>`.
+ * 3. Navigates to `/e2e/browser-native.html?session=<hex>&host_fp=<hex>[&mitm=1|&video=1]`.
+ * 4. Polls `window.__interopResult` for up to 40 s.
  * 5. `afterEach` kills both child processes.
  *
  * # Environment requirements
@@ -56,6 +57,14 @@ interface InteropResult {
   pinUsedHex: string | null;
   /** True iff the MITM SDP-fingerprint swap was rejected by the fail-closed pin gate. */
   mitmRejected: boolean;
+  /** VIDEO mode: count of inbound frames that parsed as valid SHP video frames. */
+  framesReachedDecoder: number;
+  /** VIDEO mode: count of frames the WebCodecs decoder successfully decoded. */
+  framesDecoded: number;
+  /** VIDEO mode: whether the browser exposes the WebCodecs `VideoDecoder` API. */
+  webCodecs: boolean;
+  /** VIDEO mode: whether the browser can actually decode the fixture's H.264 (probed). */
+  h264DecodeSupported: boolean | null;
   error: string | null;
 }
 
@@ -206,18 +215,33 @@ test.skip(
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 test.beforeEach(async () => {
-  // 1. Start the signaling server on a DYNAMIC port (`:0`) so concurrent / re-run invocations
-  //    never collide on a fixed port (a stale process previously gave an opaque "Address already
-  //    in use"). The server prints its ACTUAL bound address on SIGNALING_READY.
+  // Start ONLY the signaling server on a DYNAMIC port (`:0`) so concurrent / re-run invocations
+  // never collide on a fixed port (a stale process previously gave an opaque "Address already
+  // in use"). The server prints its ACTUAL bound address on SIGNALING_READY.
+  //
+  // The host is spawned per-test via `startHost(...)` so each test can pass mode-specific args
+  // (e.g. `--stream-video`) — the video test must NOT inherit the plain echo host.
   signalingProc = spawnProcess(binaryPath("streamhaul-signaling"), ["--addr", "127.0.0.1:0"]);
   const readyLine = await waitForStdoutLine(signalingProc, "SIGNALING_READY addr=");
   const sigAddr = readyLine.trim(); // e.g. "127.0.0.1:54321"
   if (!/^127\.0\.0\.1:\d{1,5}$/.test(sigAddr)) {
     throw new Error(`SIGNALING_READY addr is not a 127.0.0.1:<port> address: "${sigAddr}"`);
   }
-  const signalingUrl = `ws://${sigAddr}`;
+  process.env["_TEST_SIGNALING_URL"] = `ws://${sigAddr}`;
+});
 
-  // 2. Start the native WebRTC host pointed at the dynamic signaling URL.
+/**
+ * Spawn the native WebRTC host pointed at the (already-running) dynamic signaling URL, with the
+ * fixed base args plus any test-specific `extraArgs` (e.g. `--stream-video`). Reads + validates
+ * the host's `HOST_DTLS_FP=` line and stores it in `_TEST_HOST_FP` for the in-page driver.
+ *
+ * Call this at the START of each test, AFTER `beforeEach` has started signaling.
+ */
+async function startHost(extraArgs: string[] = []): Promise<void> {
+  const signalingUrl = process.env["_TEST_SIGNALING_URL"];
+  if (signalingUrl === undefined) {
+    throw new Error("startHost called before signaling was started (beforeEach did not run?)");
+  }
   hostProc = spawnProcess(binaryPath("streamhaul-webrtc-host"), [
     "--signaling-url",
     signalingUrl,
@@ -225,6 +249,7 @@ test.beforeEach(async () => {
     SESSION_HEX,
     "--bind",
     "127.0.0.1:0",
+    ...extraArgs,
   ]);
   // Read the DTLS fingerprint printed by the host.
   const hostFp = await waitForStdoutLine(hostProc, "HOST_DTLS_FP=");
@@ -232,14 +257,11 @@ test.beforeEach(async () => {
   // surfaces immediately with a clear error rather than propagating into encodeEnvelope deep in
   // the browser where the failure message would be confusing.
   if (!/^[0-9a-f]{64}$/.test(hostFp)) {
-    throw new Error(
-      `HOST_DTLS_FP is not 64 lowercase hex chars: "${hostFp.slice(0, 80)}"`,
-    );
+    throw new Error(`HOST_DTLS_FP is not 64 lowercase hex chars: "${hostFp.slice(0, 80)}"`);
   }
   // Store for use in the test.
   process.env["_TEST_HOST_FP"] = hostFp;
-  process.env["_TEST_SIGNALING_URL"] = signalingUrl;
-});
+}
 
 test.afterEach(async () => {
   if (hostProc) {
@@ -285,6 +307,7 @@ async function runDriver(
 }
 
 test("identity-bound browser↔native DataChannel echo (P5-3 Stage 2)", async ({ page }) => {
+  await startHost();
   const hostFp = process.env["_TEST_HOST_FP"]!;
 
   const { r, errors } = await runDriver(page, `session=${SESSION_HEX}&host_fp=${hostFp}`);
@@ -307,6 +330,7 @@ test("identity-bound browser↔native DataChannel echo (P5-3 Stage 2)", async ({
 test("MITM SDP-fingerprint swap is rejected by the identity-bound pin (P5-3 Stage 2)", async ({
   page,
 }) => {
+  await startHost();
   const hostFp = process.env["_TEST_HOST_FP"]!;
 
   // mitm=1: a man-in-the-middle swaps the host's answer SDP a=fingerprint AFTER the BindCert
@@ -323,5 +347,35 @@ test("MITM SDP-fingerprint swap is rejected by the identity-bound pin (P5-3 Stag
   // The pin was still sourced from the (honest) BindCert before the swap — proving the rejection
   // is caused by the SDP/pin MISMATCH, not a missing pin.
   expect(r.pinUsedHex, "the honest BindCert pin should still have been computed").toBe(hostFp);
+  expect(errors, "no page errors").toHaveLength(0);
+});
+
+test("identity-bound browser↔native LIVE H.264 video (P5-3 Stage 2 + ADR-0031)", async ({
+  page,
+}) => {
+  // Spawn the host in VIDEO mode: it streams 90 baked H.264 frames at 30 fps as SHP video frames
+  // over the "shp" DataChannel (first frame is an IDR), instead of echoing the HELLO frame.
+  await startHost(["--stream-video", "--frames", "90", "--fps", "30"]);
+  const hostFp = process.env["_TEST_HOST_FP"]!;
+
+  // video=1: the in-page driver parses the inbound SHP video frames and decodes them via WebCodecs.
+  const { r, errors } = await runDriver(page, `session=${SESSION_HEX}&host_fp=${hostFp}&video=1`);
+
+  expect(r.connected, `session should connect (error: ${r.error ?? "none"})`).toBe(true);
+  // Core assertion: the browser RECEIVED and PARSED at least one SHP video frame from the host.
+  expect(
+    r.framesReachedDecoder,
+    "browser must receive & parse >=1 SHP video frame from the native host",
+  ).toBeGreaterThanOrEqual(1);
+
+  // Decode is asserted ONLY when H.264 decode is actually SUPPORTED (probed via
+  // VideoDecoder.isConfigSupported). API presence (`webCodecs`) is force-enabled in this harness and
+  // is NOT proof the platform codec exists — headless Firefox may lack it — so gating on `webCodecs`
+  // here would hard-require a codec that isn't guaranteed. The codec-independent transport proof
+  // (framesReachedDecoder >= 1) above always runs.
+  if (r.h264DecodeSupported === true) {
+    expect(r.framesDecoded, "WebCodecs should decode >=1 frame").toBeGreaterThanOrEqual(1);
+  }
+
   expect(errors, "no page errors").toHaveLength(0);
 });
