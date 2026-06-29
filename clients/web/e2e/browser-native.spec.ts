@@ -65,6 +65,8 @@ interface InteropResult {
   webCodecs: boolean;
   /** VIDEO mode: whether the browser can actually decode the fixture's H.264 (probed). */
   h264DecodeSupported: boolean | null;
+  /** VIDEO mode: count of synthetic input events the browser sent (remote control). */
+  inputSent: number;
   error: string | null;
 }
 
@@ -380,6 +382,12 @@ test("identity-bound browser↔native LIVE H.264 video (P5-3 Stage 2 + ADR-0031)
   if (r.h264DecodeSupported === true) {
     expect(r.framesDecoded, "WebCodecs should decode >=1 frame").toBeGreaterThanOrEqual(1);
   }
+
+  // CONTROL (ADR-0034): the browser sent synthetic input events; assert the host received, decoded,
+  // and injected them. The host's StdoutInputLogger prints `INPUT_INJECTED ...` per event, proving
+  // the browser→host remote-control path end to end (the live preview host injects into real X11).
+  expect(r.inputSent, "browser should have sent input events").toBeGreaterThanOrEqual(1);
+  await waitForStdoutLine(hostProc!, "INPUT_INJECTED", 15_000);
 
   expect(errors, "no page errors").toHaveLength(0);
 });

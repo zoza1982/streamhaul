@@ -29,13 +29,16 @@ sh-transport = { path = "../../crates/sh-transport" }
 # to the browser (ADR-0031). No codec dep — the clip is pre-encoded bytes, so the OSS build links
 # no H.264 encoder (ADR-0028/0029).
 sh-protocol = { path = "../../crates/sh-protocol" }
+# sh-input: the InputInjector trait + InputEvent. The host demuxes browser→host input frames off the
+# DataChannel and injects them (remote control). The OS injector is supplied by the binary (ADR-0034).
+sh-input = { path = "../../crates/sh-input" }
 sh-signaling = { path = "../../crates/sh-signaling", features = ["insecure-lan"] }
 # sh-crypto: the identity-bound Noise XK handshake + BindCert (P5-3 Stage 2, ADR-0014/0023). The
 # host runs the responder side, commits its own DTLS fingerprint, and extracts the browser's
 # committed DTLS fingerprint to pin (instead of the untrusted SDP `a=fingerprint`).
 sh-crypto = { path = "../../crates/sh-crypto" }
 sh-types = { path = "../../crates/sh-types" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "time", "sync"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 anyhow = { workspace = true }

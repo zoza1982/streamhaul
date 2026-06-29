@@ -30,7 +30,11 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use bytes::Bytes;
 use sh_crypto::{DtlsCommitment, HandshakeOutcome, NoiseHandshake, SoftwareKeystore};
-use sh_protocol::{Codec, CommonHeader, Flags, FrameType, Priority, VideoHeader, MAX_FRAME_ID};
+use sh_input::InputInjector;
+use sh_protocol::{
+    Codec, CommonHeader, Flags, FrameType, InputEvent, Priority, VideoHeader, INPUT_EVENT_LEN,
+    MAX_FRAME_ID,
+};
 use sh_signaling::backoff::ExponentialBackoff;
 use sh_signaling::envelope::{MessageKind, SessionId, SignalingEnvelope};
 use sh_signaling::SignalingClient;
@@ -67,6 +71,14 @@ const NOISE_SUB_HELLO: u8 = 0x00;
 const NOISE_SUB_HOST_STATIC_PUB: u8 = 0x01;
 /// `body` is an opaque Noise XK handshake message.
 const NOISE_SUB_MSG: u8 = 0x02;
+
+/// Max input events drained from the channel per video frame, so a flood can't starve the video
+/// send loop. 256/frame ≈ 7680 events/s at 30 fps — far above any human input rate.
+const MAX_INPUT_PER_FRAME: usize = 256;
+
+/// Bounded depth of the channel feeding the dedicated injection thread. A full queue drops further
+/// events (backpressure) rather than blocking the video loop — the natural flood/rate-limit point.
+const INPUT_QUEUE_DEPTH: usize = 256;
 
 // ── VideoFrameSource trait ──────────────────────────────────────────────────────────────────────
 
@@ -221,6 +233,10 @@ pub enum StreamMode {
         max_fragment_bytes: usize,
         /// The frame source; [`VideoFrameSource::next_frame`] is called once per tick.
         source: Box<dyn VideoFrameSource>,
+        /// Sink for browser→host input events (remote control). Inbound 16-byte [`InputEvent`]s on
+        /// the DataChannel are decoded and injected via this between video frames (ADR-0034). The
+        /// binary supplies the OS injector (X11 for the live host; a logging/no-op one otherwise).
+        input: Box<dyn InputInjector>,
     },
 }
 
@@ -403,6 +419,7 @@ pub async fn run_webrtc_host(
                 fps,
                 max_fragment_bytes,
                 mut source,
+                input,
             } => {
                 run_video_stream(
                     &transport_for_accept,
@@ -410,6 +427,7 @@ pub async fn run_webrtc_host(
                     fps,
                     max_fragment_bytes,
                     &mut *source,
+                    input,
                 )
                 .await
             }
@@ -994,18 +1012,20 @@ async fn run_data_channel(transport: &PinnedWebRtcTransport) -> anyhow::Result<(
 }
 
 /// Accept the browser's DataChannel and stream H.264 SHP video frames from `source`, paced to
-/// `fps` and stopping after `frames_to_send` have been sent.
+/// `fps` and stopping after `frames_to_send` have been sent. Between frames it drains any inbound
+/// browser→host input events and feeds them to `input` (remote control; ADR-0034).
 ///
 /// # Errors
 ///
-/// Returns an error if the channel cannot be accepted, `source.next_frame()` fails, or a send
-/// fails (unless the peer closed the channel cleanly, which is treated as end-of-stream).
+/// Returns an error if the channel cannot be accepted or `source.next_frame()` fails. A send/recv
+/// failure or a clean peer close is **not** an error — it ends the stream and returns `Ok(())`.
 async fn run_video_stream(
     transport: &PinnedWebRtcTransport,
     frames_to_send: usize,
     fps: u32,
     max_fragment_bytes: usize,
     source: &mut dyn VideoFrameSource,
+    input: Box<dyn InputInjector>,
 ) -> anyhow::Result<()> {
     info!("waiting for browser to open DataChannel (video mode)");
     let mut channel = transport
@@ -1018,6 +1038,26 @@ async fn run_video_stream(
         "--frames must be > 0 in video stream mode"
     );
     anyhow::ensure!(fps > 0, "StreamMode::Video fps must be > 0");
+
+    // ── Input injection runs on a DEDICATED blocking thread, never the async executor ──
+    //
+    // The `InputInjector` contract requires inject() to run off the runtime (XTEST etc. are
+    // synchronous OS calls that could stall the video loop). We move the injector onto a
+    // `spawn_blocking` task fed by a BOUNDED channel: the drain loop only `try_send`s decoded
+    // events (truly non-blocking), and the bounded queue is the natural backpressure / flood point
+    // (a full queue drops the event rather than blocking pacing). Dropping `input_tx` at the end
+    // signals the thread to exit.
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<InputEvent>(INPUT_QUEUE_DEPTH);
+    let inject_task = tokio::task::spawn_blocking(move || {
+        let mut injector = input;
+        while let Some(event) = input_rx.blocking_recv() {
+            if let Err(e) = injector.inject(&event) {
+                // An injection failure (unsupported event / backend error) must not kill the
+                // session — log and keep going.
+                debug!(error = %e, "input injection failed");
+            }
+        }
+    });
     info!(
         target = frames_to_send,
         fps, "streaming H.264 video frames to browser"
@@ -1031,7 +1071,7 @@ async fn run_video_stream(
 
     let mut sent: usize = 0;
     let mut sequence: u16 = 0;
-    while sent < frames_to_send {
+    'stream: while sent < frames_to_send {
         ticker.tick().await;
         let (frame_type, payload) = source.next_frame()?;
         let n = sent as u64;
@@ -1068,15 +1108,66 @@ async fn run_video_stream(
         for frag in fragments {
             if let Err(e) = channel.send(frag).await {
                 info!(frames = sent, error = %e, "peer closed channel — ending video stream");
-                return Ok(());
+                break 'stream;
             }
         }
         sent = sent.saturating_add(1);
         sequence = sequence.wrapping_add(num_frags);
+
+        // Drain any browser→host input that arrived while pacing/sending this frame and hand it to
+        // the injection thread. `timeout(ZERO, recv())` is a single non-blocking poll: it returns a
+        // buffered message immediately or elapses with no idle wait. recv() is cancel-safe: it only
+        // consumes a message after popping it from the queue under the mutex, so cancelling the
+        // ZERO-timeout future at its internal `notified().await` leaves the queue untouched and the
+        // message available on the next poll. We cap the drain at `MAX_INPUT_PER_FRAME` so a flood
+        // can't starve the video send loop; the bounded `input_tx` channel is the second backpressure
+        // point (a full queue drops the event rather than blocking).
+        for _ in 0..MAX_INPUT_PER_FRAME {
+            match tokio::time::timeout(Duration::ZERO, channel.recv()).await {
+                Ok(Ok(Some(bytes))) => {
+                    if let Some(event) = decode_input(&bytes) {
+                        // Non-blocking enqueue to the injection thread; a full queue drops the
+                        // event (backpressure) rather than stalling video pacing.
+                        let _ = input_tx.try_send(event);
+                    }
+                }
+                Ok(Ok(None)) => {
+                    info!(frames = sent, "peer closed channel — ending video stream");
+                    break 'stream;
+                }
+                Ok(Err(e)) => {
+                    info!(frames = sent, error = %e, "channel recv error — ending video stream");
+                    break 'stream;
+                }
+                Err(_elapsed) => break, // no more buffered input this round
+            }
+        }
     }
 
     info!(frames = sent, "video stream complete");
+    // Close the input queue and let the injection thread drain + exit cleanly.
+    drop(input_tx);
+    let _ = inject_task.await;
     Ok(())
+}
+
+/// Decode one inbound DataChannel message as an [`InputEvent`], or `None` if it is not one.
+///
+/// The browser sends bare 16-byte `InputEvent`s on the video channel (the host only ever *sends*
+/// video, so every *received* message is browser→host input). Messages that are not a well-formed
+/// 16-byte input event (e.g. the browser's channel-open HELLO frame) return `None`; a hostile or
+/// malformed event can never crash the host (decode is bounds-checked + proptest-fuzzed).
+fn decode_input(bytes: &[u8]) -> Option<InputEvent> {
+    if bytes.len() != INPUT_EVENT_LEN {
+        return None; // not an input event (e.g. the HELLO open frame) — ignore
+    }
+    match InputEvent::decode(bytes) {
+        Ok(event) => Some(event),
+        Err(e) => {
+            debug!(error = %e, "dropping malformed input event");
+            None
+        }
+    }
 }
 
 // ── Unit tests (moved from src/main.rs — behavior must be identical) ────────────────────────────
@@ -1095,7 +1186,9 @@ mod tests {
         NOISE_SUB_HELLO, NOISE_SUB_HOST_STATIC_PUB, NOISE_SUB_MSG,
     };
     use bytes::Bytes;
-    use sh_protocol::{Codec, CommonHeader, FrameType, VideoHeader, COMMON_HEADER_LEN};
+    use sh_protocol::{
+        Codec, CommonHeader, FrameType, VideoHeader, COMMON_HEADER_LEN, INPUT_EVENT_LEN,
+    };
     use sh_types::ChannelId;
 
     /// The Noise sub-type wire values are a cross-language contract with the browser driver
@@ -1265,5 +1358,37 @@ mod tests {
         let frags = build_shp_video_fragments(0, 0, 0, FrameType::Idr, &[], 1000).unwrap();
         assert_eq!(frags.len(), 1);
         assert!(reassemble(&frags).is_empty());
+    }
+
+    #[test]
+    fn decode_input_round_trips_a_browser_input_event() {
+        use sh_protocol::{EventType, InputEvent, Modifiers};
+
+        // A browser-encoded input event (the exact 16-byte wire form the wasm bridge produces).
+        let event = InputEvent {
+            event_type: EventType::PointerMove,
+            modifiers: Modifiers::empty(),
+            pointer_x: 0x1234,
+            pointer_y: 0x5678,
+            button_mask: 0,
+            key_code: 0,
+            scroll_x: 0,
+            scroll_y: 0,
+            pressure: 0,
+        };
+        assert_eq!(
+            super::decode_input(&event.encode()),
+            Some(event),
+            "the 16-byte wire form must decode verbatim"
+        );
+    }
+
+    #[test]
+    fn decode_input_rejects_non_input_messages() {
+        // The channel-open HELLO frame (13 bytes) and other non-16-byte messages → None.
+        assert!(super::decode_input(b"SHP\x00\x00\x00\x00\x05HELLO").is_none());
+        assert!(super::decode_input(&[]).is_none());
+        // A 16-byte but malformed event (bad event-type / reserved bits) → None, never a panic.
+        assert!(super::decode_input(&[0xFF; INPUT_EVENT_LEN]).is_none());
     }
 }

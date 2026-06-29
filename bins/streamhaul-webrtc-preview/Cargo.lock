@@ -1894,6 +1894,7 @@ dependencies = [
  "bytes",
  "rand_core 0.6.4",
  "sh-crypto",
+ "sh-input",
  "sh-protocol",
  "sh-signaling",
  "sh-transport",

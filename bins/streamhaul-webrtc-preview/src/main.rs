@@ -57,7 +57,9 @@ impl Args {
         let mut max_width: u32 = 3840;
         let mut bitrate_kbps: u32 = 4_000;
         let mut fps: u32 = 30;
-        let mut frames: usize = 120;
+        // Stream until the browser disconnects (a real remote-desktop session, not a fixed clip).
+        // The send loop exits cleanly on peer close; `--frames N` caps it for tests/demos.
+        let mut frames: usize = usize::MAX;
         // Default to the SHP wire cap; the encoder's frames are fragmented to fit.
         let mut max_fragment_bytes: usize = usize::from(u16::MAX);
 
@@ -170,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
 /// Linux-specific execution path: build the X11 capture chain and run the WebRTC host.
 #[cfg(target_os = "linux")]
 async fn run_linux(args: Args) -> anyhow::Result<()> {
-    use sh_platform_linux::X11ScreenCapturer;
+    use sh_platform_linux::{X11ScreenCapturer, XTestInjector};
     use streamhaul_preview::EvenDimCapturer;
     use streamhaul_webrtc_host::run_webrtc_host;
     use streamhaul_webrtc_preview::{DownscaleCapturer, LiveFrameSource};
@@ -198,6 +200,11 @@ async fn run_linux(args: Args) -> anyhow::Result<()> {
     let live_source = LiveFrameSource::new(even, args.bitrate_kbps, args.fps)
         .context("failed to create live frame source")?;
 
+    // Real remote control: inject the browser's keyboard/mouse into the live X11 session via XTEST
+    // (ADR-0034). This is what makes the preview an actual remote desktop, not just a viewer.
+    let injector =
+        XTestInjector::new(None).context("failed to open X11 XTEST for input injection")?;
+
     info!(
         max_width = args.max_width,
         bitrate_kbps = args.bitrate_kbps,
@@ -211,6 +218,7 @@ async fn run_linux(args: Args) -> anyhow::Result<()> {
         fps: args.fps,
         max_fragment_bytes: args.max_fragment_bytes,
         source: Box::new(live_source),
+        input: Box::new(injector),
     };
 
     run_webrtc_host(config, mode, |fp| {
