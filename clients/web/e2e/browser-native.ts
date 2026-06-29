@@ -392,6 +392,11 @@ async function runInteropTest(): Promise<InteropResult> {
           /* channel closed / not writable — best-effort, the host-side assertion is authoritative */
         }
       }
+      // Keep the session alive long enough for the input to be transmitted, drained by the host
+      // (it polls between video frames), and injected — otherwise the `finally` `viewer.close()`
+      // (which fires as soon as this function returns, e.g. when H.264 decode is unsupported and the
+      // decode-wait below is skipped) can tear down DTLS/SCTP before the input bytes leave the wire.
+      await new Promise((r) => window.setTimeout(r, 1_500));
 
       // Decode is asserted by the spec only when H.264 decode is actually SUPPORTED (probed via
       // VideoDecoder.isConfigSupported — API presence alone is not enough; headless Firefox may lack
