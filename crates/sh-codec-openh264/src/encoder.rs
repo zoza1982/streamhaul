@@ -33,7 +33,12 @@ impl OpenH264Encoder {
     /// # Errors
     /// Returns [`MediaError::Encode`] if the OpenH264 encoder cannot be initialized.
     pub fn new() -> Result<Self, MediaError> {
-        Self::from_oh_config(OhEncoderConfig::new().usage_type(UsageType::ScreenContentRealTime))
+        // No bitrate target ⇒ constant-quality, skip off (the pipeline is the sole drop authority).
+        Self::from_oh_config(
+            OhEncoderConfig::new()
+                .usage_type(UsageType::ScreenContentRealTime)
+                .skip_frames(false),
+        )
     }
 
     /// Create a software H.264 encoder configured from a [`sh_media::EncoderConfig`].
@@ -58,29 +63,37 @@ impl OpenH264Encoder {
             )));
         }
 
-        let mut oh = OhEncoderConfig::new().usage_type(UsageType::ScreenContentRealTime);
-        oh = match config.target_bitrate_kbps {
+        let oh = OhEncoderConfig::new().usage_type(UsageType::ScreenContentRealTime);
+        // Rate control + frame skip are TWO complementary drop layers (ADR-0029):
+        //   * pipeline backpressure drops whole frames at the input (coarse), and
+        //   * OpenH264's RC skip caps the size of a SINGLE encoded frame when QP alone can't fit the
+        //     per-frame bit budget (fine) — without it, RC_BITRATE_MODE literally cannot honor the
+        //     congestion-controlled bitrate, and one high-change screen frame can blow the congestion
+        //     window (queueing/loss). So enable skip ONLY when a bitrate target is set; in
+        //     constant-quality mode there is no budget and the pipeline is the sole drop authority.
+        // The keyframe-durability fix (re-arm force_keyframe until a real IDR emits) makes skip safe
+        // for forced keyframes. NOTE: this is OpenH264-specific — HW encoders (NVENC/VA-API/
+        // VideoToolbox) honor a bitrate via VBV+QP and must NOT copy this skip logic.
+        let oh = match config.target_bitrate_kbps {
             // kbps → bps; saturate so a pathological config can never overflow the u32 bps field.
             Some(kbps) => oh
                 .bitrate(BitRate::from_bps(kbps.saturating_mul(1000)))
-                .rate_control_mode(RateControlMode::Bitrate),
-            // Leave OpenH264's default constant-quality rate control.
-            None => oh,
+                .rate_control_mode(RateControlMode::Bitrate)
+                .skip_frames(true),
+            // Constant-quality: no network budget; pipeline backpressure is the only drop mechanism.
+            None => oh.skip_frames(false),
         };
-        if config.target_fps > 0 {
+        let oh = if config.target_fps > 0 {
             // u32 → f32 is lossless for any realistic frame rate (exact up to 2^24).
-            oh = oh.max_frame_rate(FrameRate::from_hz(config.target_fps as f32));
-        }
+            oh.max_frame_rate(FrameRate::from_hz(config.target_fps as f32))
+        } else {
+            oh
+        };
 
         Self::from_oh_config(oh)
     }
 
     fn from_oh_config(config: OhEncoderConfig) -> Result<Self, MediaError> {
-        // Disable OpenH264's own rate-control frame skipping: the pipeline's backpressure/pacing is
-        // the single, coordinated frame-drop mechanism (dropping here would silently create
-        // non-contiguous frame ids — indistinguishable from packet loss at the receiver — and could
-        // swallow a forced IDR). ADR-0029.
-        let config = config.skip_frames(false);
         let api = OpenH264API::from_source();
         let encoder = Encoder::with_api_config(api, config)
             .map_err(|e| MediaError::Encode(format!("OpenH264 encoder init failed: {e}")))?;
