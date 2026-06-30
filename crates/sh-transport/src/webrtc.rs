@@ -1454,6 +1454,36 @@ mod tests {
     use str0m::channel::ChannelConfig;
     use str0m::{Candidate, Event, Input, Output, Rtc};
 
+    /// Cross-language contract (ADR-0036): `sh-web-client`'s `create_offer` hard-codes the
+    /// DataChannel labels `"0:128:1"` (video) and `"2:0:1"` (input). This host parser is the single
+    /// source of truth for what those strings mean. Pin the exact routing so a drift on either side
+    /// — which would otherwise SILENTLY fall back to `ChannelId::Control` and lose input — breaks a
+    /// test instead. (Mirror of how the Noise sub-type wire values are pinned.)
+    #[test]
+    fn dedicated_input_channel_labels_route_correctly() {
+        let video = parse_channel_label("0:128:1");
+        assert_eq!(
+            video.channel,
+            sh_types::ChannelId::Video,
+            "video label must route to Video"
+        );
+        assert_eq!(video.reliability, Reliability::Reliable);
+
+        let input = parse_channel_label("2:0:1");
+        assert_eq!(
+            input.channel,
+            sh_types::ChannelId::Input,
+            "input label must route to Input"
+        );
+        assert_eq!(input.reliability, Reliability::Reliable);
+        // Input's priority byte is 0 = most urgent in the ChannelSpec scale (quinn_priority 255),
+        // matching ChannelSpec::input(); a regression to a less-urgent value would surface here.
+        assert_eq!(
+            input.priority, 0,
+            "input must be highest urgency (priority 0)"
+        );
+    }
+
     // ── Synchronous drive helpers ─────────────────────────────────────────────
 
     /// Owned packet ready to be fed to the other peer.

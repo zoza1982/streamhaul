@@ -283,7 +283,11 @@ pub struct WebClient {
                   internally yet — the host page relays SDP/ICE today"
     )]
     signaling: SignalingChannel,
-    channel: Option<RtcDataChannel>,
+    /// The offerer's two DataChannels (ADR-0036): video (host→browser frames, label `"0:128:1"`)
+    /// and input (browser→host events, label `"2:255:1"`). Separate SCTP streams so input is never
+    /// gated by video pacing or head-of-line-blocked by a large video fragment.
+    video_channel: Option<RtcDataChannel>,
+    input_channel: Option<RtcDataChannel>,
     /// The peer's DTLS pin (from the verified Noise handshake), set via [`WebClient::set_dtls_pin`].
     dtls_pin: Option<Vec<u8>>,
 }
@@ -304,7 +308,8 @@ impl WebClient {
         Ok(WebClient {
             pc,
             signaling,
-            channel: None,
+            video_channel: None,
+            input_channel: None,
             dtls_pin: None,
         })
     }
@@ -357,11 +362,19 @@ impl WebClient {
     /// Returns a `JsValue` if `createOffer` or `setLocalDescription` rejects.
     #[wasm_bindgen]
     pub async fn create_offer(&mut self) -> Result<String, JsValue> {
-        // A DataChannel must exist before createOffer so the SDP includes an m=application line
-        // (and a DTLS fingerprint).  Create the SHP data channel on the offerer here.
-        if self.channel.is_none() {
-            let ch = self.pc.create_data_channel("shp");
-            self.channel = Some(ch);
+        // At least one DataChannel must exist before createOffer so the SDP includes an
+        // m=application line (and a DTLS fingerprint). We create BOTH channels here (ADR-0036) so
+        // they share that single m=application section / SCTP association. The labels encode the
+        // host's `ChannelSpec` as `channel:priority:ordered`, where `priority` is the ChannelSpec
+        // scale (0 = MOST urgent, `quinn_priority = 255 - priority`): `"0:128:1"` = Video (moderate),
+        // `"2:0:1"` = Input (highest urgency, matching `ChannelSpec::input()`). The host routes by
+        // the parsed `ChannelId` (Video = 0, Input = 2), so these MUST match its `parse_channel_label`
+        // contract — see the round-trip test `dedicated_input_channel_labels_route_correctly`.
+        if self.video_channel.is_none() {
+            self.video_channel = Some(self.pc.create_data_channel("0:128:1"));
+        }
+        if self.input_channel.is_none() {
+            self.input_channel = Some(self.pc.create_data_channel("2:0:1"));
         }
         let offer = JsFuture::from(self.pc.create_offer()).await?;
         let offer: RtcSessionDescriptionInit = offer.unchecked_into();
@@ -459,37 +472,59 @@ impl WebClient {
         Ok(())
     }
 
-    /// Send an SHP frame over the DataChannel.
+    /// Send a message on the **Video** (primary) DataChannel.
     ///
-    /// The frame is an opaque SHP byte payload (already encoded by [`sh_wasm`]); its contents are
-    /// never inspected here.
+    /// This is the primary channel: the host echoes on it (echo/MITM test), the browser sends the
+    /// channel-open HELLO on it, and the host streams video on it. Browser→host **input** goes on
+    /// the separate Input channel via [`send_input`](Self::send_input) (ADR-0036).
+    ///
+    /// The payload is opaque (already encoded by [`sh_wasm`]); its contents are never inspected here.
     ///
     /// # Errors
     ///
-    /// Returns a `JsValue` if no DataChannel is open, or the underlying `send` rejects.
+    /// Returns a `JsValue` if the video channel is not open, or the underlying `send` rejects.
     #[wasm_bindgen]
     pub fn send_frame(&self, frame: &[u8]) -> Result<(), JsValue> {
         let ch = self
-            .channel
+            .video_channel
             .as_ref()
-            .ok_or_else(|| JsError::new("no DataChannel open"))?;
+            .ok_or_else(|| JsError::new("no video DataChannel open"))?;
         ch.send_with_u8_array(frame)
     }
 
-    /// Set a callback invoked with each received SHP frame (`Uint8Array`).
+    /// Send a browser→host 16-byte SHP `InputEvent` on the dedicated **Input** DataChannel
+    /// (ADR-0036) — a separate SCTP stream so input is never gated by video pacing or
+    /// head-of-line-blocked by a large video fragment.
+    ///
+    /// The payload is opaque (already encoded by [`sh_wasm`]); its contents are never inspected here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `JsValue` if the input channel is not open, or the underlying `send` rejects.
+    #[wasm_bindgen]
+    pub fn send_input(&self, event: &[u8]) -> Result<(), JsValue> {
+        let ch = self
+            .input_channel
+            .as_ref()
+            .ok_or_else(|| JsError::new("no input DataChannel open"))?;
+        ch.send_with_u8_array(event)
+    }
+
+    /// Set a callback invoked with each received SHP video frame (`Uint8Array`) on the **Video**
+    /// DataChannel (ADR-0036).
     ///
     /// The callback fires for every `message` event whose data is binary.  Text messages are
     /// ignored (SHP frames are always binary).
     ///
     /// # Errors
     ///
-    /// Returns a `JsValue` if no DataChannel exists yet.
+    /// Returns a `JsValue` if the video channel does not exist yet.
     #[wasm_bindgen]
     pub fn on_frame(&self, callback: js_sys::Function) -> Result<(), JsValue> {
         let ch = self
-            .channel
+            .video_channel
             .as_ref()
-            .ok_or_else(|| JsError::new("no DataChannel to attach on_frame to"))?;
+            .ok_or_else(|| JsError::new("no video DataChannel to attach on_frame to"))?;
         let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |evt: MessageEvent| {
             let data = evt.data();
             if let Ok(buf) = data.dyn_into::<js_sys::ArrayBuffer>() {
@@ -515,9 +550,10 @@ impl WebClient {
     /// on that JS object.
     ///
     /// Note: the channel is **not** stored in this `WebClient`, so
-    /// [`send_frame`](Self::send_frame) / [`on_frame`](Self::on_frame) — which operate on the
-    /// *offerer's* own `createDataChannel` channel — do not apply to the answerer's inbound
-    /// channel. (Storing it would require `&mut self`; that lands with the P5-2 answerer wiring.)
+    /// [`send_frame`](Self::send_frame) / [`send_input`](Self::send_input) / [`on_frame`](Self::on_frame)
+    /// — which operate on the *offerer's* own `createDataChannel` channels — do not apply to the
+    /// answerer's inbound channel. (Storing it would require `&mut self`; that lands with the P5-2
+    /// answerer wiring.)
     ///
     /// Because the channel is delivered asynchronously, this takes a JS callback rather than
     /// returning the channel synchronously.
@@ -579,8 +615,9 @@ impl WebClient {
         s.to_owned()
     }
 
-    /// Close the underlying [`web_sys::RtcPeerConnection`], tearing down the DTLS session, the
-    /// DataChannel, and all ICE transports, and release the stored channel handle.
+    /// Close the underlying [`web_sys::RtcPeerConnection`], tearing down the DTLS session, both
+    /// DataChannels (video + input), and all ICE transports, and release the two stored channel
+    /// handles.
     ///
     /// Idempotent: calling `close()` on an already-closed connection is a no-op (the browser
     /// tolerates it).  After this, the client must not be reused — construct a new [`WebClient`]
@@ -589,7 +626,8 @@ impl WebClient {
     #[wasm_bindgen]
     pub fn close(&mut self) {
         self.pc.close();
-        self.channel = None;
+        self.video_channel = None;
+        self.input_channel = None;
     }
 
     // ── internal ─────────────────────────────────────────────────────────────

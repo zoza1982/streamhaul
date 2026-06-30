@@ -48,7 +48,10 @@ export interface WebClient {
   connect_as_answerer(remoteSdpOffer: string): Promise<string>;
   add_ice_candidate(candidate: string): Promise<void>;
   local_dtls_fingerprint(): Uint8Array;
+  /** Send on the video (primary) channel — host echo + channel-open HELLO + video. */
   send_frame(frame: Uint8Array): void;
+  /** Send a 16-byte SHP InputEvent on the dedicated Input DataChannel (ADR-0036). */
+  send_input(event: Uint8Array): void;
   on_frame(callback: (frame: Uint8Array) => void): void;
   on_data_channel(onOpen: (channel: RTCDataChannel) => void): void;
   on_ice_candidate(callback: (candidate: string | null) => void): void;
