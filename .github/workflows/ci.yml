@@ -577,3 +577,42 @@ jobs:
             exit 1
           fi
           echo "fuzz-checked ${found} crate(s)"
+
+  # ----------------------------------------------------------------------------
+  # Coverage gate (X-1) — enforces CLAUDE.md §5 (line-coverage floor on the
+  # security-critical core crates: sh-protocol = wire parsing of hostile bytes,
+  # sh-crypto = handshake/identity/pairing). The pinned toolchain already ships
+  # `llvm-tools` for this (rust-toolchain.toml).
+  #
+  # PER-CRATE floors, NOT an aggregate: a combined --fail-under would let one crate
+  # regress (e.g. sh-crypto → 50%) while another masks it. Each floor sits a few
+  # points below current coverage (sh-protocol ≈99.9%, sh-crypto ≈96%) to ratchet
+  # against regression while leaving headroom for legitimately hard-to-test code.
+  #
+  # `--ignore-filename-regex sh-types` excludes the transitively-compiled sh-types
+  # path-dep so each number reflects the crate's OWN code (cargo-llvm-cov's `-p`
+  # selects which test binaries run, NOT the report's file scope). `--all-features`
+  # matches the `test` job so feature-gated code is measured, not silently dropped.
+  #
+  # sh-transport is intentionally NOT gated yet: it sits at ≈74% (its live-network
+  # files connection/endpoint/quic_binding are R-WEBRTC-LIVE-deferred 0%, and
+  # channel/driver are under-tested) — raising it to the §5 bar is a tracked X-1
+  # follow-up before it joins this gate.
+  # ----------------------------------------------------------------------------
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: coverage
+      - name: Install cargo-llvm-cov (prebuilt, pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov@0.6.16
+      - name: sh-protocol line coverage >= 92% (CLAUDE.md §5)
+        run: cargo llvm-cov --package sh-protocol --all-features --ignore-filename-regex 'sh-types' --fail-under-lines 92 --summary-only
+      - name: sh-crypto line coverage >= 90% (CLAUDE.md §5)
+        run: cargo llvm-cov --package sh-crypto --all-features --ignore-filename-regex 'sh-types' --fail-under-lines 90 --summary-only
