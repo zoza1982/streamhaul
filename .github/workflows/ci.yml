@@ -509,3 +509,71 @@ jobs:
       - name: No Rust code yet
         if: steps.rust.outputs.present == 'false'
         run: echo "No Cargo.toml yet — audit gate is a no-op until Rust code lands."
+
+  # ----------------------------------------------------------------------------
+  # Fuzz-target compile-check (X-2).
+  # The cargo-fuzz crates are EXCLUDED from the workspace (their own workspaces;
+  # they need a nightly toolchain + libFuzzer), so a normal `cargo build/clippy`
+  # never sees them and a fuzz target that stops compiling rots undetected — a
+  # real gap that was previously only caught by hand (P3-3). We decode hostile
+  # network bytes, so these parsers MUST stay fuzzable (CLAUDE.md §5). This job
+  # type-checks every fuzz target on each PR/push (`cargo fuzz check` — no
+  # instrumented build, no fuzzing run; a scheduled nightly *run* is separate).
+  # ----------------------------------------------------------------------------
+  fuzz-build:
+    name: fuzz-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-fuzz requires a nightly toolchain; the repo otherwise pins 1.95.0
+      # via rust-toolchain.toml, so install nightly explicitly and invoke it with
+      # `cargo +nightly`.
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - name: Rust build cache (fuzz workspaces)
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Each fuzz crate is its own workspace with its own target/ dir (matches the
+          # excluded-crate cache pattern used by webrtc-preview). New crates can be added here;
+          # an un-listed one is simply not cached (still type-checked by the glob below).
+          workspaces: |
+            crates/sh-protocol/fuzz -> target
+            crates/sh-core/fuzz -> target
+            crates/sh-transport/fuzz -> target
+            crates/sh-codec-hw/fuzz -> target
+            crates/sh-crypto/fuzz -> target
+            crates/sh-signaling/fuzz -> target
+            crates/sh-ice/fuzz -> target
+            crates/sh-web-client/fuzz -> target
+          key: fuzz-nightly
+      - name: Install cargo-fuzz (prebuilt, pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: cargo fuzz check (every excluded fuzz crate)
+        run: |
+          set -euo pipefail
+          # Pin the sanitizer target to the gnu host triple. cargo-fuzz's *default* target varies
+          # by environment (it resolved to x86_64-unknown-linux-musl on the runner — whose static
+          # libc is incompatible with -Zsanitizer=address and isn't installed), so we force the
+          # gnu target: it ships with the toolchain and its dynamic glibc is ASan-compatible.
+          TARGET=x86_64-unknown-linux-gnu
+          # Auto-discover every crates/*/fuzz workspace so a newly added fuzz crate cannot be
+          # silently omitted (the exact rot this job exists to prevent). `set -e` + the bare
+          # `cargo fuzz check` means any target that stops compiling fails the job.
+          shopt -s nullglob
+          found=0
+          for fuzz_dir in crates/*/fuzz; do
+            [ -f "${fuzz_dir}/Cargo.toml" ] || continue
+            found=$((found + 1))
+            c="$(basename "$(dirname "${fuzz_dir}")")"
+            echo "::group::cargo fuzz check ${c}"
+            cargo +nightly fuzz check --fuzz-dir "${fuzz_dir}" --target "${TARGET}"
+            echo "::endgroup::"
+          done
+          # Guard against a silent no-op (e.g. a path/layout change that matches nothing).
+          if [ "${found}" -eq 0 ]; then
+            echo "::error::no crates/*/fuzz workspaces found — fuzz compile-check ran nothing" >&2
+            exit 1
+          fi
+          echo "fuzz-checked ${found} crate(s)"
