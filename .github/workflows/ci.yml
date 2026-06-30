@@ -506,6 +506,36 @@ jobs:
       - name: cargo audit
         if: steps.rust.outputs.present == 'true'
         run: cargo audit --deny warnings
+      - name: cargo audit (fuzz workspace lockfiles)
+        if: steps.rust.outputs.present == 'true'
+        run: |
+          set -euo pipefail
+          # The cargo-fuzz crates are EXCLUDED from the workspace, so the root `cargo audit` above
+          # doesn't cover them; each has its own Cargo.lock (libfuzzer-sys, arbitrary + the parent
+          # crate's deps). Audit every committed fuzz lockfile — same posture as the codec-openh264
+          # / preview jobs that audit their excluded crates' lockfiles (§7: cargo audit must be
+          # clean). Auto-discovered so a new fuzz crate is covered without editing this list.
+          shopt -s nullglob
+          found=0
+          for lock in crates/*/fuzz/Cargo.lock; do
+            found=$((found + 1))
+            echo "::group::cargo audit ${lock}"
+            cargo audit --deny warnings --file "${lock}"
+            echo "::endgroup::"
+          done
+          # Cross-check the audited count against the number of fuzz crates (discovered by
+          # Cargo.toml, exactly like the fuzz-build job). A fuzz crate whose Cargo.lock is missing or
+          # git-ignored would otherwise slip through un-audited with no error — so a mismatch is a
+          # hard failure, NOT a silent skip. (Every fuzz crate must commit its Cargo.lock.)
+          expected=0
+          for manifest in crates/*/fuzz/Cargo.toml; do
+            expected=$((expected + 1))
+          done
+          if [ "${found}" -ne "${expected}" ]; then
+            echo "::error::audited ${found} fuzz lockfile(s) but found ${expected} fuzz crate(s) — a Cargo.lock is missing or git-ignored; commit it" >&2
+            exit 1
+          fi
+          echo "audited ${found} fuzz lockfile(s)"
       - name: No Rust code yet
         if: steps.rust.outputs.present == 'false'
         run: echo "No Cargo.toml yet — audit gate is a no-op until Rust code lands."
