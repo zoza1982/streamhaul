@@ -38,7 +38,7 @@ use sh_protocol::{
 use sh_signaling::backoff::ExponentialBackoff;
 use sh_signaling::envelope::{MessageKind, SessionId, SignalingEnvelope};
 use sh_signaling::SignalingClient;
-use sh_transport::channel::Transport;
+use sh_transport::channel::{Channel, Transport};
 use sh_transport::driver::{spawn_webrtc_driver, AsyncUdpSocket as _, TokioUdpSocket};
 use sh_transport::webrtc::SdpBridgeBuilder;
 use sh_transport::{PinnedWebRtcTransport, TransportError};
@@ -1038,48 +1038,45 @@ async fn run_video_stream(
     source: &mut dyn VideoFrameSource,
     input: Box<dyn InputInjector>,
 ) -> anyhow::Result<()> {
-    info!("waiting for browser to open DataChannel (video mode)");
-    let mut channel = transport
-        .accept_channel()
-        .await
-        .context("failed to accept DataChannel")?;
-
     anyhow::ensure!(
         frames_to_send > 0,
         "--frames must be > 0 in video stream mode"
     );
     anyhow::ensure!(fps > 0, "StreamMode::Video fps must be > 0");
 
-    // ── Input injection runs on a DEDICATED blocking thread, never the async executor ──
-    //
-    // The `InputInjector` contract requires inject() to run off the runtime (XTEST etc. are
-    // synchronous OS calls that could stall the video loop). We move the injector onto a
-    // `spawn_blocking` task fed by a BOUNDED channel: the drain loop only `try_send`s decoded
-    // events (truly non-blocking), and the bounded queue is the natural backpressure / flood point
-    // (a full queue drops the event rather than blocking pacing). Dropping `input_tx` at the end
-    // signals the thread to exit.
-    let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<InputEvent>(INPUT_QUEUE_DEPTH);
-    let inject_task = tokio::task::spawn_blocking(move || {
-        let mut injector = input;
-        while let Some(event) = input_rx.blocking_recv() {
-            if let Err(e) = injector.inject(&event) {
-                // An injection failure (unsupported event / backend error) must not kill the
-                // session — log and keep going.
-                debug!(error = %e, "input injection failed");
-            }
-        }
-        // Session ended (queue closed): release any held buttons so a lost button-up event can't
-        // leave the controlled machine with a button stuck down (ADR-0034 follow-up).
-        injector.release_all();
-    });
-    info!(
-        target = frames_to_send,
-        fps, "streaming H.264 video frames to browser"
-    );
+    info!("waiting for browser to open DataChannel(s) (video mode)");
+    let (video_ch, input_ch) = accept_video_and_input(transport).await?;
 
     // `checked_div` (not `/`) satisfies the arithmetic-side-effects lint; the `fps > 0` guard above
     // makes the divisor non-zero, so the `unwrap_or` fallback is unreachable.
     let per_us = 1_000_000u64.checked_div(u64::from(fps)).unwrap_or(1).max(1);
+    info!(
+        target = frames_to_send,
+        fps,
+        has_input_channel = input_ch.is_some(),
+        "streaming H.264 video frames to browser"
+    );
+
+    // Dedicated Input channel present (ADR-0036): stream video and a dedicated input task on
+    // SEPARATE SCTP streams — input is delivered the instant it arrives, not gated by frame pacing
+    // (lowest click-to-photon). Otherwise fall back to the legacy single-channel path below, which
+    // drains input between video frames (≤ one frame interval).
+    if let Some(input_ch) = input_ch {
+        return run_video_dual(
+            video_ch,
+            input_ch,
+            frames_to_send,
+            per_us,
+            max_fragment_bytes,
+            source,
+            input,
+        )
+        .await;
+    }
+
+    // ── Legacy single-channel path: input drained between video frames (ADR-0034). ──
+    let mut channel = video_ch;
+    let (input_tx, inject_task) = spawn_injection_thread(input);
     let mut ticker = tokio::time::interval(Duration::from_micros(per_us));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1097,85 +1094,40 @@ async fn run_video_stream(
     let mut stream_err: Option<anyhow::Error> = None;
     'stream: while sent < frames_to_send {
         ticker.tick().await;
-        let (frame_type, payload) = match source.next_frame() {
-            Ok(v) => v,
-            Err(e) => {
-                stream_err = Some(e);
-                break 'stream;
-            }
-        };
-        let n = sent as u64;
-        // frame_id is a 24-bit wire field; mask into range. (`try_from` rather than `as u32` to
-        // satisfy the cast-truncation lint; the mask guarantees it fits, so this never errors.)
-        // Timestamps advance monotonically (WebCodecs wants increasing chunk timestamps);
-        // encode() narrows them to their low 32 wire bits.
-        let frame_id = u32::try_from(n & u64::from(MAX_FRAME_ID)).unwrap_or(0);
-        let ts_us = n.wrapping_mul(per_us);
-        // Fragment the access unit into ≤ `max_fragment_bytes` SHP messages (ADR-0033). Removes the
-        // hard 64 KiB per-frame cap; the receiver reassembles by frame_id. The only error is a
-        // frame needing > 255 fragments (pathological, ~16 MiB) — drop + re-arm a keyframe.
-        let fragments = match build_shp_video_fragments(
+        match send_one_frame(
+            &mut *channel,
+            source,
+            sent as u64,
+            per_us,
             sequence,
-            frame_id,
-            ts_us,
-            frame_type,
-            &payload,
             max_fragment_bytes,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!(bytes = payload.len(), error = %e, "frame needs > 255 fragments — dropping");
-                source.request_keyframe();
-                continue;
-            }
-        };
-        // fragments.len() <= 255 (the total_frags u8 cap), so this never errors — but end the stream
-        // (running the teardown) rather than fall back to a wrong count that would corrupt every
-        // later sequence number.
-        let num_frags = match u16::try_from(fragments.len())
-            .context("fragment count exceeded u16 (invariant)")
+        )
+        .await
         {
-            Ok(v) => v,
-            Err(e) => {
-                stream_err = Some(e);
+            FrameStep::Sent(num_frags) => {
+                sent = sent.saturating_add(1);
+                sequence = sequence.wrapping_add(num_frags);
+            }
+            FrameStep::Skipped => continue,
+            FrameStep::PeerClosed => {
+                info!(frames = sent, "peer closed channel — ending video stream");
                 break 'stream;
             }
-        };
-        // Send every fragment in order. A send failure means the browser closed the DataChannel — a
-        // NORMAL end of stream (the viewer disconnected), not a host error: exit 0.
-        for frag in fragments {
-            if let Err(e) = channel.send(frag).await {
-                info!(frames = sent, error = %e, "peer closed channel — ending video stream");
+            FrameStep::Failed(e) => {
+                stream_err = Some(e);
                 break 'stream;
             }
         }
-        sent = sent.saturating_add(1);
-        sequence = sequence.wrapping_add(num_frags);
 
-        // Drain any browser→host input that arrived while pacing/sending this frame and hand it to
-        // the injection thread. `timeout(ZERO, recv())` is a single non-blocking poll: it returns a
-        // buffered message immediately or elapses with no idle wait. recv() is cancel-safe: it only
-        // consumes a message after popping it from the queue under the mutex, so cancelling the
-        // ZERO-timeout future at its internal `notified().await` leaves the queue untouched and the
-        // message available on the next poll. We cap the drain at `MAX_INPUT_PER_FRAME` so a flood
-        // can't starve the video send loop; the bounded `input_tx` channel is the second backpressure
-        // point (a full queue drops the event rather than blocking).
+        // Drain any browser→host input that arrived while pacing/sending this frame. `timeout(ZERO,
+        // recv())` is a single non-blocking poll (recv is cancel-safe: it pops from the queue under
+        // the mutex before awaiting, so cancelling leaves the message for the next poll). The
+        // per-frame cap (`MAX_INPUT_PER_FRAME`) stops a flood from starving the video send loop; the
+        // bounded `input_tx` channel is the second backpressure point.
         for _ in 0..MAX_INPUT_PER_FRAME {
             match tokio::time::timeout(Duration::ZERO, channel.recv()).await {
                 Ok(Ok(Some(bytes))) => {
-                    if let Some(event) = decode_input(&bytes) {
-                        // Rate-limit drop-safe high-rate floods (pointer-move + wheel); state
-                        // transitions (Button/Key) always pass (see `admit_input`). Gating the
-                        // high-rate events here, before the bounded queue, also relieves queue
-                        // pressure on the Button/Key events.
-                        if admit_input(&event, &mut input_limiter, Instant::now()) {
-                            // Non-blocking enqueue to the injection thread; a full queue drops the
-                            // event (backpressure) rather than stalling video pacing.
-                            let _ = input_tx.try_send(event);
-                        } else {
-                            throttled_events = throttled_events.saturating_add(1);
-                        }
-                    }
+                    forward_input(&bytes, &input_tx, &mut input_limiter, &mut throttled_events);
                 }
                 Ok(Ok(None)) => {
                     info!(frames = sent, "peer closed channel — ending video stream");
@@ -1215,6 +1167,332 @@ async fn run_video_stream(
             Ok(())
         }
     }
+}
+
+/// The video channel plus an optional dedicated Input channel (ADR-0036), resolved from the
+/// peer's opened DataChannels.
+type VideoAndInput = (Box<dyn Channel>, Option<Box<dyn Channel>>);
+
+/// Bounded wait for the OPTIONAL second (Input) DataChannel after the first channel is accepted.
+///
+/// A single-channel (legacy) peer never opens an Input channel, so we must NOT block on the
+/// transport's full 30 s accept timeout waiting for one. A two-channel browser creates BOTH channels
+/// before `createOffer`, so their `ChannelOpen` events arrive within the same DTLS/SCTP setup window
+/// (tens of ms apart) — 2 s is a ~100× margin over that skew.
+///
+/// **Cost:** until PR 2 ships (browser opens both channels), EVERY legacy session pays this full
+/// wait before video starts. Hence 2 s, not more — it is dead time on the only client that exists
+/// pre-PR-2. (It must still comfortably exceed the real two-channel open skew, or a genuine
+/// two-channel peer would be mis-classified as single-channel and its input lost.)
+const INPUT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Accept the video channel and an optional dedicated Input channel (ADR-0036).
+///
+/// Accepts the first channel (transport's normal timeout), then waits a BOUNDED time for an
+/// optional second, and classifies both by parsed [`Channel::spec`]`().channel` — order-independent,
+/// since SCTP stream numbering need not match the browser's `createDataChannel` order. A legacy
+/// single-channel peer (whose `"shp"` label parses to [`ChannelId::Control`]) yields `(video, None)`
+/// and uses the between-frames drain path.
+///
+/// # Errors
+/// Returns an error if the first channel cannot be accepted, or if no usable video channel opened.
+async fn accept_video_and_input(
+    transport: &PinnedWebRtcTransport,
+) -> anyhow::Result<VideoAndInput> {
+    let first = transport
+        .accept_channel()
+        .await
+        .context("failed to accept the first DataChannel")?;
+    // A `tokio::time::timeout` cancels `accept_channel` if it elapses; `accept_channel` is
+    // cancel-safe (it pops from the accept queue under the lock BEFORE awaiting), so a channel that
+    // arrives later simply stays queued rather than being lost.
+    let second = match tokio::time::timeout(INPUT_ACCEPT_TIMEOUT, transport.accept_channel()).await
+    {
+        Ok(Ok(ch)) => Some(ch),
+        // The transport's own timeout/closed, or our bounded wait elapsing → no second channel.
+        Ok(Err(_)) | Err(_) => None,
+    };
+    classify_channels([Some(first), second].into_iter().flatten().collect())
+}
+
+/// Partition accepted channels into `(video, optional input)` by parsed [`ChannelSpec`] — pure +
+/// order-independent (SCTP stream numbering need not match the browser's `createDataChannel` order).
+///
+/// [`ChannelId::Input`] → the input channel; anything else (Video, or the legacy `"shp"` label that
+/// parses to Control) → the video channel. A second video-class channel is ignored.
+///
+/// # Errors
+/// Returns an error if no usable video channel is present.
+fn classify_channels(channels: Vec<Box<dyn Channel>>) -> anyhow::Result<VideoAndInput> {
+    let mut video: Option<Box<dyn Channel>> = None;
+    let mut input: Option<Box<dyn Channel>> = None;
+    for ch in channels {
+        match ch.spec().channel {
+            ChannelId::Input => {
+                if input.is_some() {
+                    warn!("ignoring unexpected extra Input DataChannel");
+                }
+                input = Some(ch);
+            }
+            other => {
+                if video.is_none() {
+                    video = Some(ch);
+                } else {
+                    warn!(channel = ?other, "ignoring unexpected extra DataChannel");
+                }
+            }
+        }
+    }
+    let video = video.context("peer opened no usable video DataChannel")?;
+    Ok((video, input))
+}
+
+/// Spawn the dedicated injection thread.
+///
+/// The [`InputInjector`] contract requires `inject()` to run OFF the async runtime (XTEST etc. are
+/// synchronous OS calls that could stall the executor). The thread is fed by a BOUNDED channel
+/// (the natural backpressure/flood point — a full queue drops rather than blocks). When **all**
+/// senders drop, the thread exits its `blocking_recv` loop and runs
+/// [`InputInjector::release_all`](sh_input::InputInjector::release_all) so a disconnect can't leave
+/// a button stuck (ADR-0034). (`release_all` runs on every sender-drop path; it would be skipped
+/// only if an `inject()` call itself panicked and unwound the thread — the injector impls are
+/// panic-free by construction, so this is not reachable in practice.) Returns the sender + handle.
+fn spawn_injection_thread(
+    input: Box<dyn InputInjector>,
+) -> (
+    tokio::sync::mpsc::Sender<InputEvent>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent>(INPUT_QUEUE_DEPTH);
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut injector = input;
+        while let Some(event) = rx.blocking_recv() {
+            if let Err(e) = injector.inject(&event) {
+                // An injection failure (unsupported event / backend error) must not kill the
+                // session — log and keep going.
+                debug!(error = %e, "input injection failed");
+            }
+        }
+        // All senders dropped (session ending): release any held button/key.
+        injector.release_all();
+    });
+    (tx, handle)
+}
+
+/// Decode + admit one inbound input message and forward it to the injection thread.
+/// Shared by the legacy drain and the dedicated input task. Malformed bytes are ignored;
+/// throttled (rate-limited) events bump `throttled` instead of being enqueued.
+fn forward_input(
+    bytes: &[u8],
+    input_tx: &tokio::sync::mpsc::Sender<InputEvent>,
+    limiter: &mut RateLimiter,
+    throttled: &mut u64,
+) {
+    if let Some(event) = decode_input(bytes) {
+        if admit_input(&event, limiter, Instant::now()) {
+            // Non-blocking enqueue; a full queue drops the event (backpressure), never blocks.
+            let _ = input_tx.try_send(event);
+        } else {
+            *throttled = throttled.saturating_add(1);
+        }
+    }
+}
+
+/// Outcome of attempting to send one video frame (see [`send_one_frame`]).
+enum FrameStep {
+    /// Sent as `num_frags` SHP fragments; advance the sequence by this much.
+    Sent(u16),
+    /// Dropped (needed > 255 fragments) and a keyframe was re-armed — keep going.
+    Skipped,
+    /// A fragment send failed: the peer closed the channel — a NORMAL end of stream.
+    PeerClosed,
+    /// The frame source or a fragment-count invariant failed — an abnormal end.
+    Failed(anyhow::Error),
+}
+
+/// Build and send one video frame as SHP fragments. Shared by both the legacy single-channel loop
+/// and the dual-channel `run_video_send_loop` so the intricate fragmentation/sequence logic lives in
+/// exactly one place. On a send failure it returns [`FrameStep::PeerClosed`] WITHOUT logging — the
+/// caller logs it once, with the frame count for context (avoids a duplicate log line).
+async fn send_one_frame(
+    channel: &mut dyn Channel,
+    source: &mut dyn VideoFrameSource,
+    sent_index: u64,
+    per_us: u64,
+    sequence: u16,
+    max_fragment_bytes: usize,
+) -> FrameStep {
+    let (frame_type, payload) = match source.next_frame() {
+        Ok(v) => v,
+        Err(e) => return FrameStep::Failed(e),
+    };
+    // frame_id is a 24-bit wire field; mask into range (`try_from` not `as` for the cast lint).
+    let frame_id = u32::try_from(sent_index & u64::from(MAX_FRAME_ID)).unwrap_or(0);
+    let ts_us = sent_index.wrapping_mul(per_us);
+    let fragments = match build_shp_video_fragments(
+        sequence,
+        frame_id,
+        ts_us,
+        frame_type,
+        &payload,
+        max_fragment_bytes,
+    ) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!(bytes = payload.len(), error = %e, "frame needs > 255 fragments — dropping");
+            source.request_keyframe();
+            return FrameStep::Skipped;
+        }
+    };
+    let num_frags =
+        match u16::try_from(fragments.len()).context("fragment count exceeded u16 (invariant)") {
+            Ok(v) => v,
+            Err(e) => return FrameStep::Failed(e),
+        };
+    for frag in fragments {
+        // A send failure means the peer closed the DataChannel — a NORMAL end of stream. Return
+        // without logging; the caller logs once with the frame count.
+        if channel.send(frag).await.is_err() {
+            return FrameStep::PeerClosed;
+        }
+    }
+    FrameStep::Sent(num_frags)
+}
+
+/// Video send loop with NO inline input drain — the dual-channel path (ADR-0036) handles input on a
+/// dedicated task/channel, so the video loop is never coupled to input pacing.
+async fn run_video_send_loop(
+    mut video_ch: Box<dyn Channel>,
+    frames_to_send: usize,
+    per_us: u64,
+    max_fragment_bytes: usize,
+    source: &mut dyn VideoFrameSource,
+) -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_micros(per_us));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut sent: usize = 0;
+    let mut sequence: u16 = 0;
+    while sent < frames_to_send {
+        ticker.tick().await;
+        match send_one_frame(
+            &mut *video_ch,
+            source,
+            sent as u64,
+            per_us,
+            sequence,
+            max_fragment_bytes,
+        )
+        .await
+        {
+            FrameStep::Sent(n) => {
+                sent = sent.saturating_add(1);
+                sequence = sequence.wrapping_add(n);
+            }
+            FrameStep::Skipped => continue,
+            FrameStep::PeerClosed => {
+                info!(frames = sent, "peer closed channel — ending video stream");
+                return Ok(());
+            }
+            FrameStep::Failed(e) => return Err(e),
+        }
+    }
+    info!(frames = sent, "video stream complete");
+    Ok(())
+}
+
+/// Dedicated input-receive task (dual-channel path): own the Input channel and forward every event
+/// to the injection thread the instant it arrives — no frame-pacing coupling. Returns when the peer
+/// closes/errors the channel (or it is aborted at session end). Its `input_tx` clone drops on
+/// return, removing one sender from the injection thread's view.
+async fn run_input_recv(
+    mut input_ch: Box<dyn Channel>,
+    input_tx: tokio::sync::mpsc::Sender<InputEvent>,
+) {
+    let mut limiter = RateLimiter::new(MAX_THROTTLED_INPUT_PER_SEC, THROTTLED_INPUT_BURST);
+    let mut throttled: u64 = 0;
+    loop {
+        match input_ch.recv().await {
+            Ok(Some(bytes)) => forward_input(&bytes, &input_tx, &mut limiter, &mut throttled),
+            Ok(None) => {
+                info!("input channel closed by peer");
+                break;
+            }
+            Err(e) => {
+                info!(error = %e, "input channel recv error");
+                break;
+            }
+        }
+    }
+    if throttled > 0 {
+        warn!(
+            throttled_events = throttled,
+            "throttled high-rate input events (pointer-move/wheel — hostile-input guard)"
+        );
+    }
+}
+
+/// Dual-channel session (ADR-0036): video send loop + dedicated input task on separate SCTP
+/// streams. The video loop runs INLINE (it borrows `source`, so it can't be `spawn`ed); the input
+/// task is spawned (all-owned). Whichever ends first ends the session.
+///
+/// # Teardown (safety-critical)
+/// The injection thread is fed by a bounded mpsc held by TWO sender clones — the input task's and
+/// the outer one here. On every exit (video done, peer-close on either channel, error, or a task
+/// panic) the input task is aborted+awaited (dropping its clone) and the outer clone is dropped, so
+/// the injection thread sees all senders gone and runs `release_all()` — no held button can leak.
+async fn run_video_dual(
+    video_ch: Box<dyn Channel>,
+    input_ch: Box<dyn Channel>,
+    frames_to_send: usize,
+    per_us: u64,
+    max_fragment_bytes: usize,
+    source: &mut dyn VideoFrameSource,
+    input: Box<dyn InputInjector>,
+) -> anyhow::Result<()> {
+    let (input_tx, inject_task) = spawn_injection_thread(input);
+    // Spawn the dedicated input task (all-owned ⇒ `'static`); it holds its OWN sender clone.
+    let mut input_handle = tokio::spawn(run_input_recv(input_ch, input_tx.clone()));
+
+    // The video loop borrows `source`, so it runs inline (not spawned). Race it against the input
+    // task: whichever finishes first ends the session.
+    let video_fut =
+        run_video_send_loop(video_ch, frames_to_send, per_us, max_fragment_bytes, source);
+    tokio::pin!(video_fut);
+    let mut input_finished = false;
+    let result = tokio::select! {
+        r = &mut video_fut => r,
+        join = &mut input_handle => {
+            // The input task ended: a clean peer close/error, OR an unexpected panic. Surface a
+            // panic (don't silently end the session as a clean close); teardown is unaffected either
+            // way — the task's sender clone drops on unwind, so `release_all()` still fires.
+            if join.as_ref().is_err_and(tokio::task::JoinError::is_panic) {
+                warn!("input recv task panicked — ending session (held input released)");
+            }
+            // End the session. The in-flight `video_fut` is dropped — its await points
+            // (`ticker.tick()` and `channel.send()`) are both cancel-safe (at worst a partial
+            // fragment is lost, and the session is ending anyway).
+            input_finished = true;
+            Ok(())
+        }
+    };
+
+    // ── Teardown — runs on EVERY exit so `release_all()` always fires (ADR-0034). ──
+    // If the input task already finished (its arm fired), its `JoinHandle` was polled to completion
+    // — polling it again would panic ("JoinHandle polled after completion") — and its sender clone
+    // already dropped when the task returned. Otherwise (video ended first) the input task is still
+    // running: abort + await it so its sender clone drops.
+    if !input_finished {
+        input_handle.abort();
+        let _ = input_handle.await;
+    }
+    drop(input_tx); // drop the outer clone → injection thread sees all senders gone
+    let _ = inject_task.await; // injection thread exits its loop and runs release_all()
+
+    match &result {
+        Ok(()) => info!("video stream complete (dual-channel)"),
+        Err(_) => warn!("video stream ended with error (held input released)"),
+    }
+    result
 }
 
 /// Decide whether a decoded input event is admitted past the hostile-input rate limiter.
@@ -1290,6 +1568,273 @@ mod tests {
         Codec, CommonHeader, FrameType, VideoHeader, COMMON_HEADER_LEN, INPUT_EVENT_LEN,
     };
     use sh_types::ChannelId;
+
+    /// Dedicated-input-channel (ADR-0036) host logic: channel classification + the safety-critical
+    /// dual-channel teardown (`release_all` must fire on every exit order).
+    mod dual {
+        use super::super::{classify_channels, run_video_dual, VideoFrameSource};
+        use bytes::Bytes;
+        use sh_input::{InputError, InputInjector};
+        use sh_protocol::{EventType, FrameType, InputEvent, Modifiers};
+        use sh_transport::channel::{Channel, ChannelSpec};
+        use sh_transport::TransportError;
+        use sh_types::ChannelId;
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        type RecvQueue = VecDeque<Result<Option<Bytes>, TransportError>>;
+
+        /// A `Channel` test double: counts sends; replays a scripted `recv` queue, then either closes
+        /// (`Ok(None)`) or pends forever — so a test can drive either exit order.
+        struct MockChannel {
+            spec: ChannelSpec,
+            recvs: Mutex<RecvQueue>,
+            pend_when_empty: bool,
+            sent: Arc<Mutex<usize>>,
+        }
+
+        impl MockChannel {
+            fn boxed(spec: ChannelSpec) -> Box<dyn Channel> {
+                Box::new(Self {
+                    spec,
+                    recvs: Mutex::new(VecDeque::new()),
+                    pend_when_empty: false,
+                    sent: Arc::new(Mutex::new(0)),
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for MockChannel {
+            async fn send(&mut self, _msg: Bytes) -> Result<(), TransportError> {
+                *self.sent.lock().unwrap() += 1;
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<Option<Bytes>, TransportError> {
+                let next = self.recvs.lock().unwrap().pop_front();
+                match next {
+                    Some(r) => r,
+                    // Never resolves — keeps the channel "open" so a test can drive the other exit
+                    // path. `pending()` yields the arm's own type, so no `unreachable!` is needed.
+                    None if self.pend_when_empty => std::future::pending().await,
+                    None => Ok(None),
+                }
+            }
+            fn spec(&self) -> &ChannelSpec {
+                &self.spec
+            }
+        }
+
+        /// An `InputInjector` that records inject count and whether `release_all` fired.
+        struct TrackingInjector {
+            injected: Arc<AtomicUsize>,
+            released: Arc<AtomicBool>,
+        }
+        impl InputInjector for TrackingInjector {
+            fn inject(&mut self, _e: &InputEvent) -> Result<(), InputError> {
+                self.injected.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn release_all(&mut self) {
+                self.released.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// A `VideoFrameSource` yielding a tiny single-fragment IDR each call (the loop bounds count).
+        struct TestFrameSource;
+        impl VideoFrameSource for TestFrameSource {
+            fn next_frame(&mut self) -> anyhow::Result<(FrameType, Vec<u8>)> {
+                Ok((FrameType::Idr, vec![0u8; 8]))
+            }
+        }
+
+        /// A 16-byte encoded `Button` event (always admitted past the rate limiter).
+        fn button_bytes() -> Bytes {
+            let ev = InputEvent {
+                event_type: EventType::Button,
+                modifiers: Modifiers::empty(),
+                pointer_x: 0,
+                pointer_y: 0,
+                button_mask: 0x01,
+                key_code: 0,
+                scroll_x: 0,
+                scroll_y: 0,
+                pressure: 0,
+            };
+            Bytes::copy_from_slice(&ev.encode())
+        }
+
+        #[test]
+        fn classify_routes_by_spec_order_independent() {
+            // video then input
+            let (v, i) = classify_channels(vec![
+                MockChannel::boxed(ChannelSpec::video()),
+                MockChannel::boxed(ChannelSpec::input()),
+            ])
+            .unwrap();
+            assert_eq!(v.spec().channel, ChannelId::Video);
+            assert_eq!(i.unwrap().spec().channel, ChannelId::Input);
+            // input then video (reversed open order) → same routing
+            let (v, i) = classify_channels(vec![
+                MockChannel::boxed(ChannelSpec::input()),
+                MockChannel::boxed(ChannelSpec::video()),
+            ])
+            .unwrap();
+            assert_eq!(v.spec().channel, ChannelId::Video);
+            assert_eq!(i.unwrap().spec().channel, ChannelId::Input);
+        }
+
+        #[test]
+        fn classify_legacy_single_control_is_video_no_input() {
+            // Today's browser opens one "shp" channel that parses to Control → routed as video, no
+            // input channel → the caller uses the legacy between-frames drain.
+            let (v, i) =
+                classify_channels(vec![MockChannel::boxed(ChannelSpec::control())]).unwrap();
+            assert_eq!(v.spec().channel, ChannelId::Control);
+            assert!(i.is_none());
+        }
+
+        #[test]
+        fn classify_no_video_errors() {
+            // Only an input channel and nothing video-class → no usable video → error.
+            assert!(classify_channels(vec![MockChannel::boxed(ChannelSpec::input())]).is_err());
+        }
+
+        #[tokio::test]
+        async fn dual_releases_input_when_input_channel_closes() {
+            let injected = Arc::new(AtomicUsize::new(0));
+            let released = Arc::new(AtomicBool::new(false));
+            let injector = Box::new(TrackingInjector {
+                injected: injected.clone(),
+                released: released.clone(),
+            });
+
+            // Video channel: never closes (pends on recv — though the dual path never recvs here),
+            // accepts every send. Many frames so it can't finish before input closes.
+            let video = Box::new(MockChannel {
+                spec: ChannelSpec::video(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: Arc::new(Mutex::new(0)),
+            });
+            // Input channel: two Button events, then closes (Ok(None)).
+            let mut recvs = VecDeque::new();
+            recvs.push_back(Ok(Some(button_bytes())));
+            recvs.push_back(Ok(Some(button_bytes())));
+            let input = Box::new(MockChannel {
+                spec: ChannelSpec::input(),
+                recvs: Mutex::new(recvs),
+                pend_when_empty: false,
+                sent: Arc::new(Mutex::new(0)),
+            });
+
+            let mut source = TestFrameSource;
+            let result = run_video_dual(
+                video,
+                input,
+                1_000_000,
+                1_000,
+                64_000,
+                &mut source,
+                injector,
+            )
+            .await;
+
+            assert!(result.is_ok(), "input-close is a normal end of stream");
+            assert!(
+                released.load(Ordering::SeqCst),
+                "release_all MUST fire when the input channel closes mid-session"
+            );
+            assert_eq!(
+                injected.load(Ordering::SeqCst),
+                2,
+                "both input events must be injected before the session ends"
+            );
+        }
+
+        #[tokio::test]
+        async fn dual_releases_input_when_video_completes() {
+            let released = Arc::new(AtomicBool::new(false));
+            let injector = Box::new(TrackingInjector {
+                injected: Arc::new(AtomicUsize::new(0)),
+                released: released.clone(),
+            });
+
+            let video_sent = Arc::new(Mutex::new(0usize));
+            let video = Box::new(MockChannel {
+                spec: ChannelSpec::video(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: video_sent.clone(),
+            });
+            // Input channel stays open (pends forever) — the input task never ends on its own, so the
+            // VIDEO completion must drive teardown.
+            let input = Box::new(MockChannel {
+                spec: ChannelSpec::input(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: Arc::new(Mutex::new(0)),
+            });
+
+            let mut source = TestFrameSource;
+            let result =
+                run_video_dual(video, input, 3, 1_000, 64_000, &mut source, injector).await;
+
+            assert!(result.is_ok());
+            assert!(
+                released.load(Ordering::SeqCst),
+                "release_all MUST fire when the video stream completes (input task aborted)"
+            );
+            assert_eq!(*video_sent.lock().unwrap(), 3, "all 3 frames must be sent");
+        }
+
+        /// A `VideoFrameSource` that always errors — drives the abnormal (`FrameStep::Failed`) exit.
+        struct FailingFrameSource;
+        impl VideoFrameSource for FailingFrameSource {
+            fn next_frame(&mut self) -> anyhow::Result<(FrameType, Vec<u8>)> {
+                Err(anyhow::anyhow!("synthetic frame-source failure"))
+            }
+        }
+
+        #[tokio::test]
+        async fn dual_releases_input_when_video_source_errors() {
+            let released = Arc::new(AtomicBool::new(false));
+            let injector = Box::new(TrackingInjector {
+                injected: Arc::new(AtomicUsize::new(0)),
+                released: released.clone(),
+            });
+            let video = MockChannel::boxed(ChannelSpec::video());
+            // Input pends (stays open) so the VIDEO source error must drive teardown.
+            let input = Box::new(MockChannel {
+                spec: ChannelSpec::input(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: Arc::new(Mutex::new(0)),
+            });
+            let mut source = FailingFrameSource;
+            let result =
+                run_video_dual(video, input, 5, 1_000, 64_000, &mut source, injector).await;
+            assert!(result.is_err(), "a source error is an abnormal end → Err");
+            assert!(
+                released.load(Ordering::SeqCst),
+                "release_all MUST fire on a video-source error (abnormal exit)"
+            );
+        }
+
+        #[test]
+        fn classify_duplicate_input_keeps_one_no_panic() {
+            // A hostile peer opening two Input channels must not panic; the last wins (warned).
+            let (v, i) = classify_channels(vec![
+                MockChannel::boxed(ChannelSpec::video()),
+                MockChannel::boxed(ChannelSpec::input()),
+                MockChannel::boxed(ChannelSpec::input()),
+            ])
+            .unwrap();
+            assert_eq!(v.spec().channel, ChannelId::Video);
+            assert_eq!(i.unwrap().spec().channel, ChannelId::Input);
+        }
+    }
 
     /// The Noise sub-type wire values are a cross-language contract with the browser driver
     /// (`clients/web/e2e/browser-native.ts`). Pin the exact numeric values here so a change on the
