@@ -61,6 +61,24 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz@0.13.2
+      # Persist the libFuzzer corpus across nightly runs (rolling cache). Without this each run
+      # cold-starts and only re-finds shallow paths reachable within FUZZ_SECONDS; restoring the
+      # prior corpus lets coverage ACCUMULATE so successive nights probe deeper. cargo-fuzz reads
+      # and grows each target's corpus under <fuzz_dir>/corpus/<target>/ automatically.
+      #
+      # Restore + save are SPLIT (not the combined `actions/cache`) so the save runs `if: always()`.
+      # The combined action's post-save is skipped on a failed job — which would discard the
+      # freshly-grown corpus of ALL crates on exactly the nights a target crashed (the
+      # coverage-richest inputs, found while driving toward the crash). The unique run-id `key`
+      # forces a restore miss so `restore-keys` seeds from the most recent prior corpus; the same
+      # key is writable on save.
+      - name: Restore fuzz corpus (rolling)
+        uses: actions/cache/restore@v4
+        with:
+          path: crates/*/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
       - name: Fuzz every target (bounded)
         env:
           # workflow_dispatch input, or 60s on the nightly schedule.
@@ -112,6 +130,21 @@ jobs:
             exit 1
           fi
           echo "fuzzed ${ran} target(s); all clean"
+      # Log the corpus footprint so unbounded growth is visible in the run logs as an early warning
+      # (the rolling cache only ever grows — cargo-fuzz does not auto-minimize; a periodic
+      # `cargo fuzz cmin` / old-cache cleanup is a tracked follow-up if it approaches the 10 GB
+      # per-repo Actions cache budget shared with the build cache). Runs even on a red run.
+      - name: Report corpus size
+        if: always()
+        run: du -sh crates/*/fuzz/corpus 2>/dev/null || echo "no corpus dirs yet"
+      # Save unconditionally (incl. after a crash/timeout) so corpus growth is never discarded.
+      # `actions/cache/save` ignores restore-keys (save-only); the unique run-id key is writable.
+      - name: Save fuzz corpus (rolling)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: crates/*/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
       - name: Upload crash artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
