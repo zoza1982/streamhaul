@@ -83,6 +83,20 @@ pub fn parse_sdp_fingerprint(sdp: &str) -> Result<Vec<u8>, JsValue> {
     parse_sdp_fingerprint_inner(sdp).map_err(|e| JsError::new(e).into())
 }
 
+/// Host-callable entry point for the parser, used by the `cargo-fuzz` harness.
+///
+/// The `#[wasm_bindgen]` [`parse_sdp_fingerprint`] wrapper cannot run off-wasm — building its
+/// `JsValue`/`JsError` return aborts in wasm-bindgen glue on a native target — so libFuzzer (which
+/// runs on the host) must call this seam instead. It is the **same** parsing/validation logic with
+/// a plain `&'static str` error in place of `JsValue`; it adds no behavior and is `#[doc(hidden)]`
+/// (a test seam, not public API). Keeping this hostile-input SDP parser fuzz-covered on the native
+/// target requires a host-callable entry point, since `#[wasm_bindgen]` exports are not linkable
+/// outside wasm.
+#[doc(hidden)]
+pub fn parse_sdp_fingerprint_host(sdp: &str) -> Result<Vec<u8>, &'static str> {
+    parse_sdp_fingerprint_inner(sdp)
+}
+
 /// Internal parser returning a `&'static str` error so callers can map it once.
 ///
 /// SDP lines are separated by CRLF or LF; we split on `\n` and trim a trailing `\r`.
@@ -648,6 +662,27 @@ a=setup:actpass\r\n";
         assert_eq!(fp[0], 0xAA);
         assert_eq!(fp[1], 0xBB);
         assert_eq!(fp[31], 0x99);
+    }
+
+    #[wasm_bindgen_test]
+    fn host_seam_matches_inner_parser() {
+        // The `parse_sdp_fingerprint_host` fuzz seam must stay a pure delegate to the real parser,
+        // so the nightly fuzzer exercises production logic — not a drifted copy. Lock that contract.
+        assert_eq!(
+            crate::parse_sdp_fingerprint_host(SAMPLE_SDP),
+            crate::parse_sdp_fingerprint_inner(SAMPLE_SDP),
+            "host seam must return exactly what the inner parser returns on valid SDP"
+        );
+        assert_eq!(
+            crate::parse_sdp_fingerprint_host("v=0\r\ns=-\r\n"),
+            crate::parse_sdp_fingerprint_inner("v=0\r\ns=-\r\n"),
+            "host seam must propagate the inner parser's error verbatim"
+        );
+        // And it satisfies the fuzz target's invariant directly.
+        assert_eq!(
+            crate::parse_sdp_fingerprint_host(SAMPLE_SDP).unwrap().len(),
+            32
+        );
     }
 
     #[wasm_bindgen_test]
