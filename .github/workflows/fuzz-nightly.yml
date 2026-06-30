@@ -1,0 +1,122 @@
+# Scheduled fuzzing (X-2). Companion to the per-PR `fuzz-build` job in ci.yml:
+# that job only *type-checks* the excluded cargo-fuzz targets (cheap, every PR);
+# this workflow actually *runs* libFuzzer against every target on a nightly
+# schedule (and on demand), giving the hostile-input parsers the continuous
+# fuzzing CLAUDE.md §5 mandates ("cargo-fuzz for any parser of untrusted network
+# bytes"). A crash fails the run and the reproducing input is uploaded as an
+# artifact.
+#
+# It is NOT a per-PR gate (running 19 instrumented targets is too slow for that);
+# trigger it manually via the Actions tab / `gh workflow run fuzz-nightly.yml`
+# (workflow_dispatch) to validate a change to the fuzz harnesses.
+name: fuzz-nightly
+
+on:
+  schedule:
+    # 06:00 UTC daily.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "60"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly-${{ github.ref }}
+  # Queue, don't cancel: a manual validation dispatch must not kill a long
+  # in-progress nightly fuzz run (and vice-versa).
+  cancel-in-progress: false
+
+jobs:
+  fuzz-run:
+    name: fuzz-run
+    runs-on: ubuntu-latest
+    # 19 ASan-instrumented builds + 19×60s fuzzing; generous headroom for a cold
+    # rust-cache so a slow build isn't misreported as a (crash) failure.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-fuzz needs nightly; the repo otherwise pins 1.95.0 via
+      # rust-toolchain.toml, so install nightly explicitly and use `cargo +nightly`.
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+      - name: Rust build cache (fuzz workspaces)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            crates/sh-protocol/fuzz -> target
+            crates/sh-core/fuzz -> target
+            crates/sh-transport/fuzz -> target
+            crates/sh-codec-hw/fuzz -> target
+            crates/sh-crypto/fuzz -> target
+            crates/sh-signaling/fuzz -> target
+            crates/sh-ice/fuzz -> target
+            crates/sh-web-client/fuzz -> target
+          key: fuzz-run
+      - name: Install cargo-fuzz (prebuilt, pinned)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Fuzz every target (bounded)
+        env:
+          # workflow_dispatch input, or 60s on the nightly schedule.
+          FUZZ_SECONDS: ${{ github.event.inputs.seconds || '60' }}
+        run: |
+          # NOT `set -e`: we run EVERY target and aggregate failures so one crash
+          # doesn't hide the state of the rest. `-u` catches unset vars. (We do NOT
+          # rely on pipefail here — the target list is read via command substitution,
+          # NOT a pipeline/process-substitution, so its exit status is checked
+          # explicitly below; a `fuzz list` failure must count as a failure, never a
+          # silent skip of a crate's targets.)
+          set -uo pipefail
+          # Pin the sanitizer target to the gnu host triple: cargo-fuzz's default
+          # resolves to musl on the runner, whose static libc is incompatible with
+          # -Zsanitizer=address (see ci.yml fuzz-build for the same fix).
+          TARGET=x86_64-unknown-linux-gnu
+          failed=()
+          ran=0
+          shopt -s nullglob
+          for fuzz_dir in crates/*/fuzz; do
+            [ -f "${fuzz_dir}/Cargo.toml" ] || continue
+            # Command substitution (exit status IS checked), not `< <(...)` process
+            # substitution (whose failure would be swallowed — a crate's targets would
+            # silently never run, yet the job would stay green).
+            if ! targets="$(cargo +nightly fuzz list --fuzz-dir "${fuzz_dir}")"; then
+              echo "::error::cargo fuzz list failed for ${fuzz_dir} — its targets did not run"
+              failed+=("${fuzz_dir}::<list-failed>")
+              continue
+            fi
+            while IFS= read -r t; do
+              [ -n "${t}" ] || continue
+              ran=$((ran + 1))
+              echo "::group::fuzz ${t} (${fuzz_dir}) for ${FUZZ_SECONDS}s"
+              if ! cargo +nightly fuzz run "${t}" --fuzz-dir "${fuzz_dir}" \
+                    --target "${TARGET}" -- -max_total_time="${FUZZ_SECONDS}"; then
+                echo "::error::fuzz target ${t} (${fuzz_dir}) failed — crash input uploaded as an artifact"
+                failed+=("${fuzz_dir}::${t}")
+              fi
+              echo "::endgroup::"
+            done <<< "${targets}"
+          done
+          if [ "${ran}" -eq 0 ]; then
+            echo "::error::no fuzz targets discovered — nothing ran" >&2
+            exit 1
+          fi
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "fuzzed ${ran} target(s); ${#failed[@]} FAILED:"
+            printf '  %s\n' "${failed[@]}"
+            exit 1
+          fi
+          echo "fuzzed ${ran} target(s); all clean"
+      - name: Upload crash artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-artifacts
+          # cargo-fuzz writes a reproducing input to <fuzz_dir>/artifacts/<target>/ on a crash.
+          path: crates/*/fuzz/artifacts/**
+          if-no-files-found: ignore
