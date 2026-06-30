@@ -192,8 +192,9 @@ async function runInteropTest(): Promise<InteropResult> {
     const SignalingChannel = bridge.SignalingChannel;
     viewer = new bridge.WebClient(new SignalingChannel(noop));
 
-    // create_offer() builds the offerer's "shp" DataChannel and sets the local description, so
-    // local_dtls_fingerprint() is valid afterwards. setLocalDescription also STARTS ICE gathering,
+    // create_offer() builds the offerer's two DataChannels (video "0:128:1" + input "2:0:1",
+    // ADR-0036) and sets the local description, so local_dtls_fingerprint() is valid afterwards.
+    // setLocalDescription also STARTS ICE gathering,
     // so we register the candidate handler immediately and BUFFER candidates until the WS is up
     // (the Noise handshake runs first and takes a few round-trips). Losing the browser's host
     // candidate would leave the native peer with no remote candidate → ICE failure.
@@ -350,10 +351,11 @@ async function runInteropTest(): Promise<InteropResult> {
     // ── 8. Once the DataChannel opens, send the HELLO frame. ──
     // NOTE: the offerer's own channel-open is not exposed by WebClient (`on_data_channel` is the
     // ANSWERER's `ondatachannel`, which does not fire for the offerer's `createDataChannel`
-    // channel). We therefore use the first successful `send_frame` as the open signal, and treat a
-    // never-opens condition as a DISTINCT failure (rejects below) instead of masking it as the
-    // generic timeout. In VIDEO mode we STILL send HELLO so the host's `accept_channel()` resolves
-    // and it starts streaming (the host ignores the HELLO body in video mode).
+    // channel). We therefore use the first successful `send_frame` (on the VIDEO/primary channel) as
+    // the open signal, and treat a never-opens condition as a DISTINCT failure (rejects below)
+    // instead of masking it as the generic timeout. In VIDEO mode we STILL send HELLO on the video
+    // channel (the host ignores its body — non-16-byte — in video mode; the host's accept resolves
+    // on channel-open, not on the HELLO).
     const sentFrame = sendFrameWhenOpen(viewer, SHP_HELLO_FRAME, 30_000);
     // Surface a never-opens rejection if it loses the race below (so it isn't unhandled).
     sentFrame.catch(() => undefined);
@@ -379,14 +381,16 @@ async function runInteropTest(): Promise<InteropResult> {
       result.connected = true;
 
       // CONTROL: send a few synthetic input events (browser→host) to prove remote control. The host
-      // decodes each 16-byte InputEvent off the DataChannel and injects it; the spec asserts the
+      // decodes each 16-byte InputEvent off the Input channel and injects it; the spec asserts the
       // host's `INPUT_INJECTED` log. EventType.PointerMove = 0; normalized coords in 0..=65535.
-      // `send_frame` writes raw bytes to the single "shp" RTCDataChannel — the same call serves both
-      // the video-test frames and input events (they share the one channel; the host demuxes by size).
+      // `send_input` writes to the dedicated INPUT DataChannel ("2:0:1", ADR-0036), separate from
+      // the video channel. This also proves the host took the DUAL-channel path: input arrives only
+      // on the Input channel, so `INPUT_INJECTED` can fire only if the host routed input to the
+      // dedicated channel (a legacy fallback would drain the video channel and never see it).
       for (let i = 0; i < 5; i++) {
         try {
           const ev = bridge.encode_input_event(0, 0, 10_000 + i * 100, 20_000, 0, 0, 0, 0, 0);
-          viewer.send_frame(ev);
+          viewer.send_input(ev);
           result.inputSent += 1;
         } catch {
           /* channel closed / not writable — best-effort, the host-side assertion is authoritative */

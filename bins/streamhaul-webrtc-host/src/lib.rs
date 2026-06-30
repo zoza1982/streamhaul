@@ -990,13 +990,14 @@ async fn pump_candidates(
     Ok(())
 }
 
-/// Accept the first incoming DataChannel, receive a message, and echo it back.
+/// Accept the **video (primary)** DataChannel, receive a message, and echo it back.
+///
+/// The browser (ADR-0036) opens two channels; it sends the HELLO/echo on the primary (video)
+/// channel via `send_frame`. We route to that channel by spec (not open order) so the echo is
+/// deterministic; any Input channel is accepted and dropped (the echo path doesn't use input).
 async fn run_data_channel(transport: &PinnedWebRtcTransport) -> anyhow::Result<()> {
-    info!("waiting for browser to open DataChannel");
-    let mut channel = transport
-        .accept_channel()
-        .await
-        .context("failed to accept DataChannel")?;
+    info!("waiting for browser to open DataChannel(s)");
+    let (mut channel, _input_ch) = accept_video_and_input(transport).await?;
 
     info!("DataChannel open — waiting for first frame");
     let Some(frame) = channel

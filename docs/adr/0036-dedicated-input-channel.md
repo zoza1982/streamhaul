@@ -1,6 +1,6 @@
 # ADR 0036: Dedicated low-latency Input DataChannel
 
-- **Status:** Accepted (host side; browser side staged as a follow-up)
+- **Status:** Accepted (host + browser; live e2e verifying the two-channel path)
 - **Date:** 2026-06-29
 - **Deciders:** network-engineer (design), realtime-systems-engineer (consulted), security-engineer (consulted)
 - **Builds on:** ADR-0034 (input back-channel), ADR-0031/0032/0033 (browser↔host video), P1-1 (multi-channel `Transport`/`Channel`)
@@ -22,7 +22,7 @@ The browser↔host input back-channel (ADR-0034) carries 16-byte `InputEvent`s o
 Carry input on its **own** reliable+ordered SCTP DataChannel, separate from video.
 
 - **Labels** (`{channel_u8}:{priority}:{ordered_u8}`, parsed by `parse_channel_label`): video
-  `"0:128:1"` (`ChannelId::Video`), input `"2:255:1"` (`ChannelId::Input`). The `priority` field is
+  `"0:128:1"` (`ChannelId::Video`), input `"2:0:1"` (`ChannelId::Input`). The `priority` field is
   advisory today (not yet wired to str0m's `ChannelConfig.priority`; that is a follow-up — when wired,
   input gets the highest SCTP priority).
 - **Browser (offerer)** creates **both** channels before `createOffer` (so both appear in the single
