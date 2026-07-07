@@ -688,6 +688,10 @@ impl WebRtcTransport {
         );
         let (id, recv_notify, open_notify) = {
             let mut inner = self.lock();
+            // `spec.priority` is carried only in the `label` (advisory). str0m 0.20.0's
+            // `ChannelConfig` has NO priority field and its DCEP open hardcodes priority to 0, so
+            // there is nothing to set here — SCTP send-side priority needs a str0m upgrade (ADR-0036
+            // follow-up). Do NOT add a `priority:` field expecting it to schedule; it doesn't exist.
             let config = str0m::channel::ChannelConfig {
                 label,
                 ordered,
