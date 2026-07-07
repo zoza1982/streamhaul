@@ -23,8 +23,18 @@ Carry input on its **own** reliable+ordered SCTP DataChannel, separate from vide
 
 - **Labels** (`{channel_u8}:{priority}:{ordered_u8}`, parsed by `parse_channel_label`): video
   `"0:128:1"` (`ChannelId::Video`), input `"2:0:1"` (`ChannelId::Input`). The `priority` field is
-  advisory today (not yet wired to str0m's `ChannelConfig.priority`; that is a follow-up — when wired,
-  input gets the highest SCTP priority).
+  **purely advisory** — carried in the label + `ChannelSpec` for our own bookkeeping only. It does
+  NOT drive SCTP send scheduling, and cannot with the pinned `str0m = "=0.20.0"`: `str0m`'s public
+  `ChannelConfig` exposes no priority field, its `DcepOpen::from(&ChannelConfig)` hardcodes the DCEP
+  `priority` to `0`, and `sctp-proto`'s association sends from a **single submission-order FIFO**
+  (one ordered + one unordered `VecDeque` shared across *all* streams — no per-stream round-robin or
+  priority at all; whichever side calls `write()` first wins ordering).
+  Wiring true SCTP send-side priority therefore requires a `str0m` upgrade (or fork) that exposes a
+  priority knob AND implements priority-aware scheduling — see the follow-up in **Consequences**.
+  (It is also a **no-op in today's topology** regardless: input flows browser→host and video flows
+  host→browser on *separate* streams in *opposite* directions, so neither side ever schedules input
+  against video — priority only starts to matter once one side sends on multiple streams at once,
+  e.g. a future host that streams video **and** audio/file.)
 - **Browser (offerer)** creates **both** channels before `createOffer` (so both appear in the single
   `m=application` section), sends input on the input channel, and receives video on the video channel.
 - **Host (answerer)** accepts both channels and **routes by parsed `spec().channel`** (NOT open
@@ -71,8 +81,16 @@ bounded mpsc — its adequacy as a standalone guard is confirmed in review.
 - **Positive:** input latency drops from ≤1 frame interval to ~1 SCTP RTT; input is no longer
   head-of-line-blocked by video; the `&mut self` borrow conflict that forced between-frames draining
   is gone; the legacy single-channel path remains as a fallback.
-- **Negative / follow-ups:** SCTP send-side priority is not yet wired (input/video both default
-  priority); the browser side + live e2e land in PR 2. **Tracked (from the PR-1 gate):** an
+- **Negative / follow-ups:** **SCTP send-side priority is not achievable with the pinned
+  `str0m = "=0.20.0"`** and is deferred, NOT merely "unwired": str0m's `ChannelConfig` has no
+  priority field, `DcepOpen::from(&ChannelConfig)` hardcodes the DCEP priority to `0`, and
+  `sctp-proto` sends from a single submission-order FIFO shared across all streams (no per-stream
+  fairness, let alone priority) — so there is no public knob to turn. It requires a
+  str0m/`sctp-proto` upgrade (or fork) that exposes a priority setting AND does priority-aware
+  scheduling, at which point wire `ChannelSpec::priority` into it (input = highest). It is a no-op
+  in today's opposite-direction, one-stream-per-side topology anyway (see Labels), so it only earns
+  its keep alongside future same-direction multi-channel (audio/file). The browser side + live e2e
+  landed in PR 2. **Tracked (from the PR-1 gate):** an
   unbounded transport `accept_queue`/`recv_queues` under a hostile peer opening many channels
   (pre-existing, transport-layer — bound the accept queue / cap concurrent channels); a coarse
   always-on injected-events/s backstop for the discrete `Button`/`Key` flood the rate limiter can't
