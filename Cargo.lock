@@ -1694,6 +1694,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sh-clipboard"
+version = "0.0.0"
+dependencies = [
+ "sh-protocol",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sh-codec-hw"
 version = "0.0.0"
 dependencies = [
