@@ -41,6 +41,9 @@
 //! | Item | Description |
 //! |------|-------------|
 //! | [`ClipboardAccess`] | Object-safe trait: `get_text` / `set_text` over the OS clipboard |
+//! | [`sanitize_for_paste`] | Paste-injection hardening for the receive path: sanitized text, or `None` when nothing is safe to write |
+//! | [`sanitize_clipboard_text`] | The raw sanitizer: strips control/bidi/invisible scalars + normalizes line endings |
+//! | [`is_forbidden_in_paste_output`] | Predicate (the strip policy's single source of truth) — a scalar that must never survive to a paste sink |
 //! | [`NoopClipboard`] | Reads empty, discards writes -- placeholder and fail-closed stub |
 //! | [`RecordingClipboard`] | Records writes, serves a preset read value -- test double |
 //! | [`ClipboardError`] | `thiserror`-derived error for clipboard-access failures |
@@ -51,8 +54,10 @@ mod access;
 mod error;
 mod noop;
 mod recording;
+mod sanitize;
 
 pub use access::ClipboardAccess;
 pub use error::ClipboardError;
 pub use noop::NoopClipboard;
 pub use recording::RecordingClipboard;
+pub use sanitize::{is_forbidden_in_paste_output, sanitize_clipboard_text, sanitize_for_paste};

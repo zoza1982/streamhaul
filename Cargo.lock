@@ -1697,6 +1697,7 @@ dependencies = [
 name = "sh-clipboard"
 version = "0.0.0"
 dependencies = [
+ "proptest",
  "sh-protocol",
  "thiserror 2.0.18",
 ]

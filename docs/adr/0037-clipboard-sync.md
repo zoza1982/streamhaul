@@ -48,6 +48,46 @@ A `sh-clipboard` crate with a `ClipboardAccess` trait (`get_text`/`set_text`) + 
 Real OS backends (X11 `PRIMARY`/`CLIPBOARD` selections, macOS `NSPasteboard`, Windows clipboard) are
 deferred to `sh-platform-*` and gated on hardware, exactly like the injectors.
 
+### Paste-injection hardening (this PR)
+
+`sh_clipboard::sanitize_clipboard_text(&str) -> String` — a **total, infallible** receive-path
+filter the wiring MUST run before `ClipboardAccess::set_text` on both peers (Security item 6). It is
+a single pass: line-ending normalization (`CRLF`, lone `CR`, `U+2028`, `U+2029` → a single `LF`) plus
+a strip of the control/bidi/invisible-smuggling class, keeping only `TAB` + `LF` among controls and
+all printable text (every script + emoji):
+
+| Removed | Why |
+|---------|-----|
+| C0 controls except `TAB`/`LF` (incl. **`ESC` `U+001B`**), `DEL` | ANSI/CSI/OSC sequences, cursor tricks, and the bracketed-paste terminator `ESC[201~` — stripping `ESC` means a payload can neither emit an escape sequence nor break out of bracketed paste |
+| C1 controls `U+0080`–`U+009F` (incl. 8-bit `CSI` `U+009B`, `NEL` `U+0085`) | raw-byte path around the `ESC` defense |
+| bidi controls `U+202A`–`U+202E`, `U+2066`–`U+2069`, `U+200E`/`U+200F`, `U+061C` | **Trojan Source (CVE-2021-42574)** — display order ≠ logical order (natural RTL still renders without them) |
+| zero-width / invisible format `U+200B`–`U+200D`, `U+00AD`, `U+180E`, `U+2060`–`U+2064`, `U+206A`–`U+206F`, `U+FEFF`, `U+FFF9`–`U+FFFB`, `U+1D173`–`U+1D17A` | hidden payload / homoglyph concealment |
+| Tag block `U+E0000`–`U+E007F` | ASCII-smuggling / hidden-command steganography |
+| Unicode noncharacters `U+FDD0`–`U+FDEF`, every plane's `*FFFE`/`*FFFF` | never valid for interchange |
+
+It **never rejects** (rejection would be a DoS/annoyance primitive — a hostile peer could kill the
+victim's clipboard sync with one control char; the user gets the safe substring instead). It only
+removes/normalizes, so output is valid UTF-8 and never longer than input — the 256 KiB bound holds
+without re-checking. The strip policy has a single source of truth, the exported predicate
+`is_forbidden_in_paste_output`, which the filter, the proptests, and the fuzz target all consume (no
+duplicated set to drift). **Caller obligation, made un-forgettable:** the wiring calls
+`sanitize_for_paste(&str) -> Option<String>`, which returns `None` when nothing safe remains (empty
+or all-control input) so the caller **skips** `set_text` rather than clobbering the local clipboard
+with an attacker-forced empty value. Proptest invariants (total, no-forbidden-survives, non-growth,
+idempotent, identity-on-safe-subset) run every PR; a `clipboard_sanitize` `cargo-fuzz` target runs
+nightly (§5). `U+200C`/`U+200D` (ZWNJ/ZWJ) are stripped in v1 (security-first; degrades some emoji-ZWJ
+and ZWNJ-dependent orthography — a future whitelist-inside-grapheme-cluster refinement candidate);
+variation selectors `U+FE00`–`U+FE0F` are kept for emoji/CJK fidelity.
+
+**Residual risks the sanitizer does NOT close** (honest scope): social engineering (a user pasting
+*visible* `curl … | sh` and pressing Enter); embedded `LF` into a sink without bracketed paste (kept
+by design — we guarantee the payload can't *disable* bracketed paste, not that the sink supports it);
+homoglyph/confusable spoofing (no confusable folding — would break legitimate non-Latin text);
+spreadsheet/CSV formula injection (leading `=`/`+`/`-`/`@` — a paste-target-app concern);
+variation-selector steganography; and any fully-valid-printable malicious content (not a content
+scanner). Reading-side exfiltration is a capability-gate/consent concern (items 1–2), not the
+sanitizer's.
+
 ### Host + browser wiring (follow-up PRs)
 
 The host routes the Clipboard channel to a `Box<dyn ClipboardAccess>`; the browser bridges
@@ -86,8 +126,10 @@ MUST hold before clipboard content touches any OS or the peer:
    then rejects, defeating the DoS bound at the buffer.
 6. **Paste-injection hardening** at the host paste/inject sink: even `text/plain` can carry C0
    control chars / bracketed-paste-bypass sequences (`curl | sh` drops, homoglyph/hidden-newline
-   payloads) — threat-model this and consider stripping/normalizing control characters before a
-   paste sink.
+   payloads). **Done (this PR):** `sh_clipboard::sanitize_clipboard_text` — see "Paste-injection
+   hardening" under Decision for the concrete policy, invariants, and residual risks. The wiring
+   MUST call `sanitize_for_paste` before every `set_text` and skip the write on `None` (nothing safe
+   to write).
 7. **Any future non-text format id** (HTML/image) gets its own threat model, sanitizer, and fuzz
    target before it ships — UTF-8-only in v1 is a deliberate injection-surface minimization.
 

@@ -7,6 +7,7 @@ Portable clipboard-access seam for the Streamhaul host and browser wiring.
 | Item | Description |
 |------|-------------|
 | `ClipboardAccess` | Object-safe trait: `get_text(&mut self) -> Result<Option<String>, _>` and `set_text(&mut self, &str) -> Result<(), _>` |
+| `sanitize_clipboard_text` | Paste-injection hardening: strips control/bidi/invisible scalars + normalizes line endings before a paste sink |
 | `NoopClipboard` | Reads empty, discards writes; placeholder **and** fail-closed stub for a capability-denied session |
 | `RecordingClipboard` | Records writes and serves a preset read value; a test double |
 | `ClipboardError` | `thiserror`-derived error type for clipboard-access failures |
@@ -46,7 +47,9 @@ Clipboard content is untrusted and is session data (never logged, §7). The wire
 
 - a **fail-closed** `CLIPBOARD` capability gate on the *receive* path in **both** directions;
 - **never** logging content (`ClipboardError` payloads describe the failure, never the content);
-- **control-character normalization** before a paste sink (paste-injection hardening).
+- running **`sanitize_clipboard_text`** before every paste sink (control/bidi/invisible stripping +
+  line-ending normalization — the paste-injection hardening from ADR-0037 §6), skipping the write
+  when it returns empty for a non-empty input.
 
 `NoopClipboard` is the fail-closed default: a capability-denied session is handed a `NoopClipboard`,
 so even a wiring bug cannot read or write the real OS clipboard.

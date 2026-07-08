@@ -575,6 +575,7 @@ jobs:
             crates/sh-signaling/fuzz -> target
             crates/sh-ice/fuzz -> target
             crates/sh-web-client/fuzz -> target
+            crates/sh-clipboard/fuzz -> target
           key: fuzz-nightly
       - name: Install cargo-fuzz (prebuilt, pinned)
         uses: taiki-e/install-action@v2
