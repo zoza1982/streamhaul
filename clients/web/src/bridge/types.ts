@@ -52,6 +52,8 @@ export interface WebClient {
   send_frame(frame: Uint8Array): void;
   /** Send a 16-byte SHP InputEvent on the dedicated Input DataChannel (ADR-0036). */
   send_input(event: Uint8Array): void;
+  /** Send a ClipboardUpdate ([format][content]) on the dedicated Clipboard DataChannel (ADR-0037). */
+  send_clipboard(update: Uint8Array): void;
   on_frame(callback: (frame: Uint8Array) => void): void;
   on_data_channel(onOpen: (channel: RTCDataChannel) => void): void;
   on_ice_candidate(callback: (candidate: string | null) => void): void;
@@ -173,6 +175,8 @@ export interface ShBridge {
     scroll_y: number,
     pressure: number,
   ): Uint8Array;
+  /** Encode a browser→host ClipboardUpdate ([format][utf8 content]) for the Clipboard channel (ADR-0037). */
+  encode_clipboard_text(text: string): Uint8Array;
   encode_caps(
     hw_encode_mask: number,
     hw_decode_mask: number,

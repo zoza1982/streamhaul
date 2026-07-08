@@ -1,6 +1,8 @@
 # ADR 0037: Clipboard sync (browser ↔ host)
 
-- **Status:** Accepted (wire format = PR 1; portable crate, host + browser wiring, OS backends staged)
+- **Status:** Accepted (wire format, portable crate, paste hardening, host receive wiring, and
+  browser send wiring done through PR 5; host→browser read direction, `navigator.clipboard` browser
+  bridge, OS backends, and the UGC capability gate staged)
 - **Date:** 2026-07-06
 - **Deciders:** software-architect (design), security-engineer (consulted)
 - **Builds on:** ADR-0034 (input back-channel — the pattern this mirrors), P1-1 (multi-channel
@@ -118,11 +120,23 @@ default sink** (`NoopClipboard` can neither read nor write a real OS clipboard),
 `SessionAuthorizer` gate for *all* privileged channels (input + clipboard) is a tracked follow-up.
 This is called out honestly rather than silently skipped (CLAUDE.md §11).
 
-### Host read + browser wiring (follow-up PRs)
+### Browser send wiring (this PR)
+
+`sh-web-client`'s `create_offer` now opens a third DataChannel — clipboard, label `"3:2:1"`
+(`ChannelId::Clipboard` = 3, priority 2, ordered), which round-trips to `ChannelSpec::clipboard()`
+via the host's `parse_channel_label` (pinned by `dedicated_input_channel_labels_route_correctly`).
+The new `WebClient::send_clipboard` sends a `ClipboardUpdate` on it; `sh_wasm::encode_clipboard_text`
+builds the wire bytes (the TS never serializes the wire — browser and host share one codec).
+End-to-end: the `browser-native` e2e sends a CRLF-containing paste via `send_clipboard` and asserts
+the host's `CLIPBOARD_PASTED` log, proving browser→host clipboard sync over a real DTLS DataChannel
+in headless Firefox (the host applies the sanitized, line-ending-normalized text).
+
+### Host read + OS backends (follow-up PRs)
 
 The host→browser paste direction (host reads its clipboard via `get_text`, encodes a
-`ClipboardUpdate`, sends it) and the browser bridge (`navigator.clipboard` ↔ the Clipboard channel,
-plus a live e2e) are follow-up PRs.
+`ClipboardUpdate`, sends it), the browser's `navigator.clipboard` bridge (reading the real browser
+clipboard on a user gesture and applying host→browser pastes), the OS backends, and the UGC
+capability gate are follow-up PRs.
 
 ## Security
 

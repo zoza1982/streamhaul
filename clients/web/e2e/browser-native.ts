@@ -104,6 +104,8 @@ export interface InteropResult {
   h264DecodeSupported: boolean | null;
   /** VIDEO mode: count of synthetic input events the browser sent to the host (remote control). */
   inputSent: number;
+  /** VIDEO mode: count of clipboard updates the browser sent to the host (browser→host paste). */
+  clipboardSent: number;
   /** Error message, if any. */
   error: string | null;
 }
@@ -158,6 +160,7 @@ async function runInteropTest(): Promise<InteropResult> {
     webCodecs: false,
     h264DecodeSupported: null,
     inputSent: 0,
+    clipboardSent: 0,
     error: null,
   };
 
@@ -395,6 +398,19 @@ async function runInteropTest(): Promise<InteropResult> {
         } catch {
           /* channel closed / not writable — best-effort, the host-side assertion is authoritative */
         }
+      }
+
+      // CLIPBOARD: send a browser→host paste on the dedicated Clipboard channel ("3:2:1", ADR-0037).
+      // The host decodes the ClipboardUpdate, sanitizes it, and applies it via StdoutClipboardLogger,
+      // which prints `CLIPBOARD_PASTED bytes=...` (never the content, §7). The spec asserts that line,
+      // proving browser→host clipboard sync end to end on a real DTLS DataChannel. The CRLF proves the
+      // host's line-ending normalization runs (host applies "clip\nfrom browser").
+      try {
+        const clip = bridge.encode_clipboard_text("clip\r\nfrom browser");
+        viewer.send_clipboard(clip);
+        result.clipboardSent += 1;
+      } catch {
+        /* channel closed / not writable — best-effort, the host-side assertion is authoritative */
       }
       // Keep the session alive long enough for the input to be transmitted, drained by the host
       // (it polls between video frames), and injected — otherwise the `finally` `viewer.close()`

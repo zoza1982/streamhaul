@@ -1458,11 +1458,12 @@ mod tests {
     use str0m::channel::ChannelConfig;
     use str0m::{Candidate, Event, Input, Output, Rtc};
 
-    /// Cross-language contract (ADR-0036): `sh-web-client`'s `create_offer` hard-codes the
-    /// DataChannel labels `"0:128:1"` (video) and `"2:0:1"` (input). This host parser is the single
-    /// source of truth for what those strings mean. Pin the exact routing so a drift on either side
-    /// — which would otherwise SILENTLY fall back to `ChannelId::Control` and lose input — breaks a
-    /// test instead. (Mirror of how the Noise sub-type wire values are pinned.)
+    /// Cross-language contract (ADR-0036/0037): `sh-web-client`'s `create_offer` hard-codes the
+    /// DataChannel labels `"0:128:1"` (video), `"2:0:1"` (input), and `"3:2:1"` (clipboard). This host
+    /// parser is the single source of truth for what those strings mean. Pin the exact routing so a
+    /// drift on either side — which would otherwise SILENTLY fall back to `ChannelId::Control` and
+    /// lose the channel — breaks a test instead. (Mirror of how the Noise sub-type wire values are
+    /// pinned.)
     #[test]
     fn dedicated_input_channel_labels_route_correctly() {
         let video = parse_channel_label("0:128:1");
@@ -1485,6 +1486,22 @@ mod tests {
         assert_eq!(
             input.priority, 0,
             "input must be highest urgency (priority 0)"
+        );
+
+        // Clipboard: `"3:2:1"` must route to Clipboard, reliable+ordered, priority 2 (urgency 2),
+        // matching `ChannelSpec::clipboard()` — see ADR-0037. A drift would silently drop paste.
+        let clipboard = parse_channel_label("3:2:1");
+        assert_eq!(
+            clipboard.channel,
+            sh_types::ChannelId::Clipboard,
+            "clipboard label must route to Clipboard"
+        );
+        assert_eq!(clipboard.reliability, Reliability::Reliable);
+        assert_eq!(clipboard.priority, 2, "clipboard urgency must be 2");
+        assert_eq!(
+            clipboard,
+            ChannelSpec::clipboard(),
+            "the '3:2:1' label must round-trip to ChannelSpec::clipboard() exactly"
         );
     }
 
