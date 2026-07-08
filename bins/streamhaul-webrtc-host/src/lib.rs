@@ -29,11 +29,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use bytes::Bytes;
+use sh_clipboard::{sanitize_for_paste, ClipboardAccess};
 use sh_crypto::{DtlsCommitment, HandshakeOutcome, NoiseHandshake, SoftwareKeystore};
 use sh_input::{InputInjector, RateLimiter};
 use sh_protocol::{
-    Codec, CommonHeader, EventType, Flags, FrameType, InputEvent, Priority, VideoHeader,
-    INPUT_EVENT_LEN, MAX_FRAME_ID,
+    ClipboardUpdate, Codec, CommonHeader, EventType, Flags, FrameType, InputEvent, Priority,
+    VideoHeader, INPUT_EVENT_LEN, MAX_FRAME_ID,
 };
 use sh_signaling::backoff::ExponentialBackoff;
 use sh_signaling::envelope::{MessageKind, SessionId, SignalingEnvelope};
@@ -248,6 +249,12 @@ pub enum StreamMode {
         /// the DataChannel are decoded and injected via this between video frames (ADR-0034). The
         /// binary supplies the OS injector (X11 for the live host; a logging/no-op one otherwise).
         input: Box<dyn InputInjector>,
+        /// Sink for browser→host clipboard paste (ADR-0037). Inbound [`ClipboardUpdate`]s on the
+        /// dedicated Clipboard channel are decoded, **sanitized** ([`sanitize_for_paste`]), and
+        /// written via this. The binary supplies the backend; the fail-closed default is
+        /// [`sh_clipboard::NoopClipboard`] (inert — cannot touch the real OS clipboard), so a
+        /// session with no granted clipboard backend cannot read or write it.
+        clipboard: Box<dyn ClipboardAccess>,
     },
 }
 
@@ -431,6 +438,7 @@ pub async fn run_webrtc_host(
                 max_fragment_bytes,
                 mut source,
                 input,
+                clipboard,
             } => {
                 run_video_stream(
                     &transport_for_accept,
@@ -439,6 +447,7 @@ pub async fn run_webrtc_host(
                     max_fragment_bytes,
                     &mut *source,
                     input,
+                    clipboard,
                 )
                 .await
             }
@@ -997,7 +1006,7 @@ async fn pump_candidates(
 /// deterministic; any Input channel is accepted and dropped (the echo path doesn't use input).
 async fn run_data_channel(transport: &PinnedWebRtcTransport) -> anyhow::Result<()> {
     info!("waiting for browser to open DataChannel(s)");
-    let (mut channel, _input_ch) = accept_video_and_input(transport).await?;
+    let mut channel = accept_channels(transport).await?.video;
 
     info!("DataChannel open — waiting for first frame");
     let Some(frame) = channel
@@ -1038,6 +1047,7 @@ async fn run_video_stream(
     max_fragment_bytes: usize,
     source: &mut dyn VideoFrameSource,
     input: Box<dyn InputInjector>,
+    clipboard: Box<dyn ClipboardAccess>,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         frames_to_send > 0,
@@ -1046,7 +1056,11 @@ async fn run_video_stream(
     anyhow::ensure!(fps > 0, "StreamMode::Video fps must be > 0");
 
     info!("waiting for browser to open DataChannel(s) (video mode)");
-    let (video_ch, input_ch) = accept_video_and_input(transport).await?;
+    let AcceptedChannels {
+        video: video_ch,
+        input: input_ch,
+        clipboard: clipboard_ch,
+    } = accept_channels(transport).await?;
 
     // `checked_div` (not `/`) satisfies the arithmetic-side-effects lint; the `fps > 0` guard above
     // makes the divisor non-zero, so the `unwrap_or` fallback is unreachable.
@@ -1055,29 +1069,36 @@ async fn run_video_stream(
         target = frames_to_send,
         fps,
         has_input_channel = input_ch.is_some(),
+        has_clipboard_channel = clipboard_ch.is_some(),
         "streaming H.264 video frames to browser"
     );
 
-    // Dedicated Input channel present (ADR-0036): stream video and a dedicated input task on
-    // SEPARATE SCTP streams — input is delivered the instant it arrives, not gated by frame pacing
-    // (lowest click-to-photon). Otherwise fall back to the legacy single-channel path below, which
-    // drains input between video frames (≤ one frame interval).
-    if let Some(input_ch) = input_ch {
-        return run_video_dual(
-            video_ch,
-            input_ch,
-            frames_to_send,
-            per_us,
-            max_fragment_bytes,
-            source,
-            input,
-        )
-        .await;
-    }
+    run_video_session(
+        video_ch,
+        input_ch,
+        clipboard_ch,
+        frames_to_send,
+        per_us,
+        max_fragment_bytes,
+        source,
+        input,
+        clipboard,
+    )
+    .await
+}
 
-    // ── Legacy single-channel path: input drained between video frames (ADR-0034). ──
-    let mut channel = video_ch;
-    let (input_tx, inject_task) = spawn_injection_thread(input);
+/// Legacy multiplexed-input video loop: no dedicated Input channel is present, so browser→host input
+/// is drained off the SAME video channel between frames (ADR-0034). The injection thread's lifecycle
+/// (and its `release_all()` on drop) is owned by the caller ([`run_video_session`]); this function
+/// only borrows a sender clone, so it must not be the last owner.
+async fn run_video_send_loop_with_input_drain(
+    mut channel: Box<dyn Channel>,
+    frames_to_send: usize,
+    per_us: u64,
+    max_fragment_bytes: usize,
+    source: &mut dyn VideoFrameSource,
+    input_tx: &tokio::sync::mpsc::Sender<InputEvent>,
+) -> anyhow::Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_micros(per_us));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1088,10 +1109,6 @@ async fn run_video_stream(
     // observable in the logs (never per-event — §7).
     let mut input_limiter = RateLimiter::new(MAX_THROTTLED_INPUT_PER_SEC, THROTTLED_INPUT_BURST);
     let mut throttled_events: u64 = 0;
-    // Captures an error that ends the stream early. We do NOT `?`-propagate from inside the loop:
-    // the teardown below (close the input queue + await the injection thread so `release_all`
-    // finishes) must run on *every* exit path, or an abnormal stream end could return before the
-    // held buttons are released (ADR-0034 stuck-button guarantee).
     let mut stream_err: Option<anyhow::Error> = None;
     'stream: while sent < frames_to_send {
         ticker.tick().await;
@@ -1128,7 +1145,7 @@ async fn run_video_stream(
         for _ in 0..MAX_INPUT_PER_FRAME {
             match tokio::time::timeout(Duration::ZERO, channel.recv()).await {
                 Ok(Ok(Some(bytes))) => {
-                    forward_input(&bytes, &input_tx, &mut input_limiter, &mut throttled_events);
+                    forward_input(&bytes, input_tx, &mut input_limiter, &mut throttled_events);
                 }
                 Ok(Ok(None)) => {
                     info!(frames = sent, "peer closed channel — ending video stream");
@@ -1143,12 +1160,6 @@ async fn run_video_stream(
         }
     }
 
-    // Teardown — runs on EVERY exit (normal completion, peer close, or `stream_err`): close the
-    // input queue and await the injection thread so its final `release_all()` completes before we
-    // return. Dropping the `JoinHandle` would NOT cancel the blocking task, but it also wouldn't
-    // wait for it — so we await explicitly to make the stuck-button release a hard guarantee.
-    drop(input_tx);
-    let _ = inject_task.await;
     if throttled_events > 0 {
         warn!(
             throttled_events,
@@ -1156,77 +1167,101 @@ async fn run_video_stream(
         );
     }
     match stream_err {
-        Some(e) => {
-            warn!(
-                frames = sent,
-                "video stream ended with error (held input released)"
-            );
-            Err(e)
-        }
-        None => {
-            info!(frames = sent, "video stream complete");
-            Ok(())
-        }
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
-/// The video channel plus an optional dedicated Input channel (ADR-0036), resolved from the
-/// peer's opened DataChannels.
-type VideoAndInput = (Box<dyn Channel>, Option<Box<dyn Channel>>);
+/// The mandatory video channel plus the optional dedicated Input (ADR-0036) and Clipboard
+/// (ADR-0037) channels, resolved from the peer's opened DataChannels.
+struct AcceptedChannels {
+    /// The (mandatory) video channel — also the legacy single-channel peer's only channel.
+    video: Box<dyn Channel>,
+    /// The optional dedicated low-latency Input channel (ADR-0036).
+    input: Option<Box<dyn Channel>>,
+    /// The optional dedicated reliable Clipboard channel (ADR-0037).
+    clipboard: Option<Box<dyn Channel>>,
+}
 
-/// Bounded wait for the OPTIONAL second (Input) DataChannel after the first channel is accepted.
+/// Bounded wait for the OPTIONAL dedicated Input (ADR-0036) and/or Clipboard (ADR-0037) channels
+/// after the mandatory video channel is accepted.
 ///
-/// A single-channel (legacy) peer never opens an Input channel, so we must NOT block on the
-/// transport's full 30 s accept timeout waiting for one. A two-channel browser creates BOTH channels
-/// before `createOffer`, so their `ChannelOpen` events arrive within the same DTLS/SCTP setup window
-/// (tens of ms apart) — 2 s is a ~100× margin over that skew.
+/// A single-channel (legacy) peer never opens a dedicated channel, so we must NOT block on the
+/// transport's full 30 s accept timeout waiting for one. A multi-channel browser creates every
+/// channel before `createOffer`, so their `ChannelOpen` events arrive within the same DTLS/SCTP
+/// setup window (tens of ms apart) — 2 s is a ~100× margin over that skew.
 ///
-/// **Cost:** until PR 2 ships (browser opens both channels), EVERY legacy session pays this full
-/// wait before video starts. Hence 2 s, not more — it is dead time on the only client that exists
-/// pre-PR-2. (It must still comfortably exceed the real two-channel open skew, or a genuine
-/// two-channel peer would be mis-classified as single-channel and its input lost.)
-const INPUT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Full wait for the FIRST extra channel to appear (a peer that opens none pays this once — the
+/// legacy single-channel cost, unchanged). A multi-channel peer's first extra arrives in tens of ms.
+const FIRST_EXTRA_CHANNEL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Accept the video channel and an optional dedicated Input channel (ADR-0036).
+/// Wait for EACH SUBSEQUENT extra channel after the first arrives. All of a peer's channels open
+/// within the same DTLS/SCTP setup window (tens of ms apart), so once the first extra is in, the
+/// next is at most this far behind — a ~10× margin over the real skew. This is what keeps today's
+/// two-channel (video + input) peer from paying the full 2 s waiting for a third channel it never
+/// opens: it stops ~250 ms after input arrives, not 2 s (was the pre-Clipboard behavior's ~0, so a
+/// small, bounded tax until the browser opens the Clipboard channel too — then the loop exits early
+/// at [`MAX_EXTRA_CHANNELS`] with no skew wait at all).
+const INTER_CHANNEL_SKEW: Duration = Duration::from_millis(250);
+
+/// Optional dedicated channels a peer may open beyond the mandatory video channel (today: Input,
+/// Clipboard). Bounds the accept loop so a peer can't make us wait on unbounded extra channels.
+const MAX_EXTRA_CHANNELS: usize = 2;
+
+/// Accept the video channel and the optional dedicated Input/Clipboard channels (ADR-0036/0037).
 ///
-/// Accepts the first channel (transport's normal timeout), then waits a BOUNDED time for an
-/// optional second, and classifies both by parsed [`Channel::spec`]`().channel` — order-independent,
+/// Accepts the first channel (transport's normal timeout), then runs a bounded window to pick up up
+/// to [`MAX_EXTRA_CHANNELS`] more — a full [`FIRST_EXTRA_CHANNEL_TIMEOUT`] for the first extra, then
+/// only an [`INTER_CHANNEL_SKEW`] for each subsequent one (all of a peer's channels open within tens
+/// of ms of each other). Classifies them by parsed [`Channel::spec`]`().channel` — order-independent,
 /// since SCTP stream numbering need not match the browser's `createDataChannel` order. A legacy
-/// single-channel peer (whose `"shp"` label parses to [`ChannelId::Control`]) yields `(video, None)`
-/// and uses the between-frames drain path.
+/// single-channel peer (whose `"shp"` label parses to [`ChannelId::Control`]) yields only `video` and
+/// uses the between-frames drain path.
 ///
 /// # Errors
 /// Returns an error if the first channel cannot be accepted, or if no usable video channel opened.
-async fn accept_video_and_input(
-    transport: &PinnedWebRtcTransport,
-) -> anyhow::Result<VideoAndInput> {
+async fn accept_channels(transport: &PinnedWebRtcTransport) -> anyhow::Result<AcceptedChannels> {
     let first = transport
         .accept_channel()
         .await
         .context("failed to accept the first DataChannel")?;
-    // A `tokio::time::timeout` cancels `accept_channel` if it elapses; `accept_channel` is
-    // cancel-safe (it pops from the accept queue under the lock BEFORE awaiting), so a channel that
-    // arrives later simply stays queued rather than being lost.
-    let second = match tokio::time::timeout(INPUT_ACCEPT_TIMEOUT, transport.accept_channel()).await
-    {
-        Ok(Ok(ch)) => Some(ch),
-        // The transport's own timeout/closed, or our bounded wait elapsing → no second channel.
-        Ok(Err(_)) | Err(_) => None,
-    };
-    classify_channels([Some(first), second].into_iter().flatten().collect())
+
+    let mut extra: Vec<Box<dyn Channel>> = Vec::with_capacity(MAX_EXTRA_CHANNELS);
+    while extra.len() < MAX_EXTRA_CHANNELS {
+        // Full window for the FIRST extra; only a short inter-channel skew for subsequent ones. This
+        // is what stops today's {video, input} peer from waiting the full 2 s for a third channel it
+        // never opens (it breaks ~250 ms after input arrives) while still catching a genuine third
+        // channel that opens tens of ms behind the second.
+        let wait = if extra.is_empty() {
+            FIRST_EXTRA_CHANNEL_TIMEOUT
+        } else {
+            INTER_CHANNEL_SKEW
+        };
+        // `accept_channel` is cancel-safe (it pops from the accept queue under the lock BEFORE
+        // awaiting), so a channel arriving after our bounded wait elapses stays queued, not lost.
+        match tokio::time::timeout(wait, transport.accept_channel()).await {
+            Ok(Ok(ch)) => extra.push(ch),
+            // The transport's own timeout/closed, or our bounded wait elapsing → stop waiting.
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    classify_channels(std::iter::once(first).chain(extra).collect())
 }
 
-/// Partition accepted channels into `(video, optional input)` by parsed [`ChannelSpec`] — pure +
-/// order-independent (SCTP stream numbering need not match the browser's `createDataChannel` order).
+/// Partition accepted channels into video / optional input / optional clipboard by parsed
+/// [`ChannelSpec`] — pure + order-independent (SCTP stream numbering need not match the browser's
+/// `createDataChannel` order).
 ///
-/// [`ChannelId::Input`] → the input channel; anything else (Video, or the legacy `"shp"` label that
-/// parses to Control) → the video channel. A second video-class channel is ignored.
+/// [`ChannelId::Input`] → the input channel; [`ChannelId::Clipboard`] → the clipboard channel;
+/// anything else (Video, or the legacy `"shp"` label that parses to Control) → the video channel. A
+/// second channel of any class is ignored.
 ///
 /// # Errors
 /// Returns an error if no usable video channel is present.
-fn classify_channels(channels: Vec<Box<dyn Channel>>) -> anyhow::Result<VideoAndInput> {
+fn classify_channels(channels: Vec<Box<dyn Channel>>) -> anyhow::Result<AcceptedChannels> {
     let mut video: Option<Box<dyn Channel>> = None;
     let mut input: Option<Box<dyn Channel>> = None;
+    let mut clipboard: Option<Box<dyn Channel>> = None;
     for ch in channels {
         match ch.spec().channel {
             ChannelId::Input => {
@@ -1234,6 +1269,12 @@ fn classify_channels(channels: Vec<Box<dyn Channel>>) -> anyhow::Result<VideoAnd
                     warn!("ignoring unexpected extra Input DataChannel");
                 }
                 input = Some(ch);
+            }
+            ChannelId::Clipboard => {
+                if clipboard.is_some() {
+                    warn!("ignoring unexpected extra Clipboard DataChannel");
+                }
+                clipboard = Some(ch);
             }
             other => {
                 if video.is_none() {
@@ -1245,7 +1286,11 @@ fn classify_channels(channels: Vec<Box<dyn Channel>>) -> anyhow::Result<VideoAnd
         }
     }
     let video = video.context("peer opened no usable video DataChannel")?;
-    Ok((video, input))
+    Ok(AcceptedChannels {
+        video,
+        input,
+        clipboard,
+    })
 }
 
 /// Spawn the dedicated injection thread.
@@ -1432,68 +1477,174 @@ async fn run_input_recv(
     }
 }
 
-/// Dual-channel session (ADR-0036): video send loop + dedicated input task on separate SCTP
-/// streams. The video loop runs INLINE (it borrows `source`, so it can't be `spawn`ed); the input
-/// task is spawned (all-owned). Whichever ends first ends the session.
+/// Unified video session driver (ADR-0036 Input, ADR-0037 Clipboard): the mandatory video channel
+/// plus 0–2 optional dedicated channels, in any combination.
+///
+/// - **No dedicated Input channel** → the video loop drains input off the video channel between
+///   frames (legacy peers; [`run_video_send_loop_with_input_drain`]).
+/// - **Dedicated Input channel** → a dedicated input task RACES the inline video loop; whichever
+///   ends first ends the session (ADR-0036, lowest click-to-photon).
+/// - **Dedicated Clipboard channel** (if any) NEVER races the session — its close is a non-fatal,
+///   expected event. It runs as its own task and is always aborted+awaited in teardown.
 ///
 /// # Teardown (safety-critical)
-/// The injection thread is fed by a bounded mpsc held by TWO sender clones — the input task's and
-/// the outer one here. On every exit (video done, peer-close on either channel, error, or a task
-/// panic) the input task is aborted+awaited (dropping its clone) and the outer clone is dropped, so
-/// the injection thread sees all senders gone and runs `release_all()` — no held button can leak.
-async fn run_video_dual(
+/// The injection thread is fed by a bounded mpsc; on EVERY exit its senders are dropped so the
+/// thread runs `release_all()` — no held button can leak (ADR-0034). The clipboard task is
+/// unconditionally aborted+awaited (it is never a `select!` arm, so its `JoinHandle` is polled
+/// exactly once here — no double-poll guard needed, unlike the input task).
+#[allow(clippy::too_many_arguments)] // one coherent session; splitting the arg list would obscure it
+async fn run_video_session(
     video_ch: Box<dyn Channel>,
-    input_ch: Box<dyn Channel>,
+    input_ch: Option<Box<dyn Channel>>,
+    clipboard_ch: Option<Box<dyn Channel>>,
     frames_to_send: usize,
     per_us: u64,
     max_fragment_bytes: usize,
     source: &mut dyn VideoFrameSource,
     input: Box<dyn InputInjector>,
+    clipboard: Box<dyn ClipboardAccess>,
 ) -> anyhow::Result<()> {
     let (input_tx, inject_task) = spawn_injection_thread(input);
-    // Spawn the dedicated input task (all-owned ⇒ `'static`); it holds its OWN sender clone.
-    let mut input_handle = tokio::spawn(run_input_recv(input_ch, input_tx.clone()));
+    // The clipboard task, if a dedicated Clipboard channel opened. All-owned ⇒ `'static`.
+    let clipboard_handle = clipboard_ch.map(|ch| tokio::spawn(run_clipboard_recv(ch, clipboard)));
 
-    // The video loop borrows `source`, so it runs inline (not spawned). Race it against the input
-    // task: whichever finishes first ends the session.
-    let video_fut =
-        run_video_send_loop(video_ch, frames_to_send, per_us, max_fragment_bytes, source);
-    tokio::pin!(video_fut);
-    let mut input_finished = false;
-    let result = tokio::select! {
-        r = &mut video_fut => r,
-        join = &mut input_handle => {
-            // The input task ended: a clean peer close/error, OR an unexpected panic. Surface a
-            // panic (don't silently end the session as a clean close); teardown is unaffected either
-            // way — the task's sender clone drops on unwind, so `release_all()` still fires.
-            if join.as_ref().is_err_and(tokio::task::JoinError::is_panic) {
-                warn!("input recv task panicked — ending session (held input released)");
+    let result = match input_ch {
+        Some(input_ch) => {
+            // Dedicated Input channel: race the inline video loop against a dedicated input task.
+            let mut input_handle = tokio::spawn(run_input_recv(input_ch, input_tx.clone()));
+            let video_fut =
+                run_video_send_loop(video_ch, frames_to_send, per_us, max_fragment_bytes, source);
+            tokio::pin!(video_fut);
+            let mut input_finished = false;
+            let result = tokio::select! {
+                r = &mut video_fut => r,
+                join = &mut input_handle => {
+                    // The input task ended: a clean peer close/error, OR an unexpected panic.
+                    // Surface a panic (don't silently end as a clean close); teardown is unaffected
+                    // either way — the task's sender clone drops on unwind, so `release_all()` fires.
+                    if join.as_ref().is_err_and(tokio::task::JoinError::is_panic) {
+                        warn!("input recv task panicked — ending session (held input released)");
+                    }
+                    // End the session. The in-flight `video_fut` is dropped — its await points
+                    // (`ticker.tick()`/`channel.send()`) are cancel-safe (at worst a partial
+                    // fragment is lost, and the session is ending anyway).
+                    input_finished = true;
+                    Ok(())
+                }
+            };
+            // If the input task already finished (its arm fired), its `JoinHandle` was polled to
+            // completion — polling again would panic — and its sender clone already dropped.
+            // Otherwise (video ended first) it is still running: abort + await so its clone drops.
+            if !input_finished {
+                input_handle.abort();
+                let _ = input_handle.await;
             }
-            // End the session. The in-flight `video_fut` is dropped — its await points
-            // (`ticker.tick()` and `channel.send()`) are both cancel-safe (at worst a partial
-            // fragment is lost, and the session is ending anyway).
-            input_finished = true;
-            Ok(())
+            result
+        }
+        None => {
+            // No dedicated Input channel: legacy path drains input off the video channel.
+            run_video_send_loop_with_input_drain(
+                video_ch,
+                frames_to_send,
+                per_us,
+                max_fragment_bytes,
+                source,
+                &input_tx,
+            )
+            .await
         }
     };
 
     // ── Teardown — runs on EVERY exit so `release_all()` always fires (ADR-0034). ──
-    // If the input task already finished (its arm fired), its `JoinHandle` was polled to completion
-    // — polling it again would panic ("JoinHandle polled after completion") — and its sender clone
-    // already dropped when the task returned. Otherwise (video ended first) the input task is still
-    // running: abort + await it so its sender clone drops.
-    if !input_finished {
-        input_handle.abort();
-        let _ = input_handle.await;
-    }
     drop(input_tx); // drop the outer clone → injection thread sees all senders gone
     let _ = inject_task.await; // injection thread exits its loop and runs release_all()
 
+    // The clipboard task never ends the session; abort+await it now so it stops cleanly. Aborting it
+    // mid-`spawn_blocking` can't preempt an in-flight OS write, but a late clipboard write is
+    // harmless (idempotent overwrite, no stuck-state hazard like held input).
+    if let Some(handle) = clipboard_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+
     match &result {
-        Ok(()) => info!("video stream complete (dual-channel)"),
+        Ok(()) => info!("video stream complete"),
         Err(_) => warn!("video stream ended with error (held input released)"),
     }
     result
+}
+
+/// Decode one inbound Clipboard message into paste-ready, **sanitized** text, or `None` when there
+/// is nothing safe to write (malformed bytes / decode error, a non-text format, or content that
+/// sanitizes to empty). Mirrors the input path's "malformed → ignore, never crash" contract.
+///
+/// §7: NEVER logs content — callers log only a byte count. The size/format/UTF-8 bounds are enforced
+/// by [`ClipboardUpdate::decode`]; the paste-injection hardening by [`sanitize_for_paste`].
+fn decode_clipboard_paste(bytes: &[u8]) -> Option<String> {
+    let update = match ClipboardUpdate::decode(bytes) {
+        Ok(u) => u,
+        Err(e) => {
+            debug!(error = %e, "dropping malformed clipboard update");
+            return None;
+        }
+    };
+    // Only `Text` exists today; a future non-text format would yield `None` here (it must get its
+    // own sanitizer + threat model before it can be applied — ADR-0037 §7).
+    let text = update.as_text()?;
+    sanitize_for_paste(text)
+}
+
+/// Dedicated clipboard-receive task (ADR-0037): own the Clipboard channel and apply every
+/// browser→host paste in arrival order. Unlike [`run_input_recv`], this task NEVER races the
+/// session — its natural end (peer close/error) is a non-fatal, expected event; video/input remain
+/// the only session drivers. It is always aborted+awaited by [`run_video_session`] on session end.
+async fn run_clipboard_recv(
+    mut clipboard_ch: Box<dyn Channel>,
+    clipboard: Box<dyn ClipboardAccess>,
+) {
+    let mut sink = clipboard;
+    loop {
+        match clipboard_ch.recv().await {
+            Ok(Some(bytes)) => {
+                // §7: byte count only, never content.
+                debug!(bytes = bytes.len(), "clipboard update received");
+                let Some(text) = decode_clipboard_paste(&bytes) else {
+                    continue;
+                };
+                // `set_text` may block on OS/IPC (see the `ClipboardAccess` contract) — never call
+                // it inline on the async runtime. One `spawn_blocking` per update (not a persistent
+                // thread: paste is rare/bursty and `set_text` has no ADR-0034-style stuck state to
+                // guard on drop), awaited before the next `recv()` so writes apply in wire order.
+                match tokio::task::spawn_blocking(move || {
+                    let result = sink.set_text(&text);
+                    (sink, result)
+                })
+                .await
+                {
+                    Ok((returned, Ok(()))) => sink = returned,
+                    Ok((returned, Err(e))) => {
+                        debug!(error = %e, "clipboard set_text failed");
+                        sink = returned;
+                    }
+                    Err(_join_err) => {
+                        // A panic in `set_text` loses `sink`'s ownership, ending this task —
+                        // non-fatal: video/input are unaffected. Backends are panic-free by
+                        // construction (same assumption as `InputInjector`).
+                        warn!("clipboard set_text task panicked — ending clipboard receive");
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {
+                info!("clipboard channel closed by peer");
+                return;
+            }
+            Err(e) => {
+                info!(error = %e, "clipboard channel recv error");
+                return;
+            }
+        }
+    }
 }
 
 /// Decide whether a decoded input event is admitted past the hostile-input rate limiter.
@@ -1573,16 +1724,25 @@ mod tests {
     /// Dedicated-input-channel (ADR-0036) host logic: channel classification + the safety-critical
     /// dual-channel teardown (`release_all` must fire on every exit order).
     mod dual {
-        use super::super::{classify_channels, run_video_dual, VideoFrameSource};
+        use super::super::{
+            classify_channels, decode_clipboard_paste, run_clipboard_recv, run_video_session,
+            VideoFrameSource,
+        };
         use bytes::Bytes;
+        use sh_clipboard::{ClipboardAccess, ClipboardError, NoopClipboard};
         use sh_input::{InputError, InputInjector};
-        use sh_protocol::{EventType, FrameType, InputEvent, Modifiers};
+        use sh_protocol::{ClipboardUpdate, EventType, FrameType, InputEvent, Modifiers};
         use sh_transport::channel::{Channel, ChannelSpec};
         use sh_transport::TransportError;
         use sh_types::ChannelId;
         use std::collections::VecDeque;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
+
+        /// Convenience: the fail-closed clipboard sink for the input-focused tests.
+        fn noop_clipboard() -> Box<dyn ClipboardAccess> {
+            Box::new(NoopClipboard::new())
+        }
 
         type RecvQueue = VecDeque<Result<Option<Bytes>, TransportError>>;
 
@@ -1669,37 +1829,80 @@ mod tests {
         #[test]
         fn classify_routes_by_spec_order_independent() {
             // video then input
-            let (v, i) = classify_channels(vec![
+            let c = classify_channels(vec![
                 MockChannel::boxed(ChannelSpec::video()),
                 MockChannel::boxed(ChannelSpec::input()),
             ])
             .unwrap();
-            assert_eq!(v.spec().channel, ChannelId::Video);
-            assert_eq!(i.unwrap().spec().channel, ChannelId::Input);
+            assert_eq!(c.video.spec().channel, ChannelId::Video);
+            assert_eq!(c.input.unwrap().spec().channel, ChannelId::Input);
+            assert!(c.clipboard.is_none());
             // input then video (reversed open order) → same routing
-            let (v, i) = classify_channels(vec![
+            let c = classify_channels(vec![
                 MockChannel::boxed(ChannelSpec::input()),
                 MockChannel::boxed(ChannelSpec::video()),
             ])
             .unwrap();
-            assert_eq!(v.spec().channel, ChannelId::Video);
-            assert_eq!(i.unwrap().spec().channel, ChannelId::Input);
+            assert_eq!(c.video.spec().channel, ChannelId::Video);
+            assert_eq!(c.input.unwrap().spec().channel, ChannelId::Input);
+        }
+
+        #[test]
+        fn classify_routes_clipboard_order_independent() {
+            // A three-channel peer (video + input + clipboard) in a scrambled open order still routes
+            // each channel to its slot — the clipboard channel is not mistaken for video (the bug the
+            // Clipboard match arm fixes).
+            let c = classify_channels(vec![
+                MockChannel::boxed(ChannelSpec::clipboard()),
+                MockChannel::boxed(ChannelSpec::video()),
+                MockChannel::boxed(ChannelSpec::input()),
+            ])
+            .unwrap();
+            assert_eq!(c.video.spec().channel, ChannelId::Video);
+            assert_eq!(c.input.unwrap().spec().channel, ChannelId::Input);
+            assert_eq!(c.clipboard.unwrap().spec().channel, ChannelId::Clipboard);
+        }
+
+        #[test]
+        fn classify_video_plus_clipboard_no_input() {
+            // {video, clipboard} with NO input must NOT fall to the legacy path with clipboard lost:
+            // clipboard is routed to its slot and video has no dedicated input.
+            let c = classify_channels(vec![
+                MockChannel::boxed(ChannelSpec::video()),
+                MockChannel::boxed(ChannelSpec::clipboard()),
+            ])
+            .unwrap();
+            assert_eq!(c.video.spec().channel, ChannelId::Video);
+            assert!(c.input.is_none());
+            assert_eq!(c.clipboard.unwrap().spec().channel, ChannelId::Clipboard);
         }
 
         #[test]
         fn classify_legacy_single_control_is_video_no_input() {
             // Today's browser opens one "shp" channel that parses to Control → routed as video, no
             // input channel → the caller uses the legacy between-frames drain.
-            let (v, i) =
-                classify_channels(vec![MockChannel::boxed(ChannelSpec::control())]).unwrap();
-            assert_eq!(v.spec().channel, ChannelId::Control);
-            assert!(i.is_none());
+            let c = classify_channels(vec![MockChannel::boxed(ChannelSpec::control())]).unwrap();
+            assert_eq!(c.video.spec().channel, ChannelId::Control);
+            assert!(c.input.is_none());
+            assert!(c.clipboard.is_none());
         }
 
         #[test]
         fn classify_no_video_errors() {
             // Only an input channel and nothing video-class → no usable video → error.
             assert!(classify_channels(vec![MockChannel::boxed(ChannelSpec::input())]).is_err());
+        }
+
+        #[test]
+        fn classify_duplicate_clipboard_keeps_one_no_panic() {
+            // A hostile peer opening two Clipboard channels must not panic; the last wins (warned).
+            let c = classify_channels(vec![
+                MockChannel::boxed(ChannelSpec::video()),
+                MockChannel::boxed(ChannelSpec::clipboard()),
+                MockChannel::boxed(ChannelSpec::clipboard()),
+            ])
+            .unwrap();
+            assert_eq!(c.clipboard.unwrap().spec().channel, ChannelId::Clipboard);
         }
 
         #[tokio::test]
@@ -1731,14 +1934,16 @@ mod tests {
             });
 
             let mut source = TestFrameSource;
-            let result = run_video_dual(
+            let result = run_video_session(
                 video,
-                input,
+                Some(input),
+                None,
                 1_000_000,
                 1_000,
                 64_000,
                 &mut source,
                 injector,
+                noop_clipboard(),
             )
             .await;
 
@@ -1779,8 +1984,18 @@ mod tests {
             });
 
             let mut source = TestFrameSource;
-            let result =
-                run_video_dual(video, input, 3, 1_000, 64_000, &mut source, injector).await;
+            let result = run_video_session(
+                video,
+                Some(input),
+                None,
+                3,
+                1_000,
+                64_000,
+                &mut source,
+                injector,
+                noop_clipboard(),
+            )
+            .await;
 
             assert!(result.is_ok());
             assert!(
@@ -1814,8 +2029,18 @@ mod tests {
                 sent: Arc::new(Mutex::new(0)),
             });
             let mut source = FailingFrameSource;
-            let result =
-                run_video_dual(video, input, 5, 1_000, 64_000, &mut source, injector).await;
+            let result = run_video_session(
+                video,
+                Some(input),
+                None,
+                5,
+                1_000,
+                64_000,
+                &mut source,
+                injector,
+                noop_clipboard(),
+            )
+            .await;
             assert!(result.is_err(), "a source error is an abnormal end → Err");
             assert!(
                 released.load(Ordering::SeqCst),
@@ -1826,14 +2051,237 @@ mod tests {
         #[test]
         fn classify_duplicate_input_keeps_one_no_panic() {
             // A hostile peer opening two Input channels must not panic; the last wins (warned).
-            let (v, i) = classify_channels(vec![
+            let c = classify_channels(vec![
                 MockChannel::boxed(ChannelSpec::video()),
                 MockChannel::boxed(ChannelSpec::input()),
                 MockChannel::boxed(ChannelSpec::input()),
             ])
             .unwrap();
-            assert_eq!(v.spec().channel, ChannelId::Video);
-            assert_eq!(i.unwrap().spec().channel, ChannelId::Input);
+            assert_eq!(c.video.spec().channel, ChannelId::Video);
+            assert_eq!(c.input.unwrap().spec().channel, ChannelId::Input);
+        }
+
+        // ── Clipboard receive path (ADR-0037) ────────────────────────────────────────────────────
+
+        /// A `ClipboardAccess` that records every successfully-applied `set_text` (content — this is a
+        /// TEST double; production never retains content, §7). `fail_on` (1-based) makes that Nth
+        /// call return a backend error WITHOUT recording, to exercise the non-fatal error path.
+        struct RecordingClipboard {
+            writes: Arc<Mutex<Vec<String>>>,
+            calls: usize,
+            fail_on: Option<usize>,
+        }
+        impl RecordingClipboard {
+            fn new(writes: Arc<Mutex<Vec<String>>>) -> Self {
+                Self {
+                    writes,
+                    calls: 0,
+                    fail_on: None,
+                }
+            }
+            fn failing_on(writes: Arc<Mutex<Vec<String>>>, nth: usize) -> Self {
+                Self {
+                    writes,
+                    calls: 0,
+                    fail_on: Some(nth),
+                }
+            }
+        }
+        impl ClipboardAccess for RecordingClipboard {
+            fn get_text(&mut self) -> Result<Option<String>, ClipboardError> {
+                Ok(None)
+            }
+            fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
+                self.calls += 1;
+                if self.fail_on == Some(self.calls) {
+                    return Err(ClipboardError::Backend(
+                        "synthetic set_text failure".to_owned(),
+                    ));
+                }
+                self.writes.lock().unwrap().push(text.to_owned());
+                Ok(())
+            }
+        }
+
+        fn text_update_bytes(s: &str) -> Bytes {
+            Bytes::from(ClipboardUpdate::text(s).unwrap().encode())
+        }
+
+        #[test]
+        fn decode_clipboard_paste_sanitizes_and_rejects() {
+            // Valid text → sanitized (an embedded ESC is stripped, CRLF → LF).
+            assert_eq!(
+                decode_clipboard_paste(&text_update_bytes("ls\r\n\u{1b}[31m")),
+                Some("ls\n[31m".to_owned())
+            );
+            // Malformed bytes (empty → no format byte) → None, never a panic.
+            assert_eq!(decode_clipboard_paste(&[]), None);
+            // Unknown format byte → None.
+            assert_eq!(decode_clipboard_paste(&[0xFF, b'x']), None);
+            // All-control text sanitizes to empty → None (skip the write, don't clobber).
+            assert_eq!(
+                decode_clipboard_paste(&text_update_bytes("\u{1b}\u{202e}\u{200b}")),
+                None
+            );
+        }
+
+        /// A clipboard channel that replays `msgs` then closes (`Ok(None)`) — so `run_clipboard_recv`
+        /// processes every message and returns on its own, deterministically (no race with teardown).
+        fn clipboard_channel_closing_after(msgs: Vec<Bytes>) -> Box<dyn Channel> {
+            let mut recvs: RecvQueue = msgs.into_iter().map(|b| Ok(Some(b))).collect();
+            recvs.push_back(Ok(None));
+            Box::new(MockChannel {
+                spec: ChannelSpec::clipboard(),
+                recvs: Mutex::new(recvs),
+                pend_when_empty: false,
+                sent: Arc::new(Mutex::new(0)),
+            })
+        }
+
+        #[tokio::test]
+        async fn clipboard_recv_applies_sanitized_pastes_in_order() {
+            // Drive `run_clipboard_recv` directly (deterministic — the channel closes itself): a valid
+            // paste, an all-control paste (skipped, no clobber), then a second valid paste.
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let clipboard = Box::new(RecordingClipboard::new(writes.clone()));
+            let ch = clipboard_channel_closing_after(vec![
+                text_update_bytes("hello\r\nworld"),
+                text_update_bytes("\u{1b}\u{200b}"), // all-control → sanitizes to empty → skipped
+                text_update_bytes("second"),
+            ]);
+
+            run_clipboard_recv(ch, clipboard).await;
+
+            assert_eq!(
+                *writes.lock().unwrap(),
+                vec!["hello\nworld".to_owned(), "second".to_owned()],
+                "both valid pastes applied (sanitized, in order); the all-control one was skipped"
+            );
+        }
+
+        #[tokio::test]
+        async fn clipboard_recv_set_text_error_is_non_fatal() {
+            // A backend `set_text` error on the 1st paste must NOT end the task — the 2nd paste still
+            // applies. (Recoverable-backend-hiccup contract; the erroring write is not recorded.)
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let clipboard = Box::new(RecordingClipboard::failing_on(writes.clone(), 1));
+            let ch = clipboard_channel_closing_after(vec![
+                text_update_bytes("first"),
+                text_update_bytes("after-error"),
+            ]);
+
+            run_clipboard_recv(ch, clipboard).await;
+
+            assert_eq!(
+                *writes.lock().unwrap(),
+                vec!["after-error".to_owned()],
+                "the failed write is skipped but the task keeps processing subsequent pastes"
+            );
+        }
+
+        #[tokio::test]
+        async fn video_completes_with_both_input_and_clipboard_channels() {
+            // The 4th combination: BOTH dedicated Input and Clipboard channels open. Video completes
+            // first → session ends; assert `release_all` fired (input torn down) and every frame sent.
+            // Both dedicated channels pend (never end on their own), so VIDEO completion drives end.
+            let released = Arc::new(AtomicBool::new(false));
+            let injector = Box::new(TrackingInjector {
+                injected: Arc::new(AtomicUsize::new(0)),
+                released: released.clone(),
+            });
+            let clipboard = Box::new(RecordingClipboard::new(Arc::new(Mutex::new(Vec::new()))));
+
+            let video_sent = Arc::new(Mutex::new(0usize));
+            let video = Box::new(MockChannel {
+                spec: ChannelSpec::video(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: video_sent.clone(),
+            });
+            let input = Box::new(MockChannel {
+                spec: ChannelSpec::input(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: Arc::new(Mutex::new(0)),
+            });
+            let clipboard_ch = Box::new(MockChannel {
+                spec: ChannelSpec::clipboard(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: Arc::new(Mutex::new(0)),
+            });
+
+            let mut source = TestFrameSource;
+            let result = run_video_session(
+                video,
+                Some(input),
+                Some(clipboard_ch),
+                3,
+                1_000,
+                64_000,
+                &mut source,
+                injector,
+                clipboard,
+            )
+            .await;
+
+            assert!(result.is_ok());
+            assert!(
+                released.load(Ordering::SeqCst),
+                "release_all MUST fire with both dedicated channels present (input aborted)"
+            );
+            assert_eq!(*video_sent.lock().unwrap(), 3, "all 3 frames must be sent");
+        }
+
+        #[tokio::test]
+        async fn clipboard_close_does_not_end_session() {
+            // The clipboard channel closing early must NOT end the session — video keeps streaming to
+            // completion. (If clipboard-close ended the session, fewer than all frames would send.)
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let clipboard = Box::new(RecordingClipboard::new(writes));
+
+            let video_sent = Arc::new(Mutex::new(0usize));
+            let video = Box::new(MockChannel {
+                spec: ChannelSpec::video(),
+                recvs: Mutex::new(VecDeque::new()),
+                pend_when_empty: true,
+                sent: video_sent.clone(),
+            });
+            // One paste then immediate close (Ok(None)).
+            let mut recvs = VecDeque::new();
+            recvs.push_back(Ok(Some(text_update_bytes("x"))));
+            let clipboard_ch = Box::new(MockChannel {
+                spec: ChannelSpec::clipboard(),
+                recvs: Mutex::new(recvs),
+                pend_when_empty: false, // returns Ok(None) after the paste → channel closes
+                sent: Arc::new(Mutex::new(0)),
+            });
+
+            let injector = Box::new(TrackingInjector {
+                injected: Arc::new(AtomicUsize::new(0)),
+                released: Arc::new(AtomicBool::new(false)),
+            });
+
+            let mut source = TestFrameSource;
+            let result = run_video_session(
+                video,
+                None,
+                Some(clipboard_ch),
+                4,
+                1_000,
+                64_000,
+                &mut source,
+                injector,
+                clipboard,
+            )
+            .await;
+
+            assert!(result.is_ok());
+            assert_eq!(
+                *video_sent.lock().unwrap(),
+                4,
+                "all 4 frames send even though the clipboard channel closed early"
+            );
         }
     }
 

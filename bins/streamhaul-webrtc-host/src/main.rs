@@ -30,6 +30,7 @@
 use std::io::Write as _;
 
 use anyhow::Context as _;
+use sh_clipboard::{ClipboardAccess, ClipboardError};
 use sh_input::{InputError, InputInjector};
 use sh_protocol::InputEvent;
 use streamhaul_webrtc_host::{parse_session_id, BakedFrameSource, HostConfig, StreamMode};
@@ -51,6 +52,31 @@ impl InputInjector for StdoutInputLogger {
             "INPUT_INJECTED seq={} type={:?}",
             self.count, event.event_type
         );
+        std::io::stdout().flush().ok();
+        Ok(())
+    }
+}
+
+/// A [`ClipboardAccess`] that does not touch the OS — it prints a machine-readable
+/// `CLIPBOARD_PASTED` line (byte count only, **never the content** — §7) per applied paste to
+/// stdout, and never has anything to offer on a read. Same rationale as [`StdoutInputLogger`]: the
+/// CI host is headless, so this proves a browser→host clipboard update was received + decoded +
+/// sanitized (the e2e greps for the line) without a real OS clipboard. A real backend is deferred to
+/// `sh-platform-*`; a capability-denied session uses `NoopClipboard`.
+#[derive(Default)]
+struct StdoutClipboardLogger {
+    count: u64,
+}
+
+impl ClipboardAccess for StdoutClipboardLogger {
+    fn get_text(&mut self) -> Result<Option<String>, ClipboardError> {
+        Ok(None)
+    }
+
+    fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
+        self.count = self.count.saturating_add(1);
+        // §7: byte count only, NEVER the text.
+        println!("CLIPBOARD_PASTED seq={} bytes={}", self.count, text.len());
         std::io::stdout().flush().ok();
         Ok(())
     }
@@ -179,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
             max_fragment_bytes: args.max_fragment_bytes,
             source: Box::new(BakedFrameSource::new()),
             input: Box::new(StdoutInputLogger::default()),
+            clipboard: Box::new(StdoutClipboardLogger::default()),
         }
     } else {
         StreamMode::Echo

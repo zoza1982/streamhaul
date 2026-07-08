@@ -32,6 +32,10 @@ sh-protocol = { path = "../../crates/sh-protocol" }
 # sh-input: the InputInjector trait + InputEvent. The host demuxes browser→host input frames off the
 # DataChannel and injects them (remote control). The OS injector is supplied by the binary (ADR-0034).
 sh-input = { path = "../../crates/sh-input" }
+# sh-clipboard: the ClipboardAccess trait + sanitize_for_paste. The host decodes browser→host
+# ClipboardUpdate messages off the dedicated Clipboard channel, sanitizes them (paste-injection
+# hardening), and applies them via this trait. The OS backend is supplied by the binary (ADR-0037).
+sh-clipboard = { path = "../../crates/sh-clipboard" }
 sh-signaling = { path = "../../crates/sh-signaling", features = ["insecure-lan"] }
 # sh-crypto: the identity-bound Noise XK handshake + BindCert (P5-3 Stage 2, ADR-0014/0023). The
 # host runs the responder side, commits its own DTLS fingerprint, and extracts the browser's
