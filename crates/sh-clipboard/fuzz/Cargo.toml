@@ -1,0 +1,26 @@
+# cargo-fuzz crate for sh-clipboard. This is its OWN workspace (note the empty [workspace] table) and
+# is excluded from the main workspace, so `cargo build/clippy/test --workspace` and CI never touch it.
+# Run with a nightly toolchain: `cargo +nightly fuzz run clipboard_sanitize` (see fuzz/README.md).
+[package]
+name = "sh-clipboard-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sh-clipboard]
+path = ".."
+
+[[bin]]
+name = "clipboard_sanitize"
+path = "fuzz_targets/clipboard_sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -6,7 +6,7 @@
 # bytes"). A crash fails the run and the reproducing input is uploaded as an
 # artifact.
 #
-# It is NOT a per-PR gate (running 19 instrumented targets is too slow for that);
+# It is NOT a per-PR gate (running 20 instrumented targets is too slow for that);
 # trigger it manually via the Actions tab / `gh workflow run fuzz-nightly.yml`
 # (workflow_dispatch) to validate a change to the fuzz harnesses.
 name: fuzz-nightly
@@ -35,7 +35,7 @@ jobs:
   fuzz-run:
     name: fuzz-run
     runs-on: ubuntu-latest
-    # 19 ASan-instrumented builds + 19×60s fuzzing; generous headroom for a cold
+    # 20 ASan-instrumented builds + 20×60s fuzzing; generous headroom for a cold
     # rust-cache so a slow build isn't misreported as a (crash) failure.
     timeout-minutes: 120
     steps:
@@ -56,6 +56,7 @@ jobs:
             crates/sh-signaling/fuzz -> target
             crates/sh-ice/fuzz -> target
             crates/sh-web-client/fuzz -> target
+            crates/sh-clipboard/fuzz -> target
           key: fuzz-run
       - name: Install cargo-fuzz (prebuilt, pinned)
         uses: taiki-e/install-action@v2
