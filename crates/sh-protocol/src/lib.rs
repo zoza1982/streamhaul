@@ -8,13 +8,15 @@
 //!
 //! Covers the [`CommonHeader`], [`VideoHeader`], the [`InputEvent`] (P1-2), control-channel
 //! framing ([`encode_control`]/[`decode_control`], P1-2), the 25-byte [`NackFeedback`]
-//! message (P2-6), the 4-byte [`capability`] codec-capability offer/answer frame (P2-5), and the
-//! [`file`]-transfer control + chunk framing (P7, ADR-0024).
+//! message (P2-6), the 4-byte [`capability`] codec-capability offer/answer frame (P2-5), the
+//! [`file`]-transfer control + chunk framing (P7, ADR-0024), and the bare [`ClipboardUpdate`] on the
+//! clipboard channel (ADR-0037).
 //! Audio and remaining feedback types land with their phases. Each message type
 //! lives in its own module; the public surface is re-exported here.
 
 mod bits;
 pub mod capability;
+mod clipboard;
 mod common;
 mod control;
 mod error;
@@ -24,6 +26,7 @@ mod input;
 pub mod transport_caps;
 mod video;
 
+pub use clipboard::{ClipboardFormat, ClipboardUpdate, MAX_CLIPBOARD_BYTES};
 pub use common::{CommonHeader, Flags};
 pub use control::{decode_control, encode_control, ControlFrame, CONTROL_HEADER_LEN};
 pub use error::ProtocolError;

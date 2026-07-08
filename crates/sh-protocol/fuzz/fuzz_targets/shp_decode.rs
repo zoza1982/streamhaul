@@ -14,6 +14,8 @@ fuzz_target!(|data: &[u8]| {
     let _ = sh_protocol::capability::decode_caps(data);
     // P4-6: transport capability decoder (untrusted peer bytes — 2-byte fixed format).
     let _ = sh_protocol::decode_transport_caps(data);
+    // Clipboard update decoder (untrusted peer clipboard bytes — ADR-0037).
+    let _ = sh_protocol::ClipboardUpdate::decode(data);
     // P7: file-transfer control + chunk decoders (untrusted peer bytes — ADR-0024).
     let _ = sh_protocol::FileOffer::decode(data);
     let _ = sh_protocol::FileAccept::decode(data);

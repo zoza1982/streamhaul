@@ -37,6 +37,15 @@ pub enum ProtocolError {
     /// A control-frame payload exceeds the 16-bit length field.
     #[error("control payload {0} exceeds 16-bit maximum")]
     ControlPayloadTooLarge(usize),
+    /// A clipboard update used an unknown `format` byte.
+    #[error("invalid clipboard format: {0}")]
+    InvalidClipboardFormat(u8),
+    /// A clipboard update's content exceeds [`crate::MAX_CLIPBOARD_BYTES`].
+    #[error("clipboard content {0} bytes exceeds maximum")]
+    ClipboardTooLarge(usize),
+    /// A text clipboard update's content is not valid UTF-8.
+    #[error("clipboard text is not valid UTF-8")]
+    InvalidClipboardText,
     /// `frame_id` exceeds [`crate::MAX_FRAME_ID`] (does not fit the 24-bit wire field).
     #[error("frame_id {0} exceeds 24-bit maximum")]
     FrameIdTooLarge(u64),
