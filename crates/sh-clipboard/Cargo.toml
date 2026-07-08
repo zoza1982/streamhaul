@@ -1,0 +1,15 @@
+[package]
+name = "sh-clipboard"
+description = "Portable clipboard-access trait and mock implementations for Streamhaul."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sh-protocol = { path = "../sh-protocol" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
