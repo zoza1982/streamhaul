@@ -67,6 +67,8 @@ interface InteropResult {
   h264DecodeSupported: boolean | null;
   /** VIDEO mode: count of synthetic input events the browser sent (remote control). */
   inputSent: number;
+  /** VIDEO mode: count of clipboard updates the browser sent (browser→host paste). */
+  clipboardSent: number;
   error: string | null;
 }
 
@@ -388,6 +390,13 @@ test("identity-bound browser↔native LIVE H.264 video (P5-3 Stage 2 + ADR-0031)
   // the browser→host remote-control path end to end (the live preview host injects into real X11).
   expect(r.inputSent, "browser should have sent input events").toBeGreaterThanOrEqual(1);
   await waitForStdoutLine(hostProc!, "INPUT_INJECTED", 15_000);
+
+  // CLIPBOARD (ADR-0037): the browser sent a paste on the dedicated Clipboard channel; assert the
+  // host received, decoded, sanitized, and applied it. The host's StdoutClipboardLogger prints
+  // `CLIPBOARD_PASTED bytes=...` (byte count only, never content — §7), proving browser→host
+  // clipboard sync end to end on a real DTLS DataChannel.
+  expect(r.clipboardSent, "browser should have sent a clipboard update").toBeGreaterThanOrEqual(1);
+  await waitForStdoutLine(hostProc!, "CLIPBOARD_PASTED", 15_000);
 
   expect(errors, "no page errors").toHaveLength(0);
 });

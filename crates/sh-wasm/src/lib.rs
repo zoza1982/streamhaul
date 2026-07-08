@@ -266,6 +266,22 @@ pub fn encode_input_event(
     Ok(event.encode().to_vec())
 }
 
+/// Encode a browser→host clipboard-paste `ClipboardUpdate` (`[format:u8][content]`) for the
+/// dedicated Clipboard DataChannel (ADR-0037). v1 is `text/plain` (UTF-8) only.
+///
+/// The host decodes, **sanitizes** (paste-injection hardening), and applies this. The TS never
+/// serializes the wire format — it calls this so the browser and host share one codec.
+///
+/// # Errors
+///
+/// Throws a `JsError` if `text` exceeds the 256 KiB clipboard bound (`MAX_CLIPBOARD_BYTES`).
+#[wasm_bindgen]
+pub fn encode_clipboard_text(text: &str) -> Result<Vec<u8>, JsError> {
+    let update = sh_protocol::ClipboardUpdate::text(text)
+        .map_err(|e| JsError::new(&format!("clipboard text too large: {e}")))?;
+    Ok(update.encode())
+}
+
 /// Decode the 16-byte SHP input event from `data`.
 ///
 /// Returns field values via a flat struct.  Primarily used for testing wire parity.
@@ -1218,6 +1234,34 @@ mod tests {
         bad[7] = 1; // reserved byte must be zero
         let result = crate::decode_video_header(&bad);
         assert!(result.is_err(), "reserved bits set must return error");
+    }
+
+    // ── ClipboardUpdate parity tests ─────────────────────────────────────────
+
+    #[wasm_bindgen_test]
+    fn clipboard_text_encode_matches_codec() {
+        // The wasm encoder must produce exactly what the Rust codec produces, and re-decode.
+        let bytes = crate::encode_clipboard_text("hello, 世界 🌍").unwrap();
+        let expected = sh_protocol::ClipboardUpdate::text("hello, 世界 🌍")
+            .unwrap()
+            .encode();
+        assert_eq!(
+            bytes, expected,
+            "wasm clipboard encode must match the Rust codec"
+        );
+        let decoded = sh_protocol::ClipboardUpdate::decode(&bytes).unwrap();
+        assert_eq!(decoded.as_text(), Some("hello, 世界 🌍"));
+        // Wire layout: format byte 0 (Text) then UTF-8 content.
+        assert_eq!(bytes.first(), Some(&0u8), "format byte must be 0 (Text)");
+    }
+
+    #[wasm_bindgen_test]
+    fn clipboard_text_encode_rejects_oversize() {
+        let big = "a".repeat(sh_protocol::MAX_CLIPBOARD_BYTES + 1);
+        assert!(
+            crate::encode_clipboard_text(&big).is_err(),
+            "text over the 256 KiB bound must be rejected"
+        );
     }
 
     // ── InputEvent parity tests ──────────────────────────────────────────────
