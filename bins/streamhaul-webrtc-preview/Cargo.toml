@@ -28,6 +28,9 @@ streamhaul-webrtc-host = { path = "../streamhaul-webrtc-host" }
 streamhaul-preview = { path = "../streamhaul-preview" }
 # OpenH264 software encoder — builds vendored C. This is the excluded-crate dep (ADR-0028/0029).
 sh-codec-openh264 = { path = "../../crates/sh-codec-openh264" }
+# NoopClipboard: the fail-closed clipboard sink (ADR-0037). A real X11 selection backend is deferred
+# to sh-platform-linux, so the live preview uses the inert default for now.
+sh-clipboard = { path = "../../crates/sh-clipboard" }
 # Media traits (ScreenCapturer, VideoEncoder, VideoFrame, SyntheticCapturer for tests).
 sh-media = { path = "../../crates/sh-media" }
 # SHP framing types (FrameType, CommonHeader, COMMON_HEADER_LEN).

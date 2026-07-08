@@ -2118,6 +2118,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "rand_core 0.6.4",
+ "sh-clipboard",
  "sh-crypto",
  "sh-input",
  "sh-protocol",

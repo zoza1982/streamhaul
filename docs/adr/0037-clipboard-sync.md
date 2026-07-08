@@ -88,12 +88,41 @@ variation-selector steganography; and any fully-valid-printable malicious conten
 scanner). Reading-side exfiltration is a capability-gate/consent concern (items 1–2), not the
 sanitizer's.
 
-### Host + browser wiring (follow-up PRs)
+### Host receive wiring (this PR)
 
-The host routes the Clipboard channel to a `Box<dyn ClipboardAccess>`; the browser bridges
-`navigator.clipboard` to the Clipboard channel. Both directions (host→browser paste, browser→host
-paste) gated by the `CLIPBOARD` capability. A CI logger mock (like `StdoutInputLogger`) proves
-receipt+decode without touching the OS.
+The host session accepts an optional dedicated Clipboard channel alongside video/input (one shared
+bounded accept window for both optional channels; classified order-independently by parsed
+`ChannelSpec`). A dedicated `run_clipboard_recv` task owns the channel and applies every browser→host
+paste in arrival order: `ClipboardUpdate::decode` → `sanitize_for_paste` → `ClipboardAccess::set_text`
+(skip on empty). It is **not** a session driver — its close is a non-fatal event; video/input remain
+the drivers — and it is always aborted+awaited on session end. `set_text` runs on `spawn_blocking`
+(the trait's contract allows an OS/IPC-blocking backend), awaited before the next message so writes
+apply in wire order. The workspace host uses `StdoutClipboardLogger` (a CI mock logging **only** a
+byte count + sequence, never content — §7), proving receipt+decode+sanitize without an OS clipboard;
+the fail-closed default sink is `NoopClipboard` (the live preview uses it until an OS backend lands).
+
+**Transport message-size bound (item 5) — still deferred.** The receive path enforces the 256 KiB
+bound *after* `decode`, but `sh-transport` has no per-channel max-message-size cap today — only the
+blanket 16 MiB `MAX_FRAME_LEN` on every reliable channel. So a hostile peer can still make the
+transport buffer up to ~16 MiB per bogus Clipboard message before `decode`'s 256 KiB check runs. This
+is a pre-existing transport-layer gap (it applies to every reliable channel, not just clipboard), not
+fixable in the host wiring; it remains a tracked follow-up (item 5), called out here rather than left
+silent.
+
+**Capability gate — deferred, tracked, consistent with input.** ADR item 1 requires a fail-closed
+`CLIPBOARD` capability gate on the receive path. The `streamhaul-webrtc-host` session has **no**
+authorization plumbing today — the dedicated Input channel (remote control) is likewise not
+`CONTROL`-gated; this is the `insecure-lan` dev/preview harness (`TrustAllKeystore`). Rather than
+invent a clipboard-only gate the rest of the host lacks, the fail-closed posture here is the **inert
+default sink** (`NoopClipboard` can neither read nor write a real OS clipboard), and a UGC-driven
+`SessionAuthorizer` gate for *all* privileged channels (input + clipboard) is a tracked follow-up.
+This is called out honestly rather than silently skipped (CLAUDE.md §11).
+
+### Host read + browser wiring (follow-up PRs)
+
+The host→browser paste direction (host reads its clipboard via `get_text`, encodes a
+`ClipboardUpdate`, sends it) and the browser bridge (`navigator.clipboard` ↔ the Clipboard channel,
+plus a live e2e) are follow-up PRs.
 
 ## Security
 
@@ -103,7 +132,10 @@ receipt+decode without touching the OS.
 - **§7:** clipboard content is session data and is **never logged** (the CI mock logs only a byte
   count + format, never the text).
 - **Authorization:** clipboard flows only when the session's `CLIPBOARD` capability is granted
-  (P3-5) — enforced at the host wiring layer (follow-up PR), not the wire layer.
+  (P3-5) — enforced at the host wiring layer, not the wire layer. In the current dev/preview host
+  the fail-closed posture is the inert `NoopClipboard` default sink; a UGC-driven `SessionAuthorizer`
+  gate for all privileged channels (input + clipboard) is a tracked follow-up (see "Host receive
+  wiring").
 
 ### Requirements for the wiring PRs (security-engineer review — **MUST**)
 

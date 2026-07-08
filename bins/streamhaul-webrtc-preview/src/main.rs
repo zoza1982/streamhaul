@@ -219,6 +219,9 @@ async fn run_linux(args: Args) -> anyhow::Result<()> {
         max_fragment_bytes: args.max_fragment_bytes,
         source: Box::new(live_source),
         input: Box::new(injector),
+        // Browser→host clipboard paste (ADR-0037). A real X11 selection backend is deferred to
+        // sh-platform-linux; until then the fail-closed inert sink (no OS clipboard write).
+        clipboard: Box::new(sh_clipboard::NoopClipboard::new()),
     };
 
     run_webrtc_host(config, mode, |fp| {

@@ -1546,6 +1546,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sh-clipboard"
+version = "0.0.0"
+dependencies = [
+ "sh-protocol",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "sh-codec-hw"
 version = "0.0.0"
 dependencies = [
@@ -1893,6 +1901,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "rand_core 0.6.4",
+ "sh-clipboard",
  "sh-crypto",
  "sh-input",
  "sh-protocol",
@@ -1912,6 +1921,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "sh-clipboard",
  "sh-codec-openh264",
  "sh-media",
  "sh-platform-linux",
