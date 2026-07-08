@@ -55,6 +55,8 @@ export interface WebClient {
   /** Send a ClipboardUpdate ([format][content]) on the dedicated Clipboard DataChannel (ADR-0037). */
   send_clipboard(update: Uint8Array): void;
   on_frame(callback: (frame: Uint8Array) => void): void;
+  /** Register a callback for host→browser ClipboardUpdate wire bytes on the Clipboard channel (ADR-0037). */
+  on_clipboard(callback: (update: Uint8Array) => void): void;
   on_data_channel(onOpen: (channel: RTCDataChannel) => void): void;
   on_ice_candidate(callback: (candidate: string | null) => void): void;
   ice_connection_state(): string;
@@ -177,6 +179,8 @@ export interface ShBridge {
   ): Uint8Array;
   /** Encode a browser→host ClipboardUpdate ([format][utf8 content]) for the Clipboard channel (ADR-0037). */
   encode_clipboard_text(text: string): Uint8Array;
+  /** Decode + sanitize a host→browser ClipboardUpdate; `undefined` if nothing safe to apply (ADR-0037). */
+  decode_and_sanitize_clipboard(data: Uint8Array): string | undefined;
   encode_caps(
     hw_encode_mask: number,
     hw_decode_mask: number,

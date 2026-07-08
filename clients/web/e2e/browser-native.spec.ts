@@ -69,6 +69,8 @@ interface InteropResult {
   inputSent: number;
   /** VIDEO mode: count of clipboard updates the browser sent (browser→host paste). */
   clipboardSent: number;
+  /** VIDEO mode: the sanitized text the browser received from the host (host→browser), or null. */
+  clipboardReceived: string | null;
   error: string | null;
 }
 
@@ -363,7 +365,20 @@ test("identity-bound browser↔native LIVE H.264 video (P5-3 Stage 2 + ADR-0031)
   // `--max-fragment-bytes 4096` forces the host to SPLIT each ~9 KB fixture frame into 2-3 SHP
   // fragments, so the browser's reassembler is exercised end to end (the assertions below now prove
   // the browser correctly reassembles fragmented frames before decoding them).
-  await startHost(["--stream-video", "--frames", "90", "--fps", "30", "--max-fragment-bytes", "4096"]);
+  // `--offer-clipboard` makes the host offer a clipboard to the browser once at session start
+  // (host→browser direction, ADR-0037); the driver's `on_clipboard` decodes+sanitizes it and the
+  // assertion below proves the browser received it.
+  await startHost([
+    "--stream-video",
+    "--frames",
+    "90",
+    "--fps",
+    "30",
+    "--max-fragment-bytes",
+    "4096",
+    "--offer-clipboard",
+    "host offered clip",
+  ]);
   const hostFp = process.env["_TEST_HOST_FP"]!;
 
   // video=1: the in-page driver parses the inbound SHP video frames and decodes them via WebCodecs.
@@ -397,6 +412,13 @@ test("identity-bound browser↔native LIVE H.264 video (P5-3 Stage 2 + ADR-0031)
   // clipboard sync end to end on a real DTLS DataChannel.
   expect(r.clipboardSent, "browser should have sent a clipboard update").toBeGreaterThanOrEqual(1);
   await waitForStdoutLine(hostProc!, "CLIPBOARD_PASTED", 15_000);
+
+  // CLIPBOARD host→browser (ADR-0037): the host offered "host offered clip" via `--offer-clipboard`;
+  // the browser's `on_clipboard` decoded + sanitized it. Assert the exact received text, proving the
+  // host→browser clipboard direction end to end on a real DTLS DataChannel.
+  expect(r.clipboardReceived, "browser should have received the host's offered clipboard").toBe(
+    "host offered clip",
+  );
 
   expect(errors, "no page errors").toHaveLength(0);
 });

@@ -565,6 +565,38 @@ impl WebClient {
         Ok(())
     }
 
+    /// Set a callback invoked with each host→browser `ClipboardUpdate` (`Uint8Array`, raw wire bytes)
+    /// received on the dedicated **Clipboard** DataChannel (ADR-0037).
+    ///
+    /// The callback receives the opaque wire bytes; the app decodes + **sanitizes** them via
+    /// [`sh_wasm::decode_and_sanitize_clipboard`] before writing to `navigator.clipboard` (host
+    /// content is untrusted). The callback fires for every binary `message`; text messages are
+    /// ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `JsValue` if the clipboard channel does not exist yet.
+    #[wasm_bindgen]
+    pub fn on_clipboard(&self, callback: js_sys::Function) -> Result<(), JsValue> {
+        let ch = self
+            .clipboard_channel
+            .as_ref()
+            .ok_or_else(|| JsError::new("no clipboard DataChannel to attach on_clipboard to"))?;
+        let cb = Closure::<dyn FnMut(MessageEvent)>::new(move |evt: MessageEvent| {
+            let data = evt.data();
+            if let Ok(buf) = data.dyn_into::<js_sys::ArrayBuffer>() {
+                let arr = js_sys::Uint8Array::new(&buf);
+                if let Err(e) = callback.call1(&JsValue::NULL, &arr) {
+                    web_sys::console::warn_1(&e);
+                }
+            }
+        });
+        ch.set_binary_type(web_sys::RtcDataChannelType::Arraybuffer);
+        ch.set_onmessage(Some(cb.as_ref().unchecked_ref()));
+        cb.forget();
+        Ok(())
+    }
+
     /// Register a callback for the answerer's inbound DataChannel (`ondatachannel`).
     ///
     /// The answerer does not call `createDataChannel`; instead it receives the offerer's channel

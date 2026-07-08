@@ -236,6 +236,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sh-clipboard"
+version = "0.0.0"
+dependencies = [
+ "sh-protocol",
+ "thiserror",
+]
+
+[[package]]
 name = "sh-protocol"
 version = "0.0.0"
 dependencies = [
@@ -255,6 +263,7 @@ dependencies = [
 name = "sh-wasm"
 version = "0.0.0"
 dependencies = [
+ "sh-clipboard",
  "sh-protocol",
  "sh-types",
  "wasm-bindgen",

@@ -1,8 +1,8 @@
 # ADR 0037: Clipboard sync (browser ↔ host)
 
-- **Status:** Accepted (wire format, portable crate, paste hardening, host receive wiring, and
-  browser send wiring done through PR 5; host→browser read direction, `navigator.clipboard` browser
-  bridge, OS backends, and the UGC capability gate staged)
+- **Status:** Accepted (wire format, portable crate, paste hardening, and **both directions** of
+  browser↔host clipboard sync done through PR 6; real OS clipboard backends, the `navigator.clipboard`
+  user-gesture read, and the UGC capability gate staged)
 - **Date:** 2026-07-06
 - **Deciders:** software-architect (design), security-engineer (consulted)
 - **Builds on:** ADR-0034 (input back-channel — the pattern this mirrors), P1-1 (multi-channel
@@ -131,12 +131,23 @@ End-to-end: the `browser-native` e2e sends a CRLF-containing paste via `send_cli
 the host's `CLIPBOARD_PASTED` log, proving browser→host clipboard sync over a real DTLS DataChannel
 in headless Firefox (the host applies the sanitized, line-ending-normalized text).
 
-### Host read + OS backends (follow-up PRs)
+### Host→browser direction (this PR)
 
-The host→browser paste direction (host reads its clipboard via `get_text`, encodes a
-`ClipboardUpdate`, sends it), the browser's `navigator.clipboard` bridge (reading the real browser
-clipboard on a user gesture and applying host→browser pastes), the OS backends, and the UGC
-capability gate are follow-up PRs.
+Both directions now flow over the one bidirectional Clipboard channel. On session start the host's
+`run_clipboard` task reads its clipboard (`get_text`, off the runtime via `spawn_blocking`) and, if
+non-empty, sends it once as a `ClipboardUpdate` (host→browser); it then loops applying browser→host
+pastes. The browser's `WebClient::on_clipboard` delivers the raw wire bytes; the app decodes **and
+sanitizes** them with `sh_wasm::decode_and_sanitize_clipboard` (host content is untrusted — the SAME
+`sanitize_for_paste` hardening runs browser-side) before a best-effort `navigator.clipboard.writeText`.
+The workspace host offers via a `--offer-clipboard <text>` flag (a real host reads the OS clipboard
+here); the `browser-native` e2e drives it and asserts the browser received the exact sanitized text,
+proving host→browser sync end to end in headless Firefox.
+
+### OS backends + capability gate (follow-up PRs)
+
+Real OS clipboard backends (X11 selections, `NSPasteboard`, Windows clipboard) — so the host offers
+its *actual* clipboard and the browser reads the *real* browser clipboard on a user gesture — and the
+UGC capability gate are follow-up PRs, deferred like the input injectors' OS backends.
 
 ## Security
 

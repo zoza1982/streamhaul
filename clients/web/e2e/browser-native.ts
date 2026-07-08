@@ -106,6 +106,8 @@ export interface InteropResult {
   inputSent: number;
   /** VIDEO mode: count of clipboard updates the browser sent to the host (browser→host paste). */
   clipboardSent: number;
+  /** VIDEO mode: the sanitized text the browser received from the host (host→browser), or null. */
+  clipboardReceived: string | null;
   /** Error message, if any. */
   error: string | null;
 }
@@ -161,6 +163,7 @@ async function runInteropTest(): Promise<InteropResult> {
     h264DecodeSupported: null,
     inputSent: 0,
     clipboardSent: 0,
+    clipboardReceived: null,
     error: null,
   };
 
@@ -195,8 +198,9 @@ async function runInteropTest(): Promise<InteropResult> {
     const SignalingChannel = bridge.SignalingChannel;
     viewer = new bridge.WebClient(new SignalingChannel(noop));
 
-    // create_offer() builds the offerer's two DataChannels (video "0:128:1" + input "2:0:1",
-    // ADR-0036) and sets the local description, so local_dtls_fingerprint() is valid afterwards.
+    // create_offer() builds the offerer's three DataChannels (video "0:128:1" + input "2:0:1",
+    // ADR-0036; clipboard "3:2:1", ADR-0037) and sets the local description, so
+    // local_dtls_fingerprint() is valid afterwards.
     // setLocalDescription also STARTS ICE gathering,
     // so we register the candidate handler immediately and BUFFER candidates until the WS is up
     // (the Noise handshake runs first and takes a few round-trips). Losing the browser's host
@@ -294,6 +298,25 @@ async function runInteropTest(): Promise<InteropResult> {
           /* ignore decode errors — a hostile/garbage frame must not crash the viewer */
         }
         result.framesDecoded = dec.stats.framesDecoded;
+      });
+
+      // CLIPBOARD host→browser (ADR-0037): the host offers its clipboard once at session start.
+      // Decode + SANITIZE the untrusted host content via the wasm bridge (never trust host bytes),
+      // record receipt for the spec assertion, and best-effort write it to the real browser
+      // clipboard (permission-gated in headless CI — non-fatal, the receipt is the authoritative
+      // proof). Attached BEFORE connect so the host's early offer is caught.
+      viewer!.on_clipboard((update: Uint8Array) => {
+        const text = bridge.decode_and_sanitize_clipboard(update);
+        if (text === undefined) return; // malformed / non-text / all-control → nothing to apply
+        result.clipboardReceived = text;
+        // `writeText` is permission-gated in headless CI; swallow both a synchronous throw and a
+        // rejected promise so a denied write never surfaces as an unhandled rejection / page error
+        // (the receipt above is the authoritative proof of the host→browser path).
+        try {
+          navigator.clipboard?.writeText(text).catch(() => {});
+        } catch {
+          /* no navigator.clipboard at all — receipt above is the proof */
+        }
       });
     } else {
       echoPromise = new Promise<Uint8Array>((resolve) => {

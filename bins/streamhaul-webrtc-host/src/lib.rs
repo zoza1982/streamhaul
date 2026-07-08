@@ -1506,7 +1506,7 @@ async fn run_video_session(
 ) -> anyhow::Result<()> {
     let (input_tx, inject_task) = spawn_injection_thread(input);
     // The clipboard task, if a dedicated Clipboard channel opened. All-owned ⇒ `'static`.
-    let clipboard_handle = clipboard_ch.map(|ch| tokio::spawn(run_clipboard_recv(ch, clipboard)));
+    let clipboard_handle = clipboard_ch.map(|ch| tokio::spawn(run_clipboard(ch, clipboard)));
 
     let result = match input_ch {
         Some(input_ch) => {
@@ -1594,15 +1594,48 @@ fn decode_clipboard_paste(bytes: &[u8]) -> Option<String> {
     sanitize_for_paste(text)
 }
 
-/// Dedicated clipboard-receive task (ADR-0037): own the Clipboard channel and apply every
+/// Dedicated clipboard task (ADR-0037): owns the bidirectional Clipboard channel. On start it
+/// **offers** the host's clipboard to the browser once (host→browser), then loops applying every
 /// browser→host paste in arrival order. Unlike [`run_input_recv`], this task NEVER races the
 /// session — its natural end (peer close/error) is a non-fatal, expected event; video/input remain
 /// the only session drivers. It is always aborted+awaited by [`run_video_session`] on session end.
-async fn run_clipboard_recv(
-    mut clipboard_ch: Box<dyn Channel>,
-    clipboard: Box<dyn ClipboardAccess>,
-) {
+async fn run_clipboard(mut clipboard_ch: Box<dyn Channel>, clipboard: Box<dyn ClipboardAccess>) {
     let mut sink = clipboard;
+
+    // ── Host→browser: offer the host's clipboard once at session start. ──
+    // `get_text` may block on OS/IPC (the `ClipboardAccess` contract), so read it off the runtime.
+    match tokio::task::spawn_blocking(move || {
+        let read = sink.get_text();
+        (sink, read)
+    })
+    .await
+    {
+        Ok((returned, Ok(Some(text)))) => {
+            sink = returned;
+            // Bound to the wire limit (a huge host clipboard is dropped, not truncated). §7: byte
+            // count only, never content.
+            match ClipboardUpdate::text(&text) {
+                // Send failure is non-fatal (the browser→host receive loop below still runs) but is
+                // logged like every other branch — §7: byte count / error only, never content.
+                Ok(update) => match clipboard_ch.send(Bytes::from(update.encode())).await {
+                    Ok(()) => debug!(bytes = text.len(), "offered host clipboard to browser"),
+                    Err(e) => debug!(error = %e, "failed to send host clipboard offer"),
+                },
+                Err(e) => debug!(error = %e, "host clipboard too large to offer — skipped"),
+            }
+        }
+        Ok((returned, Ok(None))) => sink = returned, // host clipboard empty / non-text — nothing to offer
+        Ok((returned, Err(e))) => {
+            debug!(error = %e, "reading host clipboard to offer failed");
+            sink = returned;
+        }
+        Err(_join_err) => {
+            warn!("clipboard get_text task panicked — ending clipboard task");
+            return;
+        }
+    }
+
+    // ── Browser→host: apply every inbound paste in wire order. ──
     loop {
         match clipboard_ch.recv().await {
             Ok(Some(bytes)) => {
@@ -1725,7 +1758,7 @@ mod tests {
     /// dual-channel teardown (`release_all` must fire on every exit order).
     mod dual {
         use super::super::{
-            classify_channels, decode_clipboard_paste, run_clipboard_recv, run_video_session,
+            classify_channels, decode_clipboard_paste, run_clipboard, run_video_session,
             VideoFrameSource,
         };
         use bytes::Bytes;
@@ -1780,6 +1813,49 @@ mod tests {
                     // path. `pending()` yields the arm's own type, so no `unreachable!` is needed.
                     None if self.pend_when_empty => std::future::pending().await,
                     None => Ok(None),
+                }
+            }
+            fn spec(&self) -> &ChannelSpec {
+                &self.spec
+            }
+        }
+
+        /// A clipboard `Channel` double that CAPTURES sent bytes (so a test can decode the host's
+        /// offer) and can be told to FAIL sends. `recvs` then `Ok(None)` closes it so `run_clipboard`
+        /// returns deterministically.
+        struct CaptureChannel {
+            spec: ChannelSpec,
+            sent: Arc<Mutex<Vec<Bytes>>>,
+            send_ok: bool,
+            recvs: Mutex<RecvQueue>,
+        }
+        impl CaptureChannel {
+            fn boxed(
+                sent: Arc<Mutex<Vec<Bytes>>>,
+                send_ok: bool,
+                recvs: RecvQueue,
+            ) -> Box<dyn Channel> {
+                Box::new(Self {
+                    spec: ChannelSpec::clipboard(),
+                    sent,
+                    send_ok,
+                    recvs: Mutex::new(recvs),
+                })
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for CaptureChannel {
+            async fn send(&mut self, msg: Bytes) -> Result<(), TransportError> {
+                if !self.send_ok {
+                    return Err(TransportError::StreamClosed);
+                }
+                self.sent.lock().unwrap().push(msg);
+                Ok(())
+            }
+            async fn recv(&mut self) -> Result<Option<Bytes>, TransportError> {
+                match self.recvs.lock().unwrap().pop_front() {
+                    Some(r) => r,
+                    None => Ok(None), // closed → run_clipboard's receive loop returns
                 }
             }
             fn spec(&self) -> &ChannelSpec {
@@ -2070,6 +2146,7 @@ mod tests {
             writes: Arc<Mutex<Vec<String>>>,
             calls: usize,
             fail_on: Option<usize>,
+            offer: Option<String>,
         }
         impl RecordingClipboard {
             fn new(writes: Arc<Mutex<Vec<String>>>) -> Self {
@@ -2077,6 +2154,7 @@ mod tests {
                     writes,
                     calls: 0,
                     fail_on: None,
+                    offer: None,
                 }
             }
             fn failing_on(writes: Arc<Mutex<Vec<String>>>, nth: usize) -> Self {
@@ -2084,12 +2162,22 @@ mod tests {
                     writes,
                     calls: 0,
                     fail_on: Some(nth),
+                    offer: None,
+                }
+            }
+            /// Make `get_text` return `offer` — the host→browser clipboard the host will offer.
+            fn offering(writes: Arc<Mutex<Vec<String>>>, offer: &str) -> Self {
+                Self {
+                    writes,
+                    calls: 0,
+                    fail_on: None,
+                    offer: Some(offer.to_owned()),
                 }
             }
         }
         impl ClipboardAccess for RecordingClipboard {
             fn get_text(&mut self) -> Result<Option<String>, ClipboardError> {
-                Ok(None)
+                Ok(self.offer.clone())
             }
             fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
                 self.calls += 1;
@@ -2125,7 +2213,7 @@ mod tests {
             );
         }
 
-        /// A clipboard channel that replays `msgs` then closes (`Ok(None)`) — so `run_clipboard_recv`
+        /// A clipboard channel that replays `msgs` then closes (`Ok(None)`) — so `run_clipboard`
         /// processes every message and returns on its own, deterministically (no race with teardown).
         fn clipboard_channel_closing_after(msgs: Vec<Bytes>) -> Box<dyn Channel> {
             let mut recvs: RecvQueue = msgs.into_iter().map(|b| Ok(Some(b))).collect();
@@ -2140,7 +2228,7 @@ mod tests {
 
         #[tokio::test]
         async fn clipboard_recv_applies_sanitized_pastes_in_order() {
-            // Drive `run_clipboard_recv` directly (deterministic — the channel closes itself): a valid
+            // Drive `run_clipboard` directly (deterministic — the channel closes itself): a valid
             // paste, an all-control paste (skipped, no clobber), then a second valid paste.
             let writes = Arc::new(Mutex::new(Vec::new()));
             let clipboard = Box::new(RecordingClipboard::new(writes.clone()));
@@ -2150,7 +2238,7 @@ mod tests {
                 text_update_bytes("second"),
             ]);
 
-            run_clipboard_recv(ch, clipboard).await;
+            run_clipboard(ch, clipboard).await;
 
             assert_eq!(
                 *writes.lock().unwrap(),
@@ -2170,12 +2258,102 @@ mod tests {
                 text_update_bytes("after-error"),
             ]);
 
-            run_clipboard_recv(ch, clipboard).await;
+            run_clipboard(ch, clipboard).await;
 
             assert_eq!(
                 *writes.lock().unwrap(),
                 vec!["after-error".to_owned()],
                 "the failed write is skipped but the task keeps processing subsequent pastes"
+            );
+        }
+
+        #[tokio::test]
+        async fn clipboard_offers_host_clipboard_to_browser() {
+            // Host→browser (ADR-0037): on start, `run_clipboard` reads the host clipboard (get_text)
+            // and sends it once as a ClipboardUpdate. Assert exactly one message was sent AND that its
+            // bytes decode back to the offered text (a real host→browser wire payload).
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let clipboard = Box::new(RecordingClipboard::offering(writes, "host clip 🌍"));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let ch = CaptureChannel::boxed(sent.clone(), true, VecDeque::new());
+
+            run_clipboard(ch, clipboard).await;
+
+            let sent = sent.lock().unwrap();
+            assert_eq!(
+                sent.len(),
+                1,
+                "the host clipboard must be offered exactly once"
+            );
+            assert_eq!(
+                ClipboardUpdate::decode(&sent[0]).unwrap().as_text(),
+                Some("host clip 🌍"),
+                "the offered bytes must be the exact ClipboardUpdate for the host clipboard"
+            );
+        }
+
+        #[tokio::test]
+        async fn clipboard_no_offer_when_host_clipboard_empty() {
+            // get_text → None (empty host clipboard) means nothing is offered — no send.
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let clipboard = Box::new(RecordingClipboard::new(writes)); // get_text → None
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let ch = CaptureChannel::boxed(sent.clone(), true, VecDeque::new());
+
+            run_clipboard(ch, clipboard).await;
+
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "an empty host clipboard offers nothing"
+            );
+        }
+
+        #[tokio::test]
+        async fn clipboard_offer_send_failure_is_non_fatal() {
+            // If the host→browser offer send fails, the browser→host receive loop must STILL run.
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let clipboard = Box::new(RecordingClipboard::offering(writes.clone(), "offered"));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut recvs: RecvQueue = VecDeque::new();
+            recvs.push_back(Ok(Some(text_update_bytes("paste after failed offer"))));
+            // send_ok = false → the offer send errors; a paste is then delivered before close.
+            let ch = CaptureChannel::boxed(sent.clone(), false, recvs);
+
+            run_clipboard(ch, clipboard).await;
+
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "the failing offer captured nothing"
+            );
+            assert_eq!(
+                *writes.lock().unwrap(),
+                vec!["paste after failed offer".to_owned()],
+                "a failed offer must not stop the browser→host receive loop"
+            );
+        }
+
+        #[tokio::test]
+        async fn clipboard_oversize_offer_skipped_receive_still_runs() {
+            // A host clipboard larger than the wire bound is dropped (not truncated), and the
+            // browser→host receive loop still runs afterward.
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let big = "a".repeat(sh_protocol::MAX_CLIPBOARD_BYTES + 1);
+            let clipboard = Box::new(RecordingClipboard::offering(writes.clone(), &big));
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut recvs: RecvQueue = VecDeque::new();
+            recvs.push_back(Ok(Some(text_update_bytes("paste after oversize offer"))));
+            let ch = CaptureChannel::boxed(sent.clone(), true, recvs);
+
+            run_clipboard(ch, clipboard).await;
+
+            assert!(
+                sent.lock().unwrap().is_empty(),
+                "an oversize host clipboard offers nothing (dropped, not truncated)"
+            );
+            assert_eq!(
+                *writes.lock().unwrap(),
+                vec!["paste after oversize offer".to_owned()],
+                "an oversize offer must not stop the browser→host receive loop"
             );
         }
 
