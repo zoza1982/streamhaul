@@ -66,11 +66,21 @@ impl InputInjector for StdoutInputLogger {
 #[derive(Default)]
 struct StdoutClipboardLogger {
     count: u64,
+    /// If set, the text the host offers to the browser once at session start (host→browser). A real
+    /// host would read the OS clipboard here; the CI host takes it from `--offer-clipboard` so the
+    /// e2e can drive the host→browser direction deterministically.
+    offer: Option<String>,
+}
+
+impl StdoutClipboardLogger {
+    fn with_offer(offer: Option<String>) -> Self {
+        Self { count: 0, offer }
+    }
 }
 
 impl ClipboardAccess for StdoutClipboardLogger {
     fn get_text(&mut self) -> Result<Option<String>, ClipboardError> {
-        Ok(None)
+        Ok(self.offer.clone())
     }
 
     fn set_text(&mut self, text: &str) -> Result<(), ClipboardError> {
@@ -91,6 +101,7 @@ struct Args {
     frames: usize,
     fps: u32,
     max_fragment_bytes: usize,
+    offer_clipboard: Option<String>,
 }
 
 impl Args {
@@ -107,6 +118,8 @@ impl Args {
         let mut fps: u32 = 30;
         // Default to the SHP wire cap; a test can pass a small value to force fragmentation.
         let mut max_fragment_bytes: usize = usize::from(u16::MAX);
+        // If set, the text the host offers to the browser once (host→browser clipboard, ADR-0037).
+        let mut offer_clipboard: Option<String> = None;
 
         let mut args = std::env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -151,6 +164,10 @@ impl Args {
                         "--max-fragment-bytes must be >= 1024"
                     );
                 }
+                "--offer-clipboard" => {
+                    offer_clipboard =
+                        Some(args.next().context("--offer-clipboard requires a value")?);
+                }
                 other => {
                     warn!(flag = other, "unknown flag (ignored)");
                 }
@@ -165,6 +182,7 @@ impl Args {
             frames,
             fps,
             max_fragment_bytes,
+            offer_clipboard,
         })
     }
 }
@@ -205,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
             max_fragment_bytes: args.max_fragment_bytes,
             source: Box::new(BakedFrameSource::new()),
             input: Box::new(StdoutInputLogger::default()),
-            clipboard: Box::new(StdoutClipboardLogger::default()),
+            clipboard: Box::new(StdoutClipboardLogger::with_offer(args.offer_clipboard)),
         }
     } else {
         StreamMode::Echo

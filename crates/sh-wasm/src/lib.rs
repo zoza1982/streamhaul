@@ -282,6 +282,23 @@ pub fn encode_clipboard_text(text: &str) -> Result<Vec<u8>, JsError> {
     Ok(update.encode())
 }
 
+/// Decode a host→browser `ClipboardUpdate` off the Clipboard channel and return the **sanitized**
+/// text safe to write to the browser clipboard, or `undefined` when there is nothing safe to apply
+/// (malformed bytes, a non-text format, or content that sanitizes to empty) — ADR-0037.
+///
+/// Host clipboard content is untrusted (a hostile/compromised host could craft a hostile paste), so
+/// this runs the SAME paste-injection hardening the host applies to browser→host pastes
+/// (`sh_clipboard::sanitize_for_paste`): control/bidi/invisible stripping + line-ending
+/// normalization. The caller writes the returned string to `navigator.clipboard` only when it is
+/// present. Never throws: any malformed input yields `undefined`, never a panic (the wire decoder is
+/// total and fuzzed).
+#[wasm_bindgen]
+pub fn decode_and_sanitize_clipboard(data: &[u8]) -> Option<String> {
+    let update = sh_protocol::ClipboardUpdate::decode(data).ok()?;
+    let text = update.as_text()?;
+    sh_clipboard::sanitize_for_paste(text)
+}
+
 /// Decode the 16-byte SHP input event from `data`.
 ///
 /// Returns field values via a flat struct.  Primarily used for testing wire parity.
@@ -1262,6 +1279,26 @@ mod tests {
             crate::encode_clipboard_text(&big).is_err(),
             "text over the 256 KiB bound must be rejected"
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn decode_and_sanitize_clipboard_roundtrips_and_hardens() {
+        // A host→browser update decodes and is sanitized (CRLF→LF, ESC stripped).
+        let wire = crate::encode_clipboard_text("host\r\nclip\u{1b}[0m").unwrap();
+        assert_eq!(
+            crate::decode_and_sanitize_clipboard(&wire),
+            Some("host\nclip[0m".to_owned())
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn decode_and_sanitize_clipboard_rejects_malformed_and_all_control() {
+        // Malformed bytes → None, never a panic.
+        assert_eq!(crate::decode_and_sanitize_clipboard(&[]), None);
+        assert_eq!(crate::decode_and_sanitize_clipboard(&[0xFF, b'x']), None);
+        // All-control content sanitizes to empty → None (nothing safe to write).
+        let wire = crate::encode_clipboard_text("\u{1b}\u{202e}\u{200b}").unwrap();
+        assert_eq!(crate::decode_and_sanitize_clipboard(&wire), None);
     }
 
     // ── InputEvent parity tests ──────────────────────────────────────────────
