@@ -4,6 +4,16 @@ use sh_protocol::InputEvent;
 
 use crate::InputError;
 
+/// The [`InputEvent::button_mask`] bits the injectors actually inject: left (0), right (1), middle
+/// (2). The upper bits are **reserved** — every OS injector iterates only these bits, so
+/// `button_mask & DEFINED_BUTTON_BITS` is the set of *really-held* buttons.
+///
+/// This is the single source of truth shared by every injector (`sh-platform-{linux,mac,win}`) and
+/// the host's hostile-input rate limiter (which masks to these bits before its release check, so a
+/// peer can't toggle a reserved bit to forge a phantom release — ADR-0034). A new physical button
+/// (back/forward) widens this constant **and** the injectors' `BUTTON_MAP` in lockstep.
+pub const DEFINED_BUTTON_BITS: u8 = 0x07;
+
 /// Applies a decoded [`InputEvent`] to the local machine.
 ///
 /// # Contract

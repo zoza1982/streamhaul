@@ -32,7 +32,7 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use tracing::debug;
 
-use sh_input::{CoordMapper, InputError, InputInjector, TargetRect};
+use sh_input::{CoordMapper, InputError, InputInjector, TargetRect, DEFINED_BUTTON_BITS};
 use sh_protocol::{EventType, InputEvent, Modifiers};
 
 use crate::keymap::hid_to_cgkeycode;
@@ -42,10 +42,6 @@ const FLAG_SHIFT: u64 = 0x0002_0000; // kCGEventFlagMaskShift
 const FLAG_CONTROL: u64 = 0x0004_0000; // kCGEventFlagMaskControl
 const FLAG_ALTERNATE: u64 = 0x0008_0000; // kCGEventFlagMaskAlternate (Option)
 const FLAG_COMMAND: u64 = 0x0010_0000; // kCGEventFlagMaskCommand
-
-/// Mask of the button bits this injector tracks (bits 0–2). Reserved bits 3–7 are ignored, so
-/// `prev_button_mask & DEFINED_BUTTON_BITS == 0` means nothing is really held.
-const DEFINED_BUTTON_BITS: u8 = 0x07;
 
 /// An [`InputInjector`] that synthesises macOS input via CoreGraphics `CGEvent`.
 ///

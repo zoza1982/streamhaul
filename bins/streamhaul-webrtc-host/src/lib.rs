@@ -31,7 +31,7 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use sh_clipboard::{sanitize_for_paste, ClipboardAccess};
 use sh_crypto::{DtlsCommitment, HandshakeOutcome, NoiseHandshake, SoftwareKeystore};
-use sh_input::{InputInjector, RateLimiter};
+use sh_input::{InputInjector, RateLimiter, DEFINED_BUTTON_BITS};
 use sh_protocol::{
     ClipboardUpdate, Codec, CommonHeader, EventType, Flags, FrameType, InputEvent, Priority,
     VideoHeader, INPUT_EVENT_LEN, MAX_FRAME_ID,
@@ -81,11 +81,13 @@ const MAX_INPUT_PER_FRAME: usize = 256;
 /// events (backpressure) rather than blocking the video loop — the natural flood/rate-limit point.
 const INPUT_QUEUE_DEPTH: usize = 256;
 
-/// Sustained cap (events/second) on injected **drop-safe high-rate** input — `PointerMove` and
-/// `Wheel` (see [`admit_input`]) — as a hostile-input DoS guard. Well above any human rate (browsers
-/// coalesce moves to ~60–120/s; trackpad scroll adds tens/s) but throttles a synthetic flood before
-/// it reaches the OS injection API. State-transition events (`Button`/`Key`) are never rate-limited
-/// (a dropped release would stick — ADR-0034).
+/// Sustained cap (events/second) on the **shared drop-safe bucket** — `PointerMove`, `Wheel`, `Key`
+/// (atomic tap), `Touch`/`Pen` (no-ops today), and press-only `Button` (see [`admit_input`]) — as a
+/// hostile-input DoS guard. One shared bucket so the cap can't be bypassed by mixing event types.
+/// Well above any human aggregate rate (coalesced moves ~60–120/s + scroll tens/s + typing ~15/s +
+/// clicks ~10/s ≈ 150–200/s) but throttles a synthetic flood before it reaches the OS injection API.
+/// A `Button` event that carries a *release* bypasses the bucket and is always admitted (a dropped
+/// release would stick — ADR-0034).
 const MAX_THROTTLED_INPUT_PER_SEC: u32 = 500;
 
 /// Burst allowance for the hostile-input rate limiter: a short idle period banks up to this many
@@ -1104,11 +1106,13 @@ async fn run_video_send_loop_with_input_drain(
 
     let mut sent: usize = 0;
     let mut sequence: u16 = 0;
-    // Hostile-input DoS guard: throttle drop-safe high-rate input (pointer-move + wheel; see the
-    // const docs and `admit_input`). `throttled_events` counts events shed so a sustained flood is
-    // observable in the logs (never per-event — §7).
+    // Hostile-input DoS guard: a single shared bucket throttles every drop-safe event (see the const
+    // docs and `admit_input`); `admitted_button_mask` mirrors the injector's held buttons so releases
+    // are always admitted. `throttled_events` counts events shed so a sustained flood is observable in
+    // the logs (never per-event — §7).
     let mut input_limiter = RateLimiter::new(MAX_THROTTLED_INPUT_PER_SEC, THROTTLED_INPUT_BURST);
     let mut throttled_events: u64 = 0;
+    let mut admitted_button_mask: u8 = 0;
     let mut stream_err: Option<anyhow::Error> = None;
     'stream: while sent < frames_to_send {
         ticker.tick().await;
@@ -1145,7 +1149,13 @@ async fn run_video_send_loop_with_input_drain(
         for _ in 0..MAX_INPUT_PER_FRAME {
             match tokio::time::timeout(Duration::ZERO, channel.recv()).await {
                 Ok(Ok(Some(bytes))) => {
-                    forward_input(&bytes, input_tx, &mut input_limiter, &mut throttled_events);
+                    forward_input(
+                        &bytes,
+                        input_tx,
+                        &mut input_limiter,
+                        &mut throttled_events,
+                        &mut admitted_button_mask,
+                    );
                 }
                 Ok(Ok(None)) => {
                     info!(frames = sent, "peer closed channel — ending video stream");
@@ -1163,7 +1173,7 @@ async fn run_video_send_loop_with_input_drain(
     if throttled_events > 0 {
         warn!(
             throttled_events,
-            "throttled high-rate input events (pointer-move/wheel — hostile-input guard)"
+            "throttled high-rate input events (shared drop-safe bucket — hostile-input guard)"
         );
     }
     match stream_err {
@@ -1333,11 +1343,18 @@ fn forward_input(
     input_tx: &tokio::sync::mpsc::Sender<InputEvent>,
     limiter: &mut RateLimiter,
     throttled: &mut u64,
+    admitted_button_mask: &mut u8,
 ) {
     if let Some(event) = decode_input(bytes) {
-        if admit_input(&event, limiter, Instant::now()) {
+        if admit_input(&event, limiter, Instant::now(), *admitted_button_mask) {
             // Non-blocking enqueue; a full queue drops the event (backpressure), never blocks.
-            let _ = input_tx.try_send(event);
+            // Mirror the injector's `prev_button_mask` ONLY on a successful enqueue: if the queue
+            // drops the event the injector never sees it, so leaving the mask put keeps host and
+            // injector in exact lockstep (a later release is then still classified correctly).
+            // (`InputEvent` is `Copy`, so `event` is still readable after `try_send` copies it in.)
+            if input_tx.try_send(event).is_ok() && event.event_type == EventType::Button {
+                *admitted_button_mask = event.button_mask & DEFINED_BUTTON_BITS;
+            }
         } else {
             *throttled = throttled.saturating_add(1);
         }
@@ -1456,9 +1473,16 @@ async fn run_input_recv(
 ) {
     let mut limiter = RateLimiter::new(MAX_THROTTLED_INPUT_PER_SEC, THROTTLED_INPUT_BURST);
     let mut throttled: u64 = 0;
+    let mut admitted_button_mask: u8 = 0;
     loop {
         match input_ch.recv().await {
-            Ok(Some(bytes)) => forward_input(&bytes, &input_tx, &mut limiter, &mut throttled),
+            Ok(Some(bytes)) => forward_input(
+                &bytes,
+                &input_tx,
+                &mut limiter,
+                &mut throttled,
+                &mut admitted_button_mask,
+            ),
             Ok(None) => {
                 info!("input channel closed by peer");
                 break;
@@ -1472,7 +1496,7 @@ async fn run_input_recv(
     if throttled > 0 {
         warn!(
             throttled_events = throttled,
-            "throttled high-rate input events (pointer-move/wheel — hostile-input guard)"
+            "throttled high-rate input events (shared drop-safe bucket — hostile-input guard)"
         );
     }
 }
@@ -1682,35 +1706,58 @@ async fn run_clipboard(mut clipboard_ch: Box<dyn Channel>, clipboard: Box<dyn Cl
 
 /// Decide whether a decoded input event is admitted past the hostile-input rate limiter.
 ///
-/// Events are classified by **drop-safety**, not by a single variant:
+/// A **single shared token bucket** caps the aggregate rate of every drop-safe event so a hostile
+/// peer cannot exceed the cap by *mixing* event types (separate per-type buckets would let a peer
+/// drive N×rate by round-robining). Events are classified by **drop-safety** (ADR-0034):
 ///
-/// - **Rate-limited** — `PointerMove` and `Wheel`. Both are stateless, high-rate flood vectors that
-///   are safe to shed: a move carries an absolute position (the next move supersedes a dropped one),
-///   and a wheel event is one self-contained scroll notch (dropping it loses at most a notch, never
-///   any held state). These are the events a hostile client can spam fastest, so they go through the
-///   bucket.
-/// - **Always admitted** — `Button` and `Key`. These are state *transitions*; dropping a *release*
-///   would leave the controlled machine with a button or key stuck down — the exact hazard
-///   [`sh_input::InputInjector::release_all`] exists to close (ADR-0034). They never touch the
-///   limiter, so they never consume tokens and can never be throttled.
-/// - **Always admitted (for now)** — `Touch` and `Pen`. These carry contact/lift state via
-///   `pressure`, so they are *not* purely drop-safe, and they are `Unsupported` on every injector
-///   today. They are admitted unthrottled until a deliberate contact-aware policy lands (tracked
-///   follow-up) — they must not be silently shed by the move/wheel bucket.
+/// - **Rate-limited (shared bucket)** — `PointerMove` (absolute position: the next move supersedes a
+///   dropped one), `Wheel` (a self-contained scroll notch, no held state), `Key` (the injectors emit
+///   each key as an **atomic press+release** — it latches nothing, so a dropped key loses at most one
+///   keystroke and can never stick), and `Touch`/`Pen` (`Unsupported` no-ops on every injector today,
+///   so dropping them is 100 % safe now — and leaving them unthrottled would let a flood crowd real
+///   `Button` releases out of the bounded queue).
+/// - **Release-preserving `Button`** — `button_mask` is *absolute* state; the injector diffs it
+///   against its own `prev_button_mask`. An event that **clears** any held (defined) bit carries a
+///   *release* and is **always admitted** (dropping it would stick a button — the hazard
+///   [`sh_input::InputInjector::release_all`] backstops). A press-only / no-op `Button` event (clears
+///   nothing) goes through the shared bucket. The caller mirrors the injector's `prev_button_mask` in
+///   `admitted_button_mask`, updated **only on successful enqueue**, so host and injector stay in
+///   exact lockstep even when the bounded queue drops an admitted event — every genuine release
+///   still reaches the injector.
 ///
 /// NOTE: the "absolute position ⇒ drop-safe" property of `PointerMove` holds because this protocol's
-/// `pointer_x`/`pointer_y` are absolute normalized coords. A future relative/pointer-lock input mode
-/// would NOT be drop-safe and must revisit this classification.
+/// `pointer_x`/`pointer_y` are absolute normalized coords; a future relative/pointer-lock mode would
+/// NOT be drop-safe. Likewise `Touch`/`Pen` become non-drop-safe once real contact injection lands
+/// (a lift is a release) and will then need a contact-preserving scheme like `Button`'s, not the
+/// shared bucket.
 ///
-/// Returns `true` to enqueue the event for injection, `false` to drop it.
-fn admit_input(event: &InputEvent, limiter: &mut RateLimiter, now: Instant) -> bool {
+/// Returns `true` to enqueue the event for injection, `false` to drop it. `admitted_button_mask` is
+/// the caller's mirror of the injector's currently-held (defined) button bits.
+fn admit_input(
+    event: &InputEvent,
+    limiter: &mut RateLimiter,
+    now: Instant,
+    admitted_button_mask: u8,
+) -> bool {
     match event.event_type {
-        // Stateless, high-rate, drop-safe vectors → rate-limited.
-        EventType::PointerMove | EventType::Wheel => limiter.allow(now),
-        // State transitions (a dropped release would stick) → always admitted.
-        EventType::Button | EventType::Key => true,
-        // Contact events carry lift/contact state and are Unsupported today → admit, don't shed.
-        EventType::Touch | EventType::Pen => true,
+        // Drop-safe vectors → the shared aggregate bucket (Key is atomic; Touch/Pen are no-ops).
+        EventType::PointerMove
+        | EventType::Wheel
+        | EventType::Key
+        | EventType::Touch
+        | EventType::Pen => limiter.allow(now),
+        EventType::Button => {
+            let curr = event.button_mask & DEFINED_BUTTON_BITS;
+            let released = admitted_button_mask & !curr; // defined bits going 1→0
+            let newly_pressed = curr & !admitted_button_mask; // defined bits going 0→1
+                                                              // Bypass the bucket ONLY for a PURE release (clears a held bit, presses NONE). A mixed
+                                                              // release+press must NOT bypass — else a peer oscillating between two disjoint masks
+                                                              // (e.g. 0x01 ⇄ 0x02) would "release" the other bit on every toggle and flood for free,
+                                                              // reopening the exact discrete-event DoS this guard closes. A mixed event dropped under
+                                                              // a flood is the same accepted queue-drop risk (backstopped by `release_all` at session
+                                                              // end); the browser emits separate up/down events, so mixed events are attacker-shaped.
+            (released != 0 && newly_pressed == 0) || limiter.allow(now)
+        }
     }
 }
 
@@ -2664,70 +2711,238 @@ mod tests {
         assert!(super::decode_input(&[0xFF; INPUT_EVENT_LEN]).is_none());
     }
 
-    #[test]
-    fn admit_input_throttles_drop_safe_events_but_never_state_transitions() {
+    // ── Hostile-input rate cap (ADR-0034 guard): shared bucket + Button release-preservation. ──
+    #[allow(clippy::unwrap_used)]
+    mod rate_cap {
         use sh_input::RateLimiter;
         use sh_protocol::{EventType, InputEvent, Modifiers};
         use std::time::Instant;
 
-        let ev = |event_type| InputEvent {
-            event_type,
-            modifiers: Modifiers::empty(),
-            pointer_x: 0,
-            pointer_y: 0,
-            button_mask: 0x01,
-            key_code: 0x04,
-            scroll_x: 0,
-            scroll_y: 1,
-            pressure: 0,
-        };
+        fn ev(event_type: EventType, button_mask: u8) -> InputEvent {
+            InputEvent {
+                event_type,
+                modifiers: Modifiers::empty(),
+                pointer_x: 0,
+                pointer_y: 0,
+                button_mask,
+                key_code: 0x04,
+                scroll_x: 0,
+                scroll_y: 1,
+                pressure: 0,
+            }
+        }
 
-        // Both drop-safe high-rate vectors (PointerMove AND Wheel) share the bucket and are
-        // throttled. A Wheel flood must NOT bypass the guard by relabeling its event type.
-        for et in [EventType::PointerMove, EventType::Wheel] {
+        #[test]
+        fn all_drop_safe_events_share_one_bucket() {
+            // PointerMove, Wheel, Key (atomic tap), Touch, Pen are all drop-safe and share the
+            // bucket — each is throttled once the burst is spent. Key/Touch/Pen used to bypass; a
+            // flood via any of them must now be capped.
+            for et in [
+                EventType::PointerMove,
+                EventType::Wheel,
+                EventType::Key,
+                EventType::Touch,
+                EventType::Pen,
+            ] {
+                let mut limiter = RateLimiter::new(500, 1); // burst 1
+                let now = Instant::now();
+                assert!(
+                    super::super::admit_input(&ev(et, 0), &mut limiter, now, 0),
+                    "{et:?}: first event (burst token) admitted"
+                );
+                assert!(
+                    !super::super::admit_input(&ev(et, 0), &mut limiter, now, 0),
+                    "{et:?}: second event at the same instant throttled"
+                );
+            }
+        }
+
+        #[test]
+        fn shared_cap_cannot_be_bypassed_by_mixing_types() {
+            // One bucket (burst 2): a Key + a PointerMove spend both tokens, so a THIRD drop-safe
+            // event of ANY type at the same instant is throttled — the aggregate cap holds under a
+            // mixed flood (separate per-type buckets would have let this through).
+            let mut limiter = RateLimiter::new(500, 2);
+            let now = Instant::now();
+            assert!(super::super::admit_input(
+                &ev(EventType::Key, 0),
+                &mut limiter,
+                now,
+                0
+            ));
+            assert!(super::super::admit_input(
+                &ev(EventType::PointerMove, 0),
+                &mut limiter,
+                now,
+                0
+            ));
+            for et in [EventType::Wheel, EventType::Key, EventType::Pen] {
+                assert!(
+                    !super::super::admit_input(&ev(et, 0), &mut limiter, now, 0),
+                    "{et:?}: the shared bucket is empty — mixing types cannot exceed the cap"
+                );
+            }
+        }
+
+        #[test]
+        fn button_release_always_admitted_even_with_empty_bucket() {
+            // Left held (admitted mask 0x01); a Button event that clears it (mask 0x00) carries a
+            // release → admitted even with a fully-empty bucket (dropping it would stick the button).
+            let mut limiter = RateLimiter::new(500, 1);
+            let now = Instant::now();
+            assert!(super::super::admit_input(
+                &ev(EventType::PointerMove, 0),
+                &mut limiter,
+                now,
+                0
+            )); // drain the one token → bucket empty
+            assert!(super::super::admit_input(
+                &ev(EventType::Button, 0x00),
+                &mut limiter,
+                now,
+                0x01
+            ));
+            // A partial release (0x03 held → 0x02: releases bit 0, still holds bit 1) also admits.
+            assert!(super::super::admit_input(
+                &ev(EventType::Button, 0x02),
+                &mut limiter,
+                now,
+                0x03
+            ));
+        }
+
+        #[test]
+        fn oscillating_button_mask_cannot_flood() {
+            // Regression: a peer alternating between two disjoint masks (0x01 ⇄ 0x02) must NOT get
+            // free admissions. Each toggle "releases" one bit but ALSO presses another, so it is a
+            // mixed event and must go through the bucket — not bypass it. With a spent bucket, every
+            // toggle after the burst is throttled.
             let mut limiter = RateLimiter::new(500, 1); // burst 1
             let now = Instant::now();
-            assert!(
-                super::admit_input(&ev(et), &mut limiter, now),
-                "{et:?}: first event (burst token) admitted"
-            );
-            assert!(
-                !super::admit_input(&ev(et), &mut limiter, now),
-                "{et:?}: second event at the same instant throttled"
-            );
+            // First press spends the one token (admitted); mirror would advance to 0x01.
+            assert!(super::super::admit_input(
+                &ev(EventType::Button, 0x01),
+                &mut limiter,
+                now,
+                0x00
+            ));
+            // Toggle to 0x02 (releases bit0, presses bit1) — mixed → rate-limited → throttled.
+            assert!(!super::super::admit_input(
+                &ev(EventType::Button, 0x02),
+                &mut limiter,
+                now,
+                0x01
+            ));
+            // Toggle back to 0x01 (releases bit1, presses bit0) — mixed → throttled.
+            assert!(!super::super::admit_input(
+                &ev(EventType::Button, 0x01),
+                &mut limiter,
+                now,
+                0x02
+            ));
         }
 
-        // Critical safety property: with the bucket fully empty, every state-transition event still
-        // passes — dropping a Button/Key release would leave it stuck (ADR-0034). Touch/Pen also
-        // pass (they carry contact state and are not purely drop-safe).
-        let mut limiter = RateLimiter::new(500, 1);
-        let now = Instant::now();
-        assert!(super::admit_input(
-            &ev(EventType::PointerMove),
-            &mut limiter,
-            now
-        )); // drain token
-        assert!(!super::admit_input(
-            &ev(EventType::PointerMove),
-            &mut limiter,
-            now
-        )); // bucket empty
-        for et in [
-            EventType::Button,
-            EventType::Key,
-            EventType::Touch,
-            EventType::Pen,
-        ] {
-            assert!(
-                super::admit_input(&ev(et), &mut limiter, now),
-                "{et:?} must bypass the rate limiter even when the bucket is empty"
+        #[test]
+        fn button_press_only_is_rate_limited() {
+            // Nothing held; a press-only Button event (mask 0x01, releases nothing) goes through the
+            // bucket and is throttled once it is empty. (burst clamps to ≥1, so drain the token first.)
+            let mut limiter = RateLimiter::new(500, 1);
+            let now = Instant::now();
+            assert!(super::super::admit_input(
+                &ev(EventType::PointerMove, 0),
+                &mut limiter,
+                now,
+                0x00
+            )); // drain the one token
+            assert!(!super::super::admit_input(
+                &ev(EventType::Button, 0x01),
+                &mut limiter,
+                now,
+                0x00
+            ));
+        }
+
+        #[test]
+        fn reserved_button_bit_cannot_force_admit() {
+            // A hostile peer sets a RESERVED bit (0x80) then clears it, trying to manufacture a
+            // "release" to bypass the bucket. Masking to DEFINED_BUTTON_BITS makes curr = 0, so
+            // released = admitted(0) & !0 = 0 → still rate-limited (throttled once the bucket is empty).
+            let mut limiter = RateLimiter::new(500, 1);
+            let now = Instant::now();
+            assert!(super::super::admit_input(
+                &ev(EventType::PointerMove, 0),
+                &mut limiter,
+                now,
+                0x00
+            )); // drain the one token
+            assert!(!super::super::admit_input(
+                &ev(EventType::Button, 0x80),
+                &mut limiter,
+                now,
+                0x00
+            ));
+        }
+
+        #[test]
+        fn forward_input_mirrors_button_mask_on_successful_enqueue() {
+            // Drive `forward_input` with a generous bucket so admission always succeeds; assert the
+            // `admitted_button_mask` mirror tracks the injector's view (masked) across press→release.
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent>(16);
+            let mut limiter = RateLimiter::new(500, 500);
+            let mut throttled = 0u64;
+            let mut mask = 0u8;
+
+            // Press left (0x01) → enqueued → mask = 0x01.
+            super::super::forward_input(
+                &ev(EventType::Button, 0x01).encode(),
+                &tx,
+                &mut limiter,
+                &mut throttled,
+                &mut mask,
+            );
+            assert_eq!(mask, 0x01);
+            // Release (0x00) → enqueued → mask = 0x00.
+            super::super::forward_input(
+                &ev(EventType::Button, 0x00).encode(),
+                &tx,
+                &mut limiter,
+                &mut throttled,
+                &mut mask,
+            );
+            assert_eq!(mask, 0x00);
+            assert_eq!(throttled, 0, "nothing was throttled with a full bucket");
+            // Both events actually enqueued (press + release).
+            assert_eq!(rx.try_recv().unwrap().button_mask, 0x01);
+            assert_eq!(rx.try_recv().unwrap().button_mask, 0x00);
+        }
+
+        #[test]
+        fn forward_input_does_not_advance_mask_when_queue_full() {
+            // A full injection queue drops an admitted press; the mask must NOT advance (the injector
+            // never saw it), so host and injector stay in lockstep and a later release is still
+            // classified correctly.
+            let (tx, _rx) = tokio::sync::mpsc::channel::<InputEvent>(1);
+            // Fill the single queue slot so the next try_send fails.
+            tx.try_send(ev(EventType::PointerMove, 0)).unwrap();
+
+            let mut limiter = RateLimiter::new(500, 500); // admission succeeds
+            let mut throttled = 0u64;
+            let mut mask = 0u8;
+            super::super::forward_input(
+                &ev(EventType::Button, 0x01).encode(),
+                &tx,
+                &mut limiter,
+                &mut throttled,
+                &mut mask,
+            );
+            assert_eq!(
+                mask, 0x00,
+                "a queue-dropped press must not advance the mirror"
+            );
+            assert_eq!(
+                throttled, 0,
+                "the event was admitted (not throttled) — the queue dropped it"
             );
         }
-        // The always-admitted events consumed no tokens, so a move is still throttled.
-        assert!(!super::admit_input(
-            &ev(EventType::PointerMove),
-            &mut limiter,
-            now
-        ));
     }
 }

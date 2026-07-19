@@ -45,7 +45,7 @@ use winapi::um::winuser::{
     MOUSEEVENTF_WHEEL, MOUSEINPUT, WHEEL_DELTA,
 };
 
-use sh_input::{InputError, InputInjector};
+use sh_input::{InputError, InputInjector, DEFINED_BUTTON_BITS};
 use sh_protocol::{EventType, InputEvent, Modifiers};
 
 use crate::keymap::hid_to_vk;
@@ -62,10 +62,6 @@ const BUTTON_MAP: [(u8, DWORD, DWORD); 3] = [
     (0x02, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
     (0x04, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
 ];
-
-/// Mask of the button bits this injector tracks (bits 0–2). Reserved bits 3–7 are ignored, so
-/// `prev_button_mask & DEFINED_BUTTON_BITS == 0` means nothing is really held.
-const DEFINED_BUTTON_BITS: u8 = 0x07;
 
 /// An [`InputInjector`] that synthesises Windows input via `SendInput`.
 ///
