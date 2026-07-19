@@ -34,7 +34,7 @@
 //! Page_Down, 0x49–0x4E), arrow keys, and the modifier keys (0xE0–0xE7). Unknown HID codes return
 //! `None` and the injector returns [`sh_input::InputError::Unsupported`] — no arbitrary injection.
 
-use sh_input::{CoordMapper, InputError, InputInjector, TargetRect};
+use sh_input::{CoordMapper, InputError, InputInjector, TargetRect, DEFINED_BUTTON_BITS};
 use sh_protocol::{EventType, InputEvent, Modifiers};
 use tracing::debug;
 use x11rb::connection::Connection;
@@ -55,10 +55,6 @@ const KEY_RELEASE: u8 = 3;
 /// `(mask, x11_button)` pairs — avoids arithmetic that would trip
 /// `clippy::arithmetic_side_effects`.
 const BUTTON_MAP: [(u8, u8); 3] = [(0x01, 1), (0x02, 2), (0x04, 3)];
-
-/// Mask of the button bits this injector actually tracks (bits 0–2). Reserved bits 3–7 are
-/// ignored, so `prev_button_mask & DEFINED_BUTTON_BITS == 0` means nothing is really held.
-const DEFINED_BUTTON_BITS: u8 = 0x07;
 
 /// An [`InputInjector`] that synthesises X11 events via the XTEST extension.
 ///

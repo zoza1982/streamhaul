@@ -53,7 +53,7 @@ mod recording;
 
 pub use coord::{CoordMapper, MappedPoint, TargetRect};
 pub use error::InputError;
-pub use injector::InputInjector;
+pub use injector::{InputInjector, DEFINED_BUTTON_BITS};
 pub use noop::NoopInjector;
 pub use rate_limiter::RateLimiter;
 pub use recording::RecordingInjector;

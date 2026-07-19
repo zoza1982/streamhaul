@@ -70,19 +70,36 @@ Add a browser→host input back-channel on the **same** "shp" DataChannel.
   Coordinates are normalized (0..=65535); per-monitor mapping is the injector's responsibility
   (`CoordMapper`).
 - **Hostile-input rate-limiting (DONE):** beyond the bounded queue, the host caps injected
-  **drop-safe high-rate** events with a token-bucket [`sh_input::RateLimiter`] (default 500/s
-  sustained, burst 120 — well above any human rate). Events are classified by **drop-safety**, not
-  by a single variant: `PointerMove` (absolute position — the next move supersedes a dropped one)
-  and `Wheel` (a self-contained scroll notch, no held state) are throttled; `Button`/`Key` state
-  transitions **always** pass — dropping a release would re-introduce the stuck-state this ADR
-  closes — as do `Touch`/`Pen` (which carry contact state and are `Unsupported` today). Gating the
-  high-rate events *before* the bounded queue relieves queue pressure on the state transitions. The
-  limiter takes the clock as a parameter (`allow(now)`) so it is deterministically unit-tested;
-  `admit_input` proves state transitions bypass it even when the bucket is empty, and that a `Wheel`
-  flood can't bypass the guard by relabeling its event type.
-- **Follow-ups:** a **discrete-event aggregate rate cap that preserves releases** (coalesce
-  redundant same-state `Button`/`Key` events / bound them without ever shedding a release) — closes
-  the remaining bounded discrete-event flood DoS (today capped only by the queue depth + per-frame
-  drain + serial injection; security-engineer-assessed as low severity, deferred not blocking); a
-  dedicated Input channel/task for lower latency; clipboard; multi-monitor coordinate mapping;
-  macOS/Windows injectors on the preview host.
+  **drop-safe** events with a **single shared** token-bucket [`sh_input::RateLimiter`] (default 500/s
+  sustained, burst 120 — well above any human *aggregate* rate). One shared bucket so the cap cannot
+  be bypassed by *mixing* event types (N per-type buckets would let a peer drive N×rate by
+  round-robining). Events are classified by **drop-safety**, not by a single variant:
+  - **Shared bucket** — `PointerMove` (absolute position — the next move supersedes a dropped one),
+    `Wheel` (a self-contained scroll notch), `Key` (the injectors emit each key as an **atomic
+    press+release** — it latches nothing, so a dropped key loses at most one keystroke and can never
+    stick), and `Touch`/`Pen` (`Unsupported` no-ops on every injector today — dropping them is 100 %
+    safe now, and leaving them unthrottled would let a flood crowd real `Button` releases out of the
+    bounded queue).
+  - **Release-preserving `Button`** — `button_mask` is *absolute* state (the injector diffs it against
+    its `prev_button_mask`). A `Button` event that is a **pure release** — clears a held (defined,
+    `& 0x07`) bit and presses **no** new bit — is **always admitted** (dropping it would re-introduce
+    the stuck-state this ADR closes); a press-only, no-op, **or mixed release+press** `Button` goes
+    through the shared bucket. The "pure release" qualifier is load-bearing: bypassing the bucket for
+    *any* event that clears a bit would let a peer oscillate between two disjoint masks (`0x01 ⇄ 0x02`)
+    and flood for free, since every toggle "releases" the other bit — so a mixed event is bucketed,
+    and a mixed event dropped under a flood is the same accepted queue-drop risk (`release_all`
+    backstop). The host mirrors the
+    injector's `prev_button_mask` in `admitted_button_mask`, updated **only on successful enqueue**, so
+    host and injector stay in exact lockstep even when the bounded queue drops an admitted event —
+    every genuine release still reaches the injector. Reserved bits are masked off before the release
+    check so a peer can't toggle bit `0x80` to manufacture a phantom release and bypass the bucket.
+
+  The limiter takes the clock as a parameter (`allow(now)`) so it is deterministically unit-tested.
+  Tests prove: all five drop-safe types share one bucket; the aggregate cap can't be bypassed by
+  mixing types; a `Button` release is admitted even with an empty bucket; press-only/reserved-bit
+  `Button` is throttled; and `admitted_button_mask` mirrors the injector across press→release and
+  does **not** advance on a queue-drop. **Residual (low severity, documented):** release throughput is
+  self-throttling (a bit can only be released after a rate-limited press admits it), and `Touch`/`Pen`
+  will need a lift-preserving scheme like `Button`'s once real contact injection lands.
+- **Follow-ups:** a dedicated Input channel/task for lower latency (DONE, ADR-0036); clipboard (DONE,
+  ADR-0037); multi-monitor coordinate mapping; macOS/Windows injectors on the preview host.
